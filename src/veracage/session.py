@@ -100,15 +100,22 @@ def _handle_request(state: _SessionState, req: dict) -> dict:
 # ----------------------------------------------------------- reaping -------
 
 def _reap_children(state: _SessionState) -> None:
-    """Non-blocking reap of any exited bwrap children."""
-    while True:
+    """Non-blocking reap of exited bwrap app children.
+
+    Only the app PIDs we track are reaped here. weston and the host agent
+    are owned by their own Popen objects (nested_weston / _spawn_agent);
+    reaping them with waitpid(-1) would race those owners and clobber the
+    exit status they later read. We iterate a snapshot so popping is safe.
+    """
+    for pid in list(state.children):
         try:
-            pid, _status = os.waitpid(-1, os.WNOHANG)
+            reaped, _status = os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
-            return
-        if pid == 0:
-            return
-        state.children.pop(pid, None)
+            # No such child — already gone. Don't leak the tracking entry.
+            state.children.pop(pid, None)
+            continue
+        if reaped == pid:
+            state.children.pop(pid, None)
 
 
 # --------------------------------------------------------- session run -----

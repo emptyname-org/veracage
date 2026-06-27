@@ -98,6 +98,43 @@ def test_missing_cmd_field(state):
     assert reply["ok"] is False
 
 
+# --------------------------------------------------------------- reaping ---
+
+def test_reap_removes_only_exited_tracked_children(state):
+    state.children[101] = "kate"
+    state.children[102] = "okular"
+
+    def fake_waitpid(pid, _flags):
+        return (101, 0) if pid == 101 else (0, 0)  # 101 exited, 102 running
+
+    with mock.patch("veracage.session.os.waitpid", side_effect=fake_waitpid):
+        session._reap_children(state)
+    assert state.children == {102: "okular"}
+
+
+def test_reap_drops_already_reaped_child(state):
+    state.children[201] = "kate"
+    with mock.patch("veracage.session.os.waitpid", side_effect=ChildProcessError):
+        session._reap_children(state)
+    assert state.children == {}
+
+
+def test_reap_never_waits_on_minus_one(state):
+    """Regression: reaping must target tracked PIDs only, never waitpid(-1),
+    which would race weston/agent reaping and clobber their exit status."""
+    state.children[301] = "kate"
+    seen = []
+
+    def fake_waitpid(pid, _flags):
+        seen.append(pid)
+        return (0, 0)
+
+    with mock.patch("veracage.session.os.waitpid", side_effect=fake_waitpid):
+        session._reap_children(state)
+    assert seen == [301]
+    assert -1 not in seen
+
+
 # ---------------------------------------------------------- socket path ----
 
 def test_session_socket_path_is_per_vault(tmp_xdg_runtime):
