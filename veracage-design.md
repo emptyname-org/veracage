@@ -404,13 +404,15 @@ Per-volume settings inherit from `[default]`.
 | Component | Est. LOC | Privilege | Lifetime |
 |---|---|---|---|
 | `veracage` CLI launcher | ~300 | user | per session |
-| `veracage-helper` (mount/dismount) | ~100 | root via polkit | seconds |
+| `veracage-helper` (mount/dismount) | ~280 Rust | root via polkit | seconds |
 | `veracage-agent` (tray, bridges, drop zone) | ~600 | user | per session |
 | `veracage-cleanup` (ExecStopPost) | ~50 | root via polkit | seconds |
 | polkit policy XML | ~30 | n/a | static |
 | systemd user unit template | ~20 | n/a | static |
 
-Total: ~1100 LOC + config. Suggested implementation: Python 3.11+ for launcher/agent, small C or Rust binary for helper (auditable).
+Total: ~1100 LOC + config. Implementation: Python 3.11+ for launcher/agent;
+the privilege helper is a small **Rust** binary (`helper-rs/`, deps `libc` +
+`sha2`) for an auditable boundary — resolves open question #1.
 
 ---
 
@@ -441,7 +443,9 @@ Total: ~1100 LOC + config. Suggested implementation: Python 3.11+ for launcher/a
 
 ## 14. Open questions
 
-1. **Helper language**: Python (matches launcher) or small auditable C/Rust binary? Lean toward **C/Rust** for the privilege boundary.
+1. ~~**Helper language**: Python or small auditable C/Rust binary?~~
+   **Resolved: Rust** (`helper-rs/`). A Python reference helper
+   (`helpers/veracage-helper`) is kept as the pre-build fallback.
 2. **Drop-zone UI toolkit**: GTK (matches GNOME) or Qt (matches KDE; matches our chosen apps Kate/Okular)? Lean **Qt**.
 3. **Clipboard bridge MIME support**: text-only v1, or include `image/png` for screenshots? Defer.
 4. **Vault auto-lock on idle**: detect N minutes idle and dismount? Probably yes, configurable.
