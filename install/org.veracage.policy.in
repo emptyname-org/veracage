@@ -24,12 +24,22 @@
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 
+  <!--
+    Cleanup is the crash-safe teardown path (systemd scope ExecStopPost). That
+    pkexec runs from the user systemd manager, which polkit may treat as an
+    *inactive* (not active) session, so allow_active=yes alone can silently
+    fail to authorize it. allow_inactive=yes covers that local case. This is
+    safe because the cleanup helper is strictly bounded: it only acts on a
+    validated /run/veracage/<16-hex>.lock and only closes a veracage-<12-hex>
+    dm device. allow_any stays auth_admin (no remote/sessionless access).
+    VERIFY on the target compositor that ExecStopPost cleanup actually fires.
+  -->
   <action id="org.veracage.cleanup">
     <description>Close a Veracage dm-crypt device and remove its lock file</description>
     <message>Cleaning up a Veracage session</message>
     <defaults>
       <allow_any>auth_admin</allow_any>
-      <allow_inactive>auth_admin</allow_inactive>
+      <allow_inactive>yes</allow_inactive>
       <allow_active>yes</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">@CLEANUP@</annotate>

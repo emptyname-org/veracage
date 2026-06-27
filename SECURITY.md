@@ -22,7 +22,7 @@ files and clipboard cross the boundary **only** on explicit user action.
 | App isolation | `bwrap` unshares pid/uts/ipc/cgroup/**net**; `--die-with-parent`; `HOME=/vault`; host `$XDG_RUNTIME_DIR` hidden behind a tmpfs with only the Wayland socket bound in. |
 | Minimal host surface | `/usr` read-only; **curated** `/etc` (linker, fontconfig, tz, NSS, machine-id, XDG, TLS) instead of all of `/etc`; no host home, no D-Bus, no portals. |
 | Clipboard isolation | Sandbox runs against a separate Wayland compositor (nested weston, "Mode B"); host clipboard managers can't see it. Transfer is one-shot, user-triggered. |
-| Crash-safe teardown | The session runs in a `systemd --user --scope`; its `ExecStopPost` runs `pkexec veracage-cleanup`, which `cryptsetup close`s the dm-crypt device on SIGKILL/OOM/panic/logout. |
+| Crash-safe teardown | The session runs in a `systemd --user --scope`; the agent + weston carry `PR_SET_PDEATHSIG` so a targeted leader kill can't orphan them and pin the mount NS open. The scope's `ExecStopPost` runs `pkexec veracage-cleanup` (bounded — validated lock + `veracage-*` device only) to `cryptsetup close` the device on SIGKILL/OOM/panic/logout. **Verify on the target** that this `pkexec` is actually authorized from a user-manager context — see the note in `install/org.veracage.policy.in`. |
 | Suspend | The agent watches login1 `PrepareForSleep` and dismounts on suspend (configurable `suspend_action`). |
 
 ## Privilege model
