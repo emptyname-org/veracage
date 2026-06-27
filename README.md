@@ -28,7 +28,9 @@ What works:
 - **Outbox watcher**: anything saved to `/vault/.veracage/out/` triggers a
   tray notification; click the tray icon to export to a host path.
 - bwrap flags: `--unshare-pid/uts/ipc/cgroup/net`, host runtime dir
-  hidden behind a tmpfs (only the Weston socket is bind-mounted in).
+  hidden behind a tmpfs (only the Weston socket is bind-mounted in),
+  curated `/etc` (linker/fontconfig/tz/NSS/machine-id/XDG/TLS only, not
+  all of host `/etc`).
 - App allowlist driven by `~/.config/veracage/config.toml`.
 - On session end: SIGTERM remaining apps → kill agent → kill weston → dismount.
 - **Crash-safe cleanup.** The launcher runs inside a `systemd-run --user
@@ -43,6 +45,15 @@ What works:
   `org.freedesktop.login1.Manager.PrepareForSleep`; on suspend, sends
   `close` to the session leader so the dm-crypt key isn't left in RAM.
   Requires `python3-gi`; soft-fails otherwise.
+- **Privilege helper in Rust** (`helper-rs/`), polkit-authorised. Derives
+  the caller's uid/gid from `PKEXEC_UID` (never argv), pins the continuation
+  at build time, and allowlists forwarded env — closing a local
+  privilege-escalation hole. A Python reference helper is kept as the
+  pre-build fallback. See `SECURITY.md`.
+- **Config**: per-volume settings (`[volumes."<path>"]`), a `gpu` opt-in
+  (`/dev/dri` passthrough, default off) and `suspend_action`
+  (`dismount` | `ignore`). See [Config](#config) below.
+- ruff + mypy clean; GitHub Actions CI (Python + Rust helper); 123 unit tests.
 
 Known gaps (later):
 - Global hotkeys for clipboard transfer are tray-menu only for now (XDG
@@ -64,14 +75,26 @@ sudo apt install bubblewrap cryptsetup veracrypt weston wl-clipboard \
 - `wl-clipboard` — clipboard bridge.
 - `python3-gi` — suspend handling via login1. Soft-fail without it.
 
-Then in the checkout:
+The privilege helper is written in Rust, so you also need a toolchain
+(`rustup`, or distro `cargo` + `rustc`).
+
+Dev install — builds the helper and points a polkit policy at this checkout:
 
 ```
 make install-dev
 ```
 
-This installs the polkit policy at `/usr/share/polkit-1/actions/org.veracage.policy`
-pointing at the dev-path helper.
+System install to `/usr/local` (override with `PREFIX=`):
+
+```
+sudo make install
+```
+
+`make install` lays down the package under `PREFIX/lib/veracage`, the
+launcher at `PREFIX/bin/veracage`, the privileged helpers under
+`PREFIX/libexec/veracage`, and a polkit policy generated from
+`install/org.veracage.policy.in`. `make build` / `make test-rs` build and
+test just the Rust helper.
 
 ## First run
 
@@ -95,15 +118,42 @@ src/bin/veracage open /path/to/vault.vc okular
 `pkexec` will prompt for your account password (polkit), then `cryptsetup`
 prompts for the vault password on the same terminal.
 
+## Config
+
+`~/.config/veracage/config.toml` (auto-created by `configure`):
+
+```toml
+[default]
+last_used_app  = "kate"
+gpu            = false          # /dev/dri passthrough (side channel; off)
+suspend_action = "dismount"     # or "ignore" to keep mounted across suspend
+
+[apps.kate]                     # the enabled-app allowlist
+name     = "Kate"
+category = "text"
+exec     = "kate"
+args     = ["/vault"]
+
+[volumes."/home/you/Documents/work.vc"]   # optional per-volume overrides
+default_app  = "okular"
+gpu          = true             # overrides [default].gpu for this vault
+```
+
+Per-volume settings inherit from `[default]`. Only apps under `[apps.*]`
+are launchable.
+
 ## Tests
 
 ```
-sudo apt install python3-pytest         # for the unit suite
-make test                               # run unit tests
+make test        # Python unit suite (pytest)
+make lint        # ruff + mypy (needs .venv dev deps)
+make test-rs     # Rust helper unit tests (cargo)
 ```
 
-Manual / privileged integration tests are documented in
-`tests/integration/MANUAL.md` — they need a real vault and Wayland session.
+`tests/integration/test_helper_security.py` runs against the built Rust
+helper (after `make build`). The remaining privileged/GUI integration tests
+are documented in `tests/integration/MANUAL.md` — they need a real vault and
+Wayland session.
 
 ## Adding a new app to the catalog
 
