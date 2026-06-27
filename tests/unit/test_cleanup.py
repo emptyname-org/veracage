@@ -5,6 +5,8 @@ import hashlib
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from veracage import cleanup
 
 # --------------------------------------------------------- hashing & paths --
@@ -164,8 +166,42 @@ def test_main_requires_root(monkeypatch, capsys):
 def test_main_dispatches_to_cleanup_one(monkeypatch, tmp_path):
     monkeypatch.setattr("veracage.cleanup.os.geteuid", lambda: 0)
     monkeypatch.setattr("veracage.cleanup.LOCKS_DIR", tmp_path)
-    p = tmp_path / "abcd.lock"
-    p.write_text("dm_name=veracage-abc123def456\n")
+    h = "abcdabcdabcdabcd"
     with mock.patch("veracage.cleanup.cleanup_one", return_value=0) as c:
-        cleanup.main(["--vault-hash", "abcd"])
-    c.assert_called_once_with(tmp_path / "abcd.lock")
+        cleanup.main(["--vault-hash", h])
+    c.assert_called_once_with(tmp_path / f"{h}.lock")
+
+
+def test_main_rejects_bad_vault_hash(monkeypatch, capsys):
+    """Traversal / wrong-length / uppercase hashes are refused (C1)."""
+    monkeypatch.setattr("veracage.cleanup.os.geteuid", lambda: 0)
+    for bad in ["../../etc/x", "abc", "g" * 16, "ABCDABCDABCDABCD"]:
+        assert cleanup.main(["--vault-hash", bad]) == 2
+    assert "invalid vault-hash" in capsys.readouterr().err
+
+
+def test_main_has_no_lock_argument():
+    """--lock was a passwordless arbitrary-path root delete; it must be gone."""
+    with pytest.raises(SystemExit):
+        cleanup.main(["--lock", "/etc/shadow"])
+
+
+def test_cleanup_one_refuses_symlink_lock(tmp_path):
+    target = tmp_path / "real.lock"
+    cleanup.write_lock(target, {"dm_name": "veracage-aaaaaaaaaaaa"})
+    link = tmp_path / "link.lock"
+    link.symlink_to(target)
+    assert cleanup.cleanup_one(link) == 2
+
+
+def test_cleanup_one_keeps_lock_on_failed_close(tmp_path):
+    """A failed cryptsetup close must NOT delete the lock (recovery trail)."""
+    p = _lock(tmp_path, dm_name="veracage-abc123def456")
+    fake = mock.MagicMock()
+    fake.returncode = 5
+    fake.stderr = "device busy"
+    with mock.patch("veracage.cleanup.subprocess.run", return_value=fake), \
+         mock.patch("veracage.cleanup.Path.exists", return_value=True):
+        rc = cleanup.cleanup_one(p)
+    assert rc == 5
+    assert p.exists()

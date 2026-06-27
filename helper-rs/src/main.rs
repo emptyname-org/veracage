@@ -379,11 +379,17 @@ fn main() {
     let rc = wait_for(pid);
 
     let dm_path = format!("/dev/mapper/{dm_name}");
+    let mut close_ok = true;
     if Path::new(&dm_path).exists() {
-        let _ = Command::new("cryptsetup").args(["close", &dm_name]).status();
+        let st = Command::new("cryptsetup").args(["close", &dm_name]).status();
+        close_ok = matches!(st, Ok(s) if s.success());
     }
     let _ = std::fs::remove_dir(&mountpoint);
-    let _ = std::fs::remove_file(&lock);
+    // Remove the lock only if the device is actually gone, so a failed close
+    // leaves a recovery trail for the ExecStopPost cleanup.
+    if close_ok {
+        let _ = std::fs::remove_file(&lock);
+    }
 
     std::process::exit(rc);
 }

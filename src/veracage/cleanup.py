@@ -20,9 +20,12 @@ import argparse
 import hashlib
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
+
+VAULT_HASH_RE = re.compile(r"^[0-9a-f]{16}$")
 
 LOCKS_DIR = Path("/run/veracage")
 DM_NAME_RE = re.compile(r"^veracage-[0-9a-f]{12}$")
@@ -54,9 +57,20 @@ def write_lock(p: Path, fields: dict[str, str]) -> None:
 
 
 def cleanup_one(p: Path) -> int:
-    """Process a single lock file: close its dm device, tidy mountpoint, unlink."""
-    if not p.is_file():
-        return 0  # already cleaned up by graceful exit; nothing to do
+    """Process a single lock file: close its dm device, tidy mountpoint, unlink.
+
+    This helper is reachable passwordless via polkit, so it must not follow a
+    symlink to an arbitrary file. The lock path itself is always constructed
+    from a validated vault-hash by main(); here we additionally refuse a
+    non-regular or symlinked lock.
+    """
+    try:
+        st = p.lstat()
+    except OSError:
+        return 0  # nothing there; already cleaned up by graceful exit
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        print(f"veracage-cleanup: refusing non-regular lock {p}", file=sys.stderr)
+        return 2
 
     try:
         fields = parse_lock(p)
@@ -84,32 +98,41 @@ def cleanup_one(p: Path) -> int:
 
     # Best-effort: remove the (now-orphan) mountpoint dir.
     mp = fields.get("mountpoint", "")
-    if mp.startswith("/run/veracage/"):
+    if mp.startswith("/run/veracage/") and not Path(mp).is_symlink():
         try:
             Path(mp).rmdir()
         except OSError:
             pass
 
-    try:
-        p.unlink()
-    except FileNotFoundError:
-        pass
+    # Only remove the lock once the device is actually gone. A failed close
+    # (e.g. EBUSY) must leave the lock as a recovery trail, not orphan the
+    # dm-crypt device + key with no way back.
+    if rc == 0:
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
     return rc
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="veracage-cleanup")
-    g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--lock", help="absolute path to a single lock file")
-    g.add_argument("--vault-hash", help="vault hash (looks up the lock under /run/veracage)")
+    # Only a validated vault-hash — never a caller-supplied path. The action
+    # is passwordless (polkit allow_active=yes), so an arbitrary --lock path
+    # would be a root file-delete primitive.
+    p.add_argument("--vault-hash", required=True,
+                   help="16-hex vault hash; cleans /run/veracage/<hash>.lock")
     args = p.parse_args(argv)
 
     if os.geteuid() != 0:
         print("veracage-cleanup: must run as root (via pkexec)", file=sys.stderr)
         return 2
 
-    if args.lock:
-        return cleanup_one(Path(args.lock))
+    if not VAULT_HASH_RE.match(args.vault_hash):
+        print(f"veracage-cleanup: invalid vault-hash {args.vault_hash!r}",
+              file=sys.stderr)
+        return 2
+
     return cleanup_one(LOCKS_DIR / f"{args.vault_hash}.lock")
 
 

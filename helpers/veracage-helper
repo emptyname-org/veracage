@@ -235,8 +235,10 @@ def main() -> int:
 
     # Clean up the dm-crypt device. The mountpoint disappeared with the
     # child's mount NS, so there's nothing to umount in this NS.
+    close_ok = True
     if dm_path.exists():
-        subprocess.run(["cryptsetup", "close", dm_name], check=False)
+        cr = subprocess.run(["cryptsetup", "close", dm_name], check=False)
+        close_ok = cr.returncode == 0
 
     # Best-effort: remove the (host-visible) empty mountpoint dir.
     try:
@@ -244,11 +246,13 @@ def main() -> int:
     except OSError:
         pass
 
-    # Remove our lock so the systemd ExecStopPost cleanup is a no-op.
-    try:
-        lock_file.unlink()
-    except FileNotFoundError:
-        pass
+    # Remove our lock only if the device is actually gone, so a failed close
+    # leaves a recovery trail for the ExecStopPost cleanup instead of losing it.
+    if close_ok:
+        try:
+            lock_file.unlink()
+        except FileNotFoundError:
+            pass
 
     return rc
 
