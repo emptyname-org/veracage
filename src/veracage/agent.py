@@ -16,7 +16,9 @@ from the CLI).
 """
 from __future__ import annotations
 
+import os
 import sys
+import time
 from pathlib import Path
 
 from . import clipboard, config, session, transfer
@@ -131,9 +133,11 @@ def _clipboard_op(fn, sock: Path, tray, ok_msg: str):
 def _start_suspend_watcher(vault: str, suspend_action: str = "dismount") -> None:
     """Subscribe to login1 PrepareForSleep; close the session on suspend.
 
-    With `suspend_action = "ignore"` the watcher is not installed and the
-    vault stays mounted across suspend. Otherwise (default "dismount") we
-    soft-import `gi`; without it, suspend handling is disabled with a warning.
+    Takes a logind *delay* inhibitor lock so the system waits for us to start
+    tearing the session down before it actually sleeps — otherwise it can
+    suspend with the dm-crypt key still in RAM. With `suspend_action =
+    "ignore"` no watcher is installed. Soft-imports `gi`; without it, suspend
+    handling is disabled with a warning.
     """
     if suspend_action == "ignore":
         sys.stderr.write(
@@ -152,22 +156,53 @@ def _start_suspend_watcher(vault: str, suspend_action: str = "dismount") -> None
         )
         return
 
+    def _take_delay_lock(bus):
+        """logind 'delay' sleep inhibitor → held fd, or None on failure."""
+        try:
+            ret, fds = bus.call_with_unix_fd_list_sync(
+                "org.freedesktop.login1", "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager", "Inhibit",
+                GLib.Variant("(ssss)", ("sleep", "veracage",
+                                        "Dismount vault before sleep", "delay")),
+                GLib.VariantType.new("(h)"),
+                Gio.DBusCallFlags.NONE, -1, None, None,
+            )
+            return fds.get(ret.get_child_value(0).get_handle())
+        except Exception as e:  # pragma: no cover - needs a live system bus
+            sys.stderr.write(f"veracage-agent: no sleep inhibitor ({e}); "
+                             "dismount may race suspend.\n")
+            return None
+
+    lock = {"fd": None}
+
     def _on_signal(_conn, _sender, _path, _iface, _signal, params):
         # PrepareForSleep(b active) — True just before suspending.
         try:
             suspending = bool(params[0]) if params else False
         except Exception:
             return
-        if suspending:
+        if not suspending:
+            return
+        # Hold the delay lock across the close request, give teardown a brief
+        # bounded window (logind InhibitDelayMaxSec ~5s), then release so the
+        # system may sleep.
+        try:
+            session.send_request(vault, {"cmd": "close"})
+        except Exception:
+            pass
+        _wait_session_gone(vault, timeout=4.0)
+        fd, lock["fd"] = lock["fd"], None
+        if fd is not None:
             try:
-                session.send_request(vault, {"cmd": "close"})
-            except Exception:
+                os.close(fd)
+            except OSError:
                 pass
 
     def _run() -> None:
         loop = GLib.MainLoop()
         try:
             bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+            lock["fd"] = _take_delay_lock(bus)
             bus.signal_subscribe(
                 "org.freedesktop.login1",
                 "org.freedesktop.login1.Manager",
@@ -184,6 +219,20 @@ def _start_suspend_watcher(vault: str, suspend_action: str = "dismount") -> None
     import threading
     t = threading.Thread(target=_run, daemon=True, name="veracage-suspend")
     t.start()
+
+
+def _wait_session_gone(vault: str, timeout: float) -> None:
+    """Poll until the session control socket disappears, up to `timeout`s —
+    a proxy for 'teardown has started' before we release the suspend lock."""
+    try:
+        sock = session.session_socket_path(vault)
+    except Exception:
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not sock.exists():
+            return
+        time.sleep(0.1)
 
 
 def _close_session(vault: str, qt_app):

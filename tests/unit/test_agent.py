@@ -106,3 +106,23 @@ def test_suspend_watcher_skipped_when_ignore(capsys):
     """suspend_action=ignore installs no watcher (no gi import) and says so."""
     agent._start_suspend_watcher("/tmp/x.vc", "ignore")
     assert "ignore" in capsys.readouterr().err
+
+
+def test_suspend_watcher_soft_fails_without_gi(monkeypatch, capsys):
+    """dismount mode with no python3-gi must degrade gracefully, not raise."""
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **k):
+        if name == "gi":
+            raise ImportError("no gi")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    agent._start_suspend_watcher("/tmp/x.vc", "dismount")   # must not raise
+    assert "python3-gi not available" in capsys.readouterr().err
+
+
+def test_wait_session_gone_returns_when_absent(tmp_xdg_runtime):
+    """With no session socket, the pre-suspend wait returns promptly."""
+    agent._wait_session_gone("/tmp/nope.vc", timeout=2.0)   # must not hang/raise
