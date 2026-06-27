@@ -100,3 +100,9 @@ def test_clipboard_op_warns_on_exception(fake_pyside):
     callback()
     tray.showMessage.assert_called_once()
     assert "failed" in tray.showMessage.call_args.args[1].lower()
+
+
+def test_suspend_watcher_skipped_when_ignore(capsys):
+    """suspend_action=ignore installs no watcher (no gi import) and says so."""
+    agent._start_suspend_watcher("/tmp/x.vc", "ignore")
+    assert "ignore" in capsys.readouterr().err

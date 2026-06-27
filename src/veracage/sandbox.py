@@ -7,16 +7,21 @@ from pathlib import Path
 from .apps import App
 
 
-def bwrap_command(mountpoint: str, app: App, wayland_socket: Path) -> list[str]:
+def bwrap_command(mountpoint: str, app: App, wayland_socket: Path,
+                  gpu: bool = False) -> list[str]:
     """Construct argv for `bwrap`.
 
     `wayland_socket` is the host-visible path to the (nested) Wayland socket
     the sandboxed app should connect to. We mount only that single socket
     into the sandbox at /run/user/$UID/wayland-0; the rest of the user's
     runtime dir is hidden behind a tmpfs.
+
+    `gpu` opts into /dev/dri passthrough (per-volume `gpu = true`). Off by
+    default — Okular/Kate render fine on CPU and a shared GPU is a documented
+    side channel.
     """
     uid = os.getuid()
-    return [
+    argv = [
         "bwrap",
         # Namespaces — full isolation
         "--unshare-pid", "--unshare-uts", "--unshare-ipc",
@@ -66,6 +71,9 @@ def bwrap_command(mountpoint: str, app: App, wayland_socket: Path) -> list[str]:
         "--setenv", "XDG_CACHE_HOME",  "/vault/.cache",
         "--setenv", "WAYLAND_DISPLAY", "wayland-0",
         "--chdir", "/vault",
-        "--",
-        app.exec, *app.args,
     ]
+    if gpu:
+        # Comes after `--dev /dev`, so it binds into the fresh devtmpfs.
+        argv += ["--dev-bind-try", "/dev/dri", "/dev/dri"]
+    argv += ["--", app.exec, *app.args]
+    return argv

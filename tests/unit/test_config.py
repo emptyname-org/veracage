@@ -70,3 +70,54 @@ def test_save_escapes_quotes_and_backslashes(tmp_xdg_config):
     got = loaded.apps["weird"]
     assert got.name == 'Has "quotes" and \\ slashes'
     assert got.args == ['arg with "quote"']
+
+
+# ------------------------------------------------ gpu / suspend / volumes ---
+
+def test_default_gpu_off_and_suspend_dismount(tmp_xdg_config):
+    cfg = config.load()
+    assert cfg.gpu is False
+    assert cfg.suspend_action == "dismount"
+
+
+def test_roundtrip_gpu_and_suspend_action(tmp_xdg_config):
+    config.save(config.Config(
+        apps={"kate": apps.KNOWN_APPS["kate"]},
+        gpu=True, suspend_action="ignore",
+    ))
+    loaded = config.load()
+    assert loaded.gpu is True
+    assert loaded.suspend_action == "ignore"
+
+
+def test_invalid_suspend_action_falls_back(tmp_xdg_config, capsys):
+    p = config.config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text('[default]\nsuspend_action = "explode"\n')
+    cfg = config.load()
+    assert cfg.suspend_action == "dismount"
+    assert "suspend_action" in capsys.readouterr().err
+
+
+def test_per_volume_gpu_override(tmp_xdg_config):
+    config.save(config.Config(
+        apps={"okular": apps.KNOWN_APPS["okular"]},
+        gpu=False,
+        volumes={config._norm_vault("/tmp/work.vc"): config.VolumeConfig(gpu=True)},
+    ))
+    loaded = config.load()
+    assert loaded.gpu_for("/tmp/work.vc") is True     # per-volume override
+    assert loaded.gpu_for("/tmp/other.vc") is False   # inherits [default]
+
+
+def test_per_volume_inherits_default_when_gpu_unset(tmp_xdg_config):
+    config.save(config.Config(
+        apps={},
+        gpu=True,
+        volumes={config._norm_vault("/tmp/x.vc"):
+                 config.VolumeConfig(default_app="okular")},
+    ))
+    loaded = config.load()
+    assert loaded.gpu_for("/tmp/x.vc") is True              # gpu unset -> default
+    assert loaded.default_app_for("/tmp/x.vc") == "okular"
+    assert loaded.default_app_for("/tmp/none.vc") is None

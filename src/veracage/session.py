@@ -54,6 +54,7 @@ class _SessionState:
     mountpoint: str
     vault: str
     weston_socket: Path
+    gpu: bool = False
     children: dict[int, str] = field(default_factory=dict)  # pid → app key
     closing: bool = False
 
@@ -79,7 +80,8 @@ def _handle_request(state: _SessionState, req: dict) -> dict:
         if app is None:
             return {"ok": False, "error": f"app '{key}' is not enabled"}
         try:
-            argv = bwrap_command(state.mountpoint, app, state.weston_socket)
+            argv = bwrap_command(state.mountpoint, app, state.weston_socket,
+                                 state.gpu)
             proc = subprocess.Popen(argv)
         except FileNotFoundError as e:
             return {"ok": False, "error": f"missing dependency: {e.filename}"}
@@ -127,6 +129,7 @@ def run_session(mountpoint: str, vault: str, first_app_key: str) -> int:
     if first_app is None:
         print(f"veracage: app '{first_app_key}' not enabled", file=sys.stderr)
         return 2
+    gpu = cfg.gpu_for(vault)
 
     sock_path = session_socket_path(vault)
     if sock_path.exists():
@@ -148,6 +151,7 @@ def run_session(mountpoint: str, vault: str, first_app_key: str) -> int:
                 mountpoint=mountpoint,
                 vault=vault,
                 weston_socket=wl_socket,
+                gpu=gpu,
             )
 
             # Spawn the host-side agent (tray UI, drop zone, clipboard

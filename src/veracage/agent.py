@@ -39,11 +39,12 @@ def run(vault: str, mountpoint: str, weston_socket: str) -> int:
 
     sock = Path(weston_socket)
     transfer.ensure_staging(mountpoint)
+    cfg = config.load()
 
     qt = QApplication(sys.argv)
     qt.setQuitOnLastWindowClosed(False)
 
-    _start_suspend_watcher(vault)
+    _start_suspend_watcher(vault, cfg.suspend_action)
 
     tray = QSystemTrayIcon(QIcon.fromTheme("security-high"))
     tray.setToolTip(f"Veracage — {Path(vault).name}")
@@ -51,7 +52,6 @@ def run(vault: str, mountpoint: str, weston_socket: str) -> int:
 
     # ---- Launch app submenu ----
     launch_menu = menu.addMenu("Open app in vault…")
-    cfg = config.load()
     for key, app_def in cfg.apps.items():
         action = launch_menu.addAction(app_def.name)
         action.triggered.connect(_launch_app(vault, key, tray))
@@ -132,12 +132,19 @@ def _clipboard_op(fn, sock: Path, tray, ok_msg: str):
     return _do
 
 
-def _start_suspend_watcher(vault: str) -> None:
+def _start_suspend_watcher(vault: str, suspend_action: str = "dismount") -> None:
     """Subscribe to login1 PrepareForSleep; close the session on suspend.
 
-    Soft-imports `gi`. Without it, suspend handling is disabled and the
-    session keeps the dm-crypt key in RAM across suspends.
+    With `suspend_action = "ignore"` the watcher is not installed and the
+    vault stays mounted across suspend. Otherwise (default "dismount") we
+    soft-import `gi`; without it, suspend handling is disabled with a warning.
     """
+    if suspend_action == "ignore":
+        sys.stderr.write(
+            "veracage-agent: suspend_action=ignore; vault stays mounted "
+            "across suspend.\n"
+        )
+        return
     try:
         import gi
         gi.require_version("Gio", "2.0")

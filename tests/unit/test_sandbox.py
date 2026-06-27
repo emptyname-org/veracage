@@ -123,3 +123,17 @@ def test_essential_etc_paths_bound(argv):
                    "/etc/group", "/etc/nsswitch.conf", "/etc/localtime",
                    "/etc/machine-id"):
         assert needed in bound, f"{needed} not bound into sandbox"
+
+
+def test_gpu_off_by_default_no_dri(argv):
+    assert "/dev/dri" not in argv
+
+
+def test_gpu_opt_in_binds_dev_dri():
+    sock = Path("/tmp/veracage-test.sock")
+    argv = sandbox.bwrap_command("/run/veracage/abc", KNOWN_APPS["okular"],
+                                 sock, gpu=True)
+    triples = list(zip(argv, argv[1:], argv[2:]))
+    assert ("--dev-bind-try", "/dev/dri", "/dev/dri") in triples
+    # Must come after `--dev /dev` so it binds into the fresh devtmpfs.
+    assert argv.index("/dev/dri") > argv.index("/dev")
