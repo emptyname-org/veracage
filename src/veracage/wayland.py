@@ -14,6 +14,7 @@ compositor that supports it (KWin ≥ 6, Mutter ≥ 47, sway ≥ 1.10).
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import os
 import secrets
 import signal
@@ -26,6 +27,17 @@ WESTON_STARTUP_TIMEOUT_S = 5.0
 
 class WestonStartFailed(RuntimeError):
     pass
+
+
+def _weston_preexec() -> None:  # pragma: no cover - runs post-fork in the child
+    """New session (so the launcher's Ctrl+C doesn't hit weston directly), plus
+    PR_SET_PDEATHSIG=SIGKILL so weston dies if the session leader is killed —
+    otherwise an orphaned weston keeps the scope cgroup alive and blocks the
+    crash-safe ExecStopPost cleanup."""
+    os.setsid()
+    ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0)
+    if os.getppid() == 1:  # leader already died before prctl took effect
+        os._exit(0)
 
 
 @contextlib.contextmanager
@@ -45,9 +57,9 @@ def nested_weston():
             # our bwrap'd app connects to the socket directly.
             "--shell=desktop-shell.so",
         ],
-        # Detach signals so Ctrl+C in the launcher kills the whole tree
-        # rather than just the launcher.
-        preexec_fn=os.setsid,
+        # New session (Ctrl+C in the launcher doesn't hit weston directly) +
+        # die-with-leader via PR_SET_PDEATHSIG (see _weston_preexec).
+        preexec_fn=_weston_preexec,
         # Close stdin so weston doesn't read from the user's terminal.
         stdin=subprocess.DEVNULL,
     )

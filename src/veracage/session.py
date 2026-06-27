@@ -17,6 +17,7 @@ so peer `veracage exec` invocations can find it without privileged lookup.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import hashlib
 import json
 import os
@@ -26,6 +27,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -71,6 +73,8 @@ class _SessionState:
 
 
 def _handle_request(state: _SessionState, req: dict) -> dict:
+    if not isinstance(req, dict):
+        return {"ok": False, "error": "request must be a JSON object"}
     cmd = req.get("cmd")
     if cmd == "exec":
         key = req.get("app")
@@ -143,7 +147,8 @@ def run_session(mountpoint: str, vault: str, first_app_key: str) -> int:
         stop.set()
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
-    # SIGCHLD wakes the selector loop so we can reap.
+    # No-op SIGCHLD handler. Note: under PEP 475 this does NOT interrupt
+    # sel.select; child reaping is driven by the 1s poll below (≤1s latency).
     signal.signal(signal.SIGCHLD, lambda *_: None)
 
     try:
@@ -158,55 +163,43 @@ def run_session(mountpoint: str, vault: str, first_app_key: str) -> int:
             # Spawn the host-side agent (tray UI, drop zone, clipboard
             # bridge). Soft-fails if PySide6 is missing.
             agent_proc = _spawn_agent(vault, mountpoint, wl_socket)
-
-            # Spawn the first app.
-            first_argv = bwrap_command(mountpoint, first_app, wl_socket, gpu)
-            first_proc = subprocess.Popen(first_argv)
-            state.children[first_proc.pid] = first_app_key
-
-            # Listen for exec/list/close requests.
-            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            srv.bind(str(sock_path))
-            os.chmod(sock_path, 0o600)
-            srv.listen(8)
-
-            sel = selectors.DefaultSelector()
-            sel.register(srv, selectors.EVENT_READ)
-
             try:
-                while not stop.is_set():
-                    _reap_children(state)
-                    if state.closing or not state.children:
-                        break
-                    events = sel.select(timeout=1.0)
-                    for key, _ in events:
-                        if key.fileobj is srv:
-                            _accept_one(srv, state)
+                # Spawn the first app.
+                first_argv = bwrap_command(mountpoint, first_app, wl_socket, gpu)
+                first_proc = subprocess.Popen(first_argv)
+                state.children[first_proc.pid] = first_app_key
+
+                # Listen for exec/list/close requests.
+                srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                srv.bind(str(sock_path))
+                os.chmod(sock_path, 0o600)
+                srv.listen(8)
+
+                sel = selectors.DefaultSelector()
+                sel.register(srv, selectors.EVENT_READ)
+                try:
+                    while not stop.is_set():
+                        _reap_children(state)
+                        if state.closing or not state.children:
+                            break
+                        events = sel.select(timeout=1.0)
+                        for key, _ in events:
+                            if key.fileobj is srv:
+                                _accept_one(srv, state)
+                finally:
+                    sel.close()
+                    srv.close()
+                    with contextlib.suppress(FileNotFoundError):
+                        sock_path.unlink()
+
+                # On graceful close, SIGTERM remaining apps so they can flush
+                # state, then wait a bounded time and SIGKILL any straggler.
+                _terminate_children(state)
             finally:
-                sel.close()
-                srv.close()
-                with contextlib.suppress(FileNotFoundError):
-                    sock_path.unlink()
-
-            # Tell remaining children to exit; --die-with-parent already
-            # covers SIGKILL of us, but on graceful close we send SIGTERM
-            # so apps can flush state.
-            for pid in list(state.children):
-                with contextlib.suppress(ProcessLookupError):
-                    os.kill(pid, signal.SIGTERM)
-            for pid in list(state.children):
-                with contextlib.suppress(ChildProcessError):
-                    os.waitpid(pid, 0)
-
-            # Tear down the agent.
-            if agent_proc and agent_proc.poll() is None:
-                with contextlib.suppress(ProcessLookupError):
-                    agent_proc.terminate()
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    agent_proc.wait(timeout=2)
-                if agent_proc.poll() is None:
-                    with contextlib.suppress(ProcessLookupError):
-                        agent_proc.kill()
+                # Always tear the agent down — even on an exception path — so
+                # it can't outlive us holding the mount NS open and blocking
+                # cleanup. PR_SET_PDEATHSIG is the backstop for a SIGKILL of us.
+                _terminate_agent(agent_proc)
 
         return 0
 
@@ -214,6 +207,53 @@ def run_session(mountpoint: str, vault: str, first_app_key: str) -> int:
         print(f"veracage: weston failed to start: {e}", file=sys.stderr)
         print("(install with: sudo apt install weston)", file=sys.stderr)
         return 1
+
+
+def _set_pdeathsig() -> None:  # pragma: no cover - runs post-fork in the child
+    """preexec_fn: receive SIGKILL when the session leader (our parent) dies.
+
+    A targeted kill of the leader must not orphan us holding the mount NS
+    open — that keeps the scope cgroup non-empty and blocks the ExecStopPost
+    cleanup, leaking the decrypted device. This is the backstop for the case
+    where no Python `finally` can run.
+    """
+    PR_SET_PDEATHSIG = 1
+    ctypes.CDLL("libc.so.6", use_errno=True).prctl(
+        PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+    if os.getppid() == 1:  # parent already died before prctl took effect
+        os._exit(0)
+
+
+def _terminate_children(state: _SessionState, timeout: float = 3.0) -> None:
+    """SIGTERM tracked apps, wait up to `timeout`s, then SIGKILL stragglers."""
+    for pid in list(state.children):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + timeout
+    for pid in list(state.children):
+        while time.monotonic() < deadline:
+            try:
+                if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                    break
+            except ChildProcessError:
+                break
+            time.sleep(0.05)
+        else:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(pid, 0)
+
+
+def _terminate_agent(agent_proc) -> None:
+    if agent_proc and agent_proc.poll() is None:
+        with contextlib.suppress(ProcessLookupError):
+            agent_proc.terminate()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            agent_proc.wait(timeout=2)
+        if agent_proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                agent_proc.kill()
 
 
 def _spawn_agent(vault: str, mountpoint: str, weston_socket: Path):
@@ -231,7 +271,7 @@ def _spawn_agent(vault: str, mountpoint: str, weston_socket: Path):
         "--vault", vault,
         "--mountpoint", mountpoint,
         "--weston-socket", str(weston_socket),
-    ])
+    ], preexec_fn=_set_pdeathsig)
 
 
 def _find_entry_script() -> str | None:
@@ -239,6 +279,9 @@ def _find_entry_script() -> str | None:
     here = Path(__file__).resolve()
     cand = here.parent.parent / "bin" / "veracage"
     return str(cand) if cand.is_file() else None
+
+
+_MAX_REQUEST_BYTES = 64 * 1024  # control requests are tiny; cap to bound memory
 
 
 def _accept_one(srv: socket.socket, state: _SessionState) -> None:
@@ -252,13 +295,16 @@ def _accept_one(srv: socket.socket, state: _SessionState) -> None:
                 if not chunk:
                     break
                 data += chunk
+                if len(data) > _MAX_REQUEST_BYTES:
+                    raise ValueError("request too large")
             req = json.loads(data.decode().strip() or "{}")
+            reply = _handle_request(state, req)
         except (ValueError, OSError) as e:
-            conn.sendall((json.dumps({"ok": False, "error": str(e)}) + "\n").encode())
-            return
-
-        reply = _handle_request(state, req)
-        conn.sendall((json.dumps(reply) + "\n").encode())
+            reply = {"ok": False, "error": str(e)}
+        except Exception as e:  # a handler bug must not kill the session loop
+            reply = {"ok": False, "error": f"internal error: {e}"}
+        with contextlib.suppress(OSError):
+            conn.sendall((json.dumps(reply) + "\n").encode())
 
 
 # ---------------------------------------------------- client (`veracage exec`)

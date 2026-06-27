@@ -157,6 +157,41 @@ def test_reap_never_waits_on_minus_one(state):
     assert -1 not in seen
 
 
+# ------------------------------------------------ control-socket robustness -
+
+def test_handle_request_rejects_non_dict(state):
+    """A valid-JSON non-object (e.g. []) must not crash the handler (H2)."""
+    reply = session._handle_request(state, [])
+    assert reply == {"ok": False, "error": "request must be a JSON object"}
+
+
+def _fake_server(payload: bytes):
+    """A mock srv whose accept() yields one pre-fed connection; returns
+    (mock_srv, client_side) — read the reply off client_side."""
+    import socket as _socket
+    srv_side, cli_side = _socket.socketpair()
+    cli_side.sendall(payload)
+    fake = mock.Mock()
+    fake.accept.return_value = (srv_side, None)
+    return fake, cli_side
+
+
+def test_accept_one_survives_non_dict_request(state):
+    """_accept_one must reply with an error, not raise, for a non-dict body."""
+    fake_srv, cli = _fake_server(b"[]\n")
+    session._accept_one(fake_srv, state)   # must not raise
+    assert b'"ok": false' in cli.recv(4096)
+    cli.close()
+
+
+def test_accept_one_caps_oversized_request(state):
+    """An unbounded trickle is rejected, not accumulated forever (M2)."""
+    fake_srv, cli = _fake_server(b"x" * (70 * 1024))  # no newline, over the cap
+    session._accept_one(fake_srv, state)
+    assert b"too large" in cli.recv(4096)
+    cli.close()
+
+
 # ---------------------------------------------------------- socket path ----
 
 def test_session_socket_path_is_per_vault(tmp_xdg_runtime):
