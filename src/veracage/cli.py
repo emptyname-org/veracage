@@ -35,12 +35,6 @@ _FORWARD_ENV = (
 )
 
 
-def _entry_script() -> str:
-    """Path to src/bin/veracage — passed to the helper as --continuation."""
-    # __file__ = src/veracage/cli.py  →  src/bin/veracage
-    return str(Path(__file__).resolve().parent.parent / "bin" / "veracage")
-
-
 # ----------------------------------------------------------- open --------
 
 def cmd_open(args: argparse.Namespace) -> int:
@@ -119,10 +113,7 @@ def cmd_open(args: argparse.Namespace) -> int:
         HELPER_PATH,
         "--vault", str(vault),
         "--mountpoint", str(mountpoint),
-        "--user", str(os.getuid()),
-        "--group", str(os.getgid()),
         *env_args,
-        "--continuation", _entry_script(),
         "--",
         "_continue", "--mountpoint", str(mountpoint),
                      "--vault", str(vault),

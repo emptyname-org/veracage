@@ -8,7 +8,7 @@ Invoked as root via pkexec. Sequence:
          a. unshare(CLONE_NEWNS), make / rslave
          b. cryptsetup --type tcrypt open VAULT veracage-XXXX  (prompts for password)
          c. mount /dev/mapper/veracage-XXXX MOUNTPOINT (nodev,nosuid)
-         d. drop privileges (setresgid, setresuid)
+         d. drop privileges to the PKEXEC_UID caller (setresgid/setresuid)
          e. exec(continuation)
     3. parent:
          a. waitpid(child)
@@ -17,6 +17,14 @@ Invoked as root via pkexec. Sequence:
 The mount is created inside the child's mount NS only — invisible to the
 host. The dm-crypt device (`/dev/mapper/veracage-XXXX`) IS globally
 visible to root (kernel limitation, documented in §3 of the design).
+
+SECURITY: this helper is reachable by any active local user via pkexec
+(polkit `auth_self_keep`). It must therefore NOT trust caller-supplied
+identity or code paths. The uid/gid to drop to come from PKEXEC_UID (set
+by pkexec to the real caller); the continuation is pinned to this helper's
+own install tree; forwarded env vars are allowlisted. A direct
+`pkexec veracage-helper --user 0 --continuation /bin/sh` therefore can't
+yield a root shell — those arguments no longer exist.
 """
 from __future__ import annotations
 
@@ -24,6 +32,7 @@ import argparse
 import ctypes
 import hashlib
 import os
+import pwd
 import secrets
 import signal
 import subprocess
@@ -31,6 +40,14 @@ import sys
 from pathlib import Path
 
 LOCKS_DIR = Path("/run/veracage")
+
+# Env vars the launcher may forward into the (unprivileged) continuation.
+# pkexec strips the environment; the launcher re-supplies these via
+# --setenv. Anything outside this set is dropped, so a direct pkexec
+# caller can't smuggle e.g. LD_PRELOAD/LD_LIBRARY_PATH through us.
+_ALLOWED_SETENV = frozenset({
+    "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "DISPLAY", "LANG",
+})
 
 
 def _vault_hash(p: str) -> str:
@@ -76,22 +93,56 @@ def fail(msg: str, code: int = 1) -> None:
     sys.exit(code)
 
 
+def resolve_caller(environ) -> tuple[int, int]:
+    """Return (uid, gid) of the invoking user, taken from PKEXEC_UID.
+
+    NEVER trust a caller-supplied uid/gid: this helper is reachable by any
+    active local user via pkexec, so honouring an argv uid would let them
+    pass `--user 0` and obtain a root shell. pkexec sets PKEXEC_UID to the
+    real caller's uid; the primary gid comes from the passwd database.
+    """
+    raw = environ.get("PKEXEC_UID")
+    if raw is None or not raw.isdigit():
+        raise PermissionError("PKEXEC_UID not set; refusing to run outside pkexec")
+    uid = int(raw)
+    if uid == 0:
+        raise PermissionError("refusing to run for a root caller")
+    try:
+        gid = pwd.getpwuid(uid).pw_gid
+    except KeyError:
+        raise PermissionError(f"unknown caller uid {uid}") from None
+    return uid, gid
+
+
+def continuation_path() -> Path:
+    """Absolute path to the trusted continuation (src/bin/veracage).
+
+    Pinned relative to this helper's own (polkit-pinned) location so the
+    caller cannot redirect us at an arbitrary executable.
+    """
+    return Path(__file__).resolve().parent.parent / "src" / "bin" / "veracage"
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--vault", required=True)
     p.add_argument("--mountpoint", required=True)
-    p.add_argument("--user", type=int, required=True)
-    p.add_argument("--group", type=int, required=True)
-    p.add_argument("--continuation", required=True)
     p.add_argument("--setenv", action="append", default=[], metavar="KEY=VALUE",
                    help="env var to set before exec'ing the continuation; "
-                        "needed because pkexec strips most of the environment")
+                        "needed because pkexec strips most of the environment. "
+                        "Restricted to an allowlist (see _ALLOWED_SETENV).")
     p.add_argument("rest", nargs=argparse.REMAINDER,
                    help="argv to pass to the continuation after `--`")
     args = p.parse_args()
 
     if os.geteuid() != 0:
         fail("must be invoked as root (via pkexec)", 2)
+
+    # Identity comes from pkexec, never from argv (see resolve_caller).
+    try:
+        caller_uid, caller_gid = resolve_caller(os.environ)
+    except PermissionError as e:
+        fail(str(e), 2)
 
     vault = Path(args.vault).resolve()
     if not vault.is_file():
@@ -101,7 +152,7 @@ def main() -> int:
     if not str(mountpoint).startswith("/run/veracage/"):
         fail(f"mountpoint must be under /run/veracage/: {mountpoint}", 2)
 
-    cont = Path(args.continuation).resolve()
+    cont = continuation_path()
     if not cont.is_file() or not os.access(cont, os.X_OK):
         fail(f"continuation not executable: {cont}", 2)
 
@@ -120,7 +171,7 @@ def main() -> int:
     # Lock file used by `veracage-cleanup` (systemd ExecStopPost) so that
     # even a SIGKILL of the launcher leaves a recoverable trail.
     lock_file = LOCKS_DIR / f"{_vault_hash(str(vault))}.lock"
-    _write_lock(lock_file, dm_name, str(mountpoint), args.user)
+    _write_lock(lock_file, dm_name, str(mountpoint), caller_uid)
 
     pid = os.fork()
     if pid == 0:
@@ -130,7 +181,7 @@ def main() -> int:
             make_root_rslave()
 
             mountpoint.mkdir(mode=0o700, parents=True, exist_ok=True)
-            os.chown(mountpoint, args.user, args.group)
+            os.chown(mountpoint, caller_uid, caller_gid)
 
             # Open the TrueCrypt/VeraCrypt volume. Prompts on tty.
             r = subprocess.run(
@@ -151,16 +202,17 @@ def main() -> int:
                 subprocess.run(["cryptsetup", "close", dm_name])
                 fail(f"mount failed: {r.returncode}", r.returncode)
 
-            # Drop privileges to the calling user.
+            # Drop privileges to the pkexec caller (gid first, then uid).
             os.setgroups([])
-            os.setresgid(args.group, args.group, args.group)
-            os.setresuid(args.user, args.user, args.user)
+            os.setresgid(caller_gid, caller_gid, caller_gid)
+            os.setresuid(caller_uid, caller_uid, caller_uid)
 
-            # Re-establish env vars that pkexec stripped (allowlist enforced
-            # by the launcher; we trust args here because we ran as root).
+            # Re-establish the handful of env vars pkexec stripped. Only
+            # allowlisted keys are honoured (see _ALLOWED_SETENV) so a
+            # caller can't inject e.g. LD_PRELOAD into the continuation.
             for kv in args.setenv:
                 k, _, v = kv.partition("=")
-                if k:
+                if k in _ALLOWED_SETENV:
                     os.environ[k] = v
 
             # Hand off to the continuation. Replaces this process; mount NS

@@ -81,11 +81,16 @@ def test_open_unit_name_includes_vault_hash(monkeypatch, configured, fake_vault)
     assert expected in unit
 
 
-def test_open_passes_vault_user_group(monkeypatch, configured, fake_vault):
+def test_open_passes_vault_but_not_identity(monkeypatch, configured, fake_vault):
+    """The launcher passes the vault path but NOT uid/gid/continuation: the
+    privileged helper derives identity from PKEXEC_UID and pins the
+    continuation itself, so a direct `pkexec` call can't choose --user 0."""
     _, argv = _run_open(monkeypatch, fake_vault, "kate")
-    assert ("--vault", str(fake_vault)) in zip(argv, argv[1:])
-    assert ("--user", str(os.getuid())) in zip(argv, argv[1:])
-    assert ("--group", str(os.getgid())) in zip(argv, argv[1:])
+    pairs = list(zip(argv, argv[1:]))
+    assert ("--vault", str(fake_vault)) in pairs
+    assert ("--user", str(os.getuid())) not in pairs
+    assert ("--group", str(os.getgid())) not in pairs
+    assert "--continuation" not in argv
 
 
 def test_open_forwards_wayland_display(monkeypatch, configured, fake_vault):
@@ -100,14 +105,6 @@ def test_open_forwards_xdg_runtime_dir(monkeypatch, configured, fake_vault):
     pairs = list(zip(argv, argv[1:]))
     setenv_pairs = [b for a, b in pairs if a == "--setenv"]
     assert any(s.startswith("XDG_RUNTIME_DIR=") for s in setenv_pairs)
-
-
-def test_open_continuation_path_exists(monkeypatch, configured, fake_vault):
-    _, argv = _run_open(monkeypatch, fake_vault, "kate")
-    cont_idx = argv.index("--continuation")
-    cont_path = argv[cont_idx + 1]
-    assert cont_path.endswith("/src/bin/veracage")
-    assert os.path.isfile(cont_path), f"continuation path {cont_path} does not exist on disk"
 
 
 def test_open_uses_last_used_app_when_unspecified(monkeypatch, configured, fake_vault):
