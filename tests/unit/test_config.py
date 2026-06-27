@@ -121,3 +121,47 @@ def test_per_volume_inherits_default_when_gpu_unset(tmp_xdg_config):
     assert loaded.gpu_for("/tmp/x.vc") is True              # gpu unset -> default
     assert loaded.default_app_for("/tmp/x.vc") == "okular"
     assert loaded.default_app_for("/tmp/none.vc") is None
+
+
+# ------------------------------------------------ robustness to bad input ---
+
+def test_malformed_toml_degrades_to_empty(tmp_xdg_config, capsys):
+    p = config.config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("this is not = valid = toml [[[\n")
+    cfg = config.load()
+    assert cfg.is_empty()
+    assert "cannot read" in capsys.readouterr().err
+
+
+def test_apps_not_a_table_is_ignored(tmp_xdg_config):
+    p = config.config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text('apps = "nope"\n')
+    assert config.load().is_empty()
+
+
+def test_gpu_string_does_not_fail_open(tmp_xdg_config, capsys):
+    p = config.config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text('[default]\ngpu = "false"\n')   # truthy string, not a bool
+    cfg = config.load()
+    assert cfg.gpu is False
+    assert "gpu" in capsys.readouterr().err
+
+
+def test_per_volume_gpu_string_does_not_fail_open(tmp_xdg_config):
+    p = config.config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text('[volumes."/tmp/x.vc"]\ngpu = "yes"\n')
+    assert config.load().gpu_for("/tmp/x.vc") is False
+
+
+def test_control_chars_roundtrip(tmp_xdg_config):
+    """A name with a newline/tab must serialize to valid TOML (so the next
+    load doesn't choke)."""
+    weird = apps.App(key="w", name="line1\nline2\ttab", category="text",
+                     exec="w", args=[])
+    config.save(config.Config(apps={"w": weird}))
+    loaded = config.load()
+    assert loaded.apps["w"].name == "line1\nline2\ttab"

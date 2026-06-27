@@ -68,44 +68,72 @@ class Config:
 
 
 def load() -> Config:
+    """Parse the config. Tolerant of a malformed/crafted file: any parse or
+    type error degrades to defaults with a warning rather than crashing the
+    agent/session (a same-uid process can write this file)."""
     p = config_path()
     if not p.is_file():
-        return Config(apps={}, last_used_app=None)
-    with open(p, "rb") as f:
-        raw = tomllib.load(f)
-    apps_raw = raw.get("apps", {}) or {}
+        return Config(apps={})
+    try:
+        with open(p, "rb") as f:
+            raw = tomllib.load(f)
+    except (tomllib.TOMLDecodeError, OSError) as e:
+        print(f"veracage: cannot read {p}: {e}; using empty config",
+              file=sys.stderr)
+        return Config(apps={})
+    if not isinstance(raw, dict):
+        return Config(apps={})
+
     apps: dict[str, App] = {}
-    for key, entry in apps_raw.items():
-        try:
-            apps[key] = App(
-                key=key,
-                name=entry["name"],
-                category=entry["category"],
-                exec=entry["exec"],
-                args=list(entry.get("args", [])),
-                note=entry.get("note", ""),
-            )
-        except KeyError as e:
-            print(f"veracage: config entry [apps.{key}] missing {e}; skipping",
-                  file=sys.stderr)
-    default = raw.get("default") or {}
+    apps_raw = raw.get("apps")
+    if isinstance(apps_raw, dict):
+        for key, entry in apps_raw.items():
+            if not isinstance(entry, dict):
+                print(f"veracage: [apps.{key}] is not a table; skipping",
+                      file=sys.stderr)
+                continue
+            try:
+                apps[key] = App(
+                    key=key,
+                    name=entry["name"],
+                    category=entry["category"],
+                    exec=entry["exec"],
+                    args=list(entry.get("args", [])),
+                    note=entry.get("note", ""),
+                )
+            except (KeyError, TypeError) as e:
+                print(f"veracage: config entry [apps.{key}] invalid ({e}); skipping",
+                      file=sys.stderr)
+
+    default = raw.get("default")
+    if not isinstance(default, dict):
+        default = {}
     last = default.get("last_used_app")
-    gpu = bool(default.get("gpu", False))
-    suspend_action = str(default.get("suspend_action", "dismount"))
+    if not isinstance(last, str):
+        last = None
+    gpu = _coerce_bool(default.get("gpu", False), "default.gpu")
+    suspend_action = default.get("suspend_action", "dismount")
     if suspend_action not in ("dismount", "ignore"):
         print(f"veracage: invalid suspend_action {suspend_action!r} "
-              f"(want 'dismount' or 'ignore'); using 'dismount'",
-              file=sys.stderr)
+              f"(want 'dismount' or 'ignore'); using 'dismount'", file=sys.stderr)
         suspend_action = "dismount"
+
     volumes: dict[str, VolumeConfig] = {}
-    for key, entry in (raw.get("volumes") or {}).items():
-        if not isinstance(entry, dict):
-            continue
-        volumes[_norm_vault(key)] = VolumeConfig(
-            gpu=entry.get("gpu"),
-            default_app=entry.get("default_app"),
-            display_name=entry.get("display_name"),
-        )
+    vol_raw = raw.get("volumes")
+    if isinstance(vol_raw, dict):
+        for key, entry in vol_raw.items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                nk = _norm_vault(key)
+            except (OSError, RuntimeError):
+                nk = str(Path(key).expanduser())
+            gval = entry.get("gpu")
+            volumes[nk] = VolumeConfig(
+                gpu=_coerce_bool(gval, f'volumes."{key}".gpu') if gval is not None else None,
+                default_app=entry.get("default_app"),
+                display_name=entry.get("display_name"),
+            )
     return Config(apps=apps, last_used_app=last, gpu=gpu,
                   suspend_action=suspend_action, volumes=volumes)
 
@@ -142,8 +170,23 @@ def save(cfg: Config) -> Path:
     return p
 
 
+_ESC_MAP = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\t": "\\t",
+            "\r": "\\r", "\f": "\\f", "\b": "\\b"}
+
+
 def _esc(s: str) -> str:
-    return s.replace("\\", "\\\\").replace('"', '\\"')
+    """Escape a string for a TOML basic string, including control chars, so a
+    name/path with a newline/tab can't produce an invalid file that the next
+    load() chokes on."""
+    out = []
+    for ch in s:
+        if ch in _ESC_MAP:
+            out.append(_ESC_MAP[ch])
+        elif ord(ch) < 0x20:
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def _toml_list(xs: list[str]) -> str:
@@ -152,3 +195,14 @@ def _toml_list(xs: list[str]) -> str:
 
 def _toml_bool(b: bool) -> str:
     return "true" if b else "false"
+
+
+def _coerce_bool(val: object, where: str) -> bool:
+    """Strict bool: only a real TOML bool counts. Anything else (e.g. the
+    string "false", which is truthy) warns and is treated as False — so a
+    bad gpu value fails *closed*, not open."""
+    if isinstance(val, bool):
+        return val
+    print(f"veracage: {where} should be true/false, got {val!r}; using false",
+          file=sys.stderr)
+    return False
