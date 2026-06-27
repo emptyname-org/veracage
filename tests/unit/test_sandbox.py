@@ -1,0 +1,107 @@
+"""bwrap argv shape — the design's security flags must always be present."""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+
+from veracage import sandbox
+from veracage.apps import KNOWN_APPS
+
+
+@pytest.fixture
+def argv():
+    sock = Path("/tmp/veracage-test.sock")
+    return sandbox.bwrap_command("/run/veracage/abc", KNOWN_APPS["kate"], sock)
+
+
+REQUIRED_FLAGS = [
+    # namespace flags — required for isolation
+    "--unshare-pid",
+    "--unshare-uts",
+    "--unshare-ipc",
+    "--unshare-cgroup-try",
+    "--unshare-net",
+    # safety
+    "--die-with-parent",
+    "--new-session",
+]
+
+
+@pytest.mark.parametrize("flag", REQUIRED_FLAGS)
+def test_required_flag_present(argv, flag):
+    assert flag in argv, f"{flag} missing from bwrap argv"
+
+
+def test_starts_with_bwrap(argv):
+    assert argv[0] == "bwrap"
+
+
+def test_app_command_appears_after_double_dash(argv):
+    sep = argv.index("--")
+    assert argv[sep + 1] == "kate"
+    assert "/vault" in argv[sep + 1:]
+
+
+def test_vault_is_bound_at_slash_vault(argv):
+    # `--bind <mp> /vault` must be present
+    pairs = list(zip(argv, argv[1:], argv[2:]))
+    assert any(
+        a == "--bind" and b == "/run/veracage/abc" and c == "/vault"
+        for a, b, c in pairs
+    ), "vault not bound at /vault"
+
+
+def test_runtime_dir_is_tmpfs(argv):
+    """The host's $XDG_RUNTIME_DIR must NOT be bound through wholesale —
+    instead a tmpfs hides it, and only the wayland socket is bound."""
+    uid = os.getuid()
+    rt = f"/run/user/{uid}"
+    pairs = list(zip(argv, argv[1:]))
+
+    assert ("--tmpfs", rt) in pairs, "runtime dir is not a tmpfs"
+
+    # Forbid any --bind / --ro-bind of the entire runtime dir
+    forbidden = [
+        i for i, (a, b) in enumerate(pairs)
+        if a in {"--bind", "--ro-bind"} and b == rt
+    ]
+    assert not forbidden, "host runtime dir is wholesale-bound — clipboard leak risk"
+
+
+def test_only_wayland_socket_bound_into_runtime_dir(argv):
+    """The Weston socket should be bound at <runtime>/wayland-0; nothing else."""
+    uid = os.getuid()
+    target = f"/run/user/{uid}/wayland-0"
+    triples = list(zip(argv, argv[1:], argv[2:]))
+    binds_into_runtime = [
+        (b, c) for a, b, c in triples
+        if a == "--bind" and c.startswith(f"/run/user/{uid}/")
+    ]
+    assert binds_into_runtime == [("/tmp/veracage-test.sock", target)]
+
+
+def test_wayland_display_is_wayland_0(argv):
+    triples = list(zip(argv, argv[1:], argv[2:]))
+    assert ("--setenv", "WAYLAND_DISPLAY", "wayland-0") in triples
+
+
+def test_home_is_vault(argv):
+    triples = list(zip(argv, argv[1:], argv[2:]))
+    assert ("--setenv", "HOME", "/vault") in triples
+
+
+def test_no_share_user_no_share_net_no_network(argv):
+    """Belt-and-suspenders: no --share-net and no --share-user flags."""
+    assert "--share-net" not in argv
+    assert "--share-user" not in argv
+
+
+def test_app_args_are_passed(argv):
+    # Kate's catalog entry is ["/vault"]; the bwrap argv ends with `kate /vault`.
+    assert argv[-2:] == ["kate", "/vault"]
+
+
+def test_chdir_to_vault(argv):
+    assert ("--chdir", "/vault") in list(zip(argv, argv[1:]))

@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local dev virtualenv (not part of the project)
+.venv/
+
+# Runtime / scratch
+/run/
+*.swp
+*.orig
