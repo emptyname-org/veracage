@@ -26,9 +26,9 @@
 use std::env;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -48,6 +48,32 @@ const ALLOWED_SETENV: &[&str] = &[
 /// VERACAGE_CONTINUATION=<prefix>/bin/veracage). Never caller-controlled.
 fn continuation() -> &'static str {
     option_env!("VERACAGE_CONTINUATION").unwrap_or("/usr/local/bin/veracage")
+}
+
+/// True iff `arg` is exactly /run/veracage/<one-non-empty-component>. Pure
+/// (no filesystem) so it can be unit-tested. Defeats `..` traversal and the
+/// bare-directory case that a component *prefix* check would wrongly allow.
+fn mountpoint_ok(arg: &str) -> bool {
+    let mut c = Path::new(arg).components();
+    matches!(c.next(), Some(Component::RootDir))
+        && c.next().map(|x| x.as_os_str().as_bytes()) == Some(&b"run"[..])
+        && c.next().map(|x| x.as_os_str().as_bytes()) == Some(&b"veracage"[..])
+        && matches!(c.next(), Some(Component::Normal(n)) if !n.is_empty())
+        && c.next().is_none()
+}
+
+/// Resolve the validated mountpoint under the *canonical* /run/veracage, so
+/// neither `..` nor a symlinked component can redirect the root chown/mount.
+fn validated_mountpoint(arg: &str) -> Result<PathBuf, String> {
+    if !mountpoint_ok(arg) {
+        return Err(format!("mountpoint must be /run/veracage/<name>: {arg}"));
+    }
+    let name = Path::new(arg)
+        .file_name()
+        .ok_or_else(|| "mountpoint has no final component".to_string())?;
+    let parent = std::fs::canonicalize("/run/veracage")
+        .map_err(|e| format!("/run/veracage: {e}"))?;
+    Ok(parent.join(name))
 }
 
 fn fail(msg: &str, code: i32) -> ! {
@@ -122,7 +148,7 @@ fn resolve_caller() -> Result<(u32, u32), String> {
 fn vault_hash(p: &Path) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(p.to_string_lossy().as_bytes());
+    h.update(p.as_os_str().as_bytes());  // raw bytes — matches Python on UTF-8 paths
     h.finalize()
         .iter()
         .take(8)
@@ -164,8 +190,20 @@ fn write_lock(path: &str, dm_name: &str, mountpoint: &Path, uid: u32) {
         "dm_name={dm_name}\nmountpoint={}\nuser_uid={uid}\n",
         mountpoint.display()
     );
-    std::fs::write(path, body).unwrap_or_else(|e| fail(&format!("write lock {path}: {e}"), 1));
-    set_mode(path, 0o600);
+    // Clear any stale lock (the dir is root-only-writable), then create fresh
+    // with O_EXCL|O_NOFOLLOW so a pre-planted symlink/file can't redirect this
+    // root write. Mode 0600 is set at creation (no separate chmod to fail).
+    let _ = std::fs::remove_file(path);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .unwrap_or_else(|e| fail(&format!("create lock {path}: {e}"), 1));
+    use std::io::Write;
+    f.write_all(body.as_bytes())
+        .unwrap_or_else(|e| fail(&format!("write lock {path}: {e}"), 1));
 }
 
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
@@ -306,13 +344,17 @@ fn main() {
         fail(&format!("vault is not a file: {}", vault.display()), 2);
     }
 
-    let mountpoint = PathBuf::from(&args.mountpoint);
-    if !mountpoint.starts_with("/run/veracage/") {
-        fail(
-            &format!("mountpoint must be under /run/veracage/: {}", args.mountpoint),
-            2,
-        );
+    // Create the root-owned mountpoint parent BEFORE validating against it.
+    if let Err(e) = std::fs::create_dir_all("/run/veracage") {
+        fail(&format!("/run/veracage: {e}"), 1);
     }
+    set_mode("/run/veracage", 0o755);
+
+    // Mountpoint must be a direct child of the canonical /run/veracage —
+    // resolved here so `..` traversal, the bare dir, or symlinked components
+    // can't redirect the root chown/mount that the child performs.
+    let mountpoint = validated_mountpoint(&args.mountpoint)
+        .unwrap_or_else(|e| fail(&e, 2));
 
     let cont = PathBuf::from(continuation());
     if !is_executable(&cont) {
@@ -320,9 +362,6 @@ fn main() {
     }
 
     let dm_name = random_dm_name();
-
-    let _ = std::fs::create_dir_all("/run/veracage");
-    set_mode("/run/veracage", 0o755);
 
     let lock = format!("/run/veracage/{}.lock", vault_hash(&vault));
     write_lock(&lock, &dm_name, &mountpoint, uid);
@@ -380,6 +419,25 @@ mod tests {
         assert!(!ALLOWED_SETENV.contains(&"LD_PRELOAD"));
         assert!(!ALLOWED_SETENV.contains(&"LD_LIBRARY_PATH"));
         assert!(ALLOWED_SETENV.contains(&"WAYLAND_DISPLAY"));
+    }
+
+    #[test]
+    fn mountpoint_accepts_direct_child() {
+        assert!(mountpoint_ok("/run/veracage/abc123"));
+        assert!(mountpoint_ok("/run/veracage/0123456789abcdef"));
+    }
+
+    #[test]
+    fn mountpoint_rejects_traversal_and_bare_dir() {
+        // C1 regression guard: these must NOT pass.
+        assert!(!mountpoint_ok("/run/veracage/../../etc/cron.d"));
+        assert!(!mountpoint_ok("/run/veracage/../veracage/x"));
+        assert!(!mountpoint_ok("/run/veracage"));
+        assert!(!mountpoint_ok("/run/veracage/"));
+        assert!(!mountpoint_ok("/run/veracage/a/b"));
+        assert!(!mountpoint_ok("/tmp/evil"));
+        assert!(!mountpoint_ok("/run/veracageX/x"));
+        assert!(!mountpoint_ok("run/veracage/x"));
     }
 
     // Filled in from `python3 -c 'import hashlib;
