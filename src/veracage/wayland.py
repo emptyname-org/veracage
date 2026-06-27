@@ -21,7 +21,6 @@ import subprocess
 import time
 from pathlib import Path
 
-
 WESTON_STARTUP_TIMEOUT_S = 5.0
 
 

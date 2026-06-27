@@ -31,8 +31,7 @@ from pathlib import Path
 
 from . import config
 from .sandbox import bwrap_command
-from .wayland import nested_weston, WestonStartFailed
-
+from .wayland import WestonStartFailed, nested_weston
 
 # --------------------------------------------------------------- paths -----
 
@@ -75,6 +74,8 @@ def _handle_request(state: _SessionState, req: dict) -> dict:
     cmd = req.get("cmd")
     if cmd == "exec":
         key = req.get("app")
+        if not isinstance(key, str):
+            return {"ok": False, "error": "missing or invalid 'app'"}
         cfg = config.load()
         app = cfg.apps.get(key)
         if app is None:
@@ -159,7 +160,7 @@ def run_session(mountpoint: str, vault: str, first_app_key: str) -> int:
             agent_proc = _spawn_agent(vault, mountpoint, wl_socket)
 
             # Spawn the first app.
-            first_argv = bwrap_command(mountpoint, first_app, wl_socket)
+            first_argv = bwrap_command(mountpoint, first_app, wl_socket, gpu)
             first_proc = subprocess.Popen(first_argv)
             state.children[first_proc.pid] = first_app_key
 

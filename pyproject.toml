@@ -1,0 +1,51 @@
+# Veracage — project metadata and tool config.
+#
+# The supported install is `make install` (see Makefile): it places the
+# Python package, the Rust privilege helper, the polkit policy and the
+# systemd bits under $PREFIX. This file primarily pins linter/type-checker
+# config so local runs and CI agree, and carries package metadata.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "veracage"
+version = "0.4.0"
+description = "VeraCrypt sandboxing wrapper: mount a vault into a private namespace and run viewer apps in a bubblewrap sandbox with explicit, user-driven host transfer."
+requires-python = ">=3.11"
+authors = [{ name = "emptyname", email = "noreply@emptyname.org" }]
+readme = "README.md"
+keywords = ["veracrypt", "sandbox", "bubblewrap", "wayland", "security"]
+
+[project.optional-dependencies]
+ui = ["PySide6"]          # config screen, tray, drop zone, clipboard bridge
+dev = ["pytest", "ruff", "mypy"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# --- linting -------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+ignore = [
+    "E501",   # long comment/table lines are fine; logic lines stay short
+    "B905",   # zip(argv, argv[1:]) windowing is intentionally ragged
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011"]
+
+# --- type checking -------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true   # PySide6 / gi are optional/untyped system deps
+warn_unused_ignores = true
+files = ["src/veracage"]

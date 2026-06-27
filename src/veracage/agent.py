@@ -24,12 +24,8 @@ from . import clipboard, config, session, transfer
 
 def run(vault: str, mountpoint: str, weston_socket: str) -> int:
     try:
-        from PySide6.QtCore import Qt
         from PySide6.QtGui import QIcon
-        from PySide6.QtWidgets import (
-            QApplication, QFileDialog, QLabel, QMenu, QSystemTrayIcon,
-            QVBoxLayout, QWidget,
-        )
+        from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
     except ImportError:
         sys.stderr.write(
             "veracage-agent: PySide6 not installed; UI disabled.\n"
@@ -149,7 +145,7 @@ def _start_suspend_watcher(vault: str, suspend_action: str = "dismount") -> None
         import gi
         gi.require_version("Gio", "2.0")
         gi.require_version("GLib", "2.0")
-        from gi.repository import GLib, Gio
+        from gi.repository import Gio, GLib
     except (ImportError, ValueError):
         sys.stderr.write(
             "veracage-agent: python3-gi not available; suspend handling off.\n"
@@ -205,7 +201,7 @@ def _close_session(vault: str, qt_app):
 class DropZone:
     def __init__(self, mountpoint: str, tray):
         from PySide6.QtCore import Qt
-        from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
+        from PySide6.QtWidgets import QLabel, QVBoxLayout
         self.mountpoint = mountpoint
         self.tray = tray
         self.widget = _DropWidget(self._handle_drop)

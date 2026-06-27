@@ -10,8 +10,7 @@ from pathlib import Path
 
 from . import cleanup, config, configure, session
 from .sandbox import bwrap_command  # noqa: F401  (kept for downstream tests)
-from .wayland import nested_weston, WestonStartFailed  # noqa: F401
-
+from .wayland import WestonStartFailed, nested_weston  # noqa: F401
 
 HELPER_PATH = os.environ.get(
     "VERACAGE_HELPER",

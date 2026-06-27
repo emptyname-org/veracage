@@ -60,6 +60,28 @@ def test_exec_handles_missing_binary(state, configured):
     assert "missing dependency" in reply["error"]
 
 
+def test_exec_passes_gpu_flag_through(state, configured):
+    """state.gpu must reach bwrap_command (regression: first app + exec)."""
+    state.gpu = True
+    captured = {}
+
+    def fake_bwrap(_mp, app, _sock, gpu=False):
+        captured["gpu"] = gpu
+        return ["bwrap", app.exec]
+
+    with mock.patch("veracage.session.bwrap_command", side_effect=fake_bwrap), \
+         mock.patch("veracage.session.subprocess.Popen",
+                    return_value=mock.Mock(pid=7)):
+        session._handle_request(state, {"cmd": "exec", "app": "kate"})
+    assert captured["gpu"] is True
+
+
+def test_exec_rejects_non_string_app(state, configured):
+    reply = session._handle_request(state, {"cmd": "exec", "app": 123})
+    assert reply["ok"] is False
+    assert state.children == {}
+
+
 # ----------------------------------------------------------------- list ----
 
 def test_list_returns_children(state):

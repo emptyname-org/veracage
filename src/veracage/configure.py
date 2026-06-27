@@ -13,8 +13,7 @@ import argparse
 import sys
 
 from . import config
-from .apps import KNOWN_APPS, CATEGORY_LABELS, CATEGORY_ORDER, App, detected
-
+from .apps import CATEGORY_LABELS, CATEGORY_ORDER, KNOWN_APPS, App, detected
 
 # ---------------------------------------------------------------- helpers ---
 
@@ -88,8 +87,15 @@ def _text(_args: argparse.Namespace) -> int:
 def _qt(_args: argparse.Namespace) -> int:
     try:
         from PySide6.QtWidgets import (
-            QApplication, QCheckBox, QDialog, QDialogButtonBox,
-            QGroupBox, QLabel, QScrollArea, QVBoxLayout, QWidget,
+            QApplication,
+            QCheckBox,
+            QDialog,
+            QDialogButtonBox,
+            QGroupBox,
+            QLabel,
+            QScrollArea,
+            QVBoxLayout,
+            QWidget,
         )
     except ImportError:
         print("veracage: PySide6 not installed — falling back to text mode.\n"
@@ -101,7 +107,7 @@ def _qt(_args: argparse.Namespace) -> int:
     cfg = config.load()
     enabled = set(cfg.apps)
 
-    app = QApplication.instance() or QApplication([])
+    app = QApplication.instance() or QApplication([])  # noqa: F841  keep QApplication alive
     dlg = QDialog()
     dlg.setWindowTitle("Veracage — choose sandbox apps")
     dlg.resize(520, 600)

@@ -1,8 +1,6 @@
 """File transfer staging dirs and import/export."""
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from veracage import transfer

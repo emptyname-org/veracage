@@ -5,7 +5,6 @@ or real veracrypt — fixtures here redirect everything to tmp paths.
 """
 from __future__ import annotations
 
-import os
 import tempfile
 from pathlib import Path
 
