@@ -1,3 +1,18 @@
+> ⚠️ **SUPERSEDED — historical (v0). Do not implement from this document.**
+> The authoritative design is **[`veracage-design.md`](./veracage-design.md)**,
+> which the code follows. This early sketch contradicts the current design in
+> several places, for example:
+> - It describes a *bind-mount-then-unmount-on-host* dance. The real design
+>   mounts the vault **only** inside the private mount namespace and never
+>   exposes it to the host (`veracage-design.md` §3).
+> - It names different apps (mousepad/thunar) and the `cage` compositor; the
+>   implementation uses kate/okular/dolphin and a nested **weston** (Mode B).
+> - Its clipboard story ("the compositor enforces focus") is not how
+>   isolation actually works here — sandbox clipboard is separated by running
+>   a distinct compositor instance (or `wp-security-context-v1` in Mode A).
+>
+> Kept only for historical context.
+
 # Veracage — Architecture
 
 A thin wrapper that mounts a VeraCrypt volume into a kernel-isolated namespace and launches applications inside a bubblewrap sandbox with Wayland clipboard isolation.
