@@ -142,9 +142,19 @@ Off by default. Okular renders fine on CPU for typical PDFs. Per-volume opt-in v
 
 ## 5. Wayland isolation
 
-Two modes, picked at startup based on compositor capability detection.
+> **Decision (2026-06): Mode B only.** Veracage uses a nested `weston` (§5.2)
+> on every compositor. Mode A (`wp-security-context-v1`, §5.1) was evaluated
+> and **not** adopted: per the protocol definition and the KWin/wlroots
+> implementations, security-context-v1 only lets the compositor *deny a
+> sandbox privileged globals* and *tag its identity* — it does **not**
+> partition the `wl_data_device` clipboard. The clipboard-isolation goal
+> (req 1.1.2) is delivered by Mode B's **separate compositor instance**, not
+> by Mode A. (GNOME/Mutter doesn't implement the protocol at all.) Mode A
+> would trade clipboard isolation for window-integration UX — the wrong trade
+> for this threat model. The full Mode A implementation spec is preserved in
+> `docs/mode-a-security-context.md` should the trade ever change.
 
-### 5.1 Mode A — `wp-security-context-v1` (default on modern compositors)
+### 5.1 Mode A — `wp-security-context-v1` (evaluated, not adopted)
 
 The launcher:
 
@@ -156,11 +166,19 @@ The launcher:
 6. Places the new socket at `$XDG_RUNTIME_DIR/veracage-wayland`.
 7. Bind-mounts that socket into the sandbox at `/run/user/$UID/wayland-0`.
 
-Compositor effects (KWin 6, Mutter 47+, sway ≥1.10):
+Compositor effects (KWin ≥ 6, sway ≥ 1.9; **not** Mutter/GNOME, which
+doesn't implement it):
 
-- Sandbox connections are **isolated from `wlr-data-control`** → host clipboard managers (Klipper, GPaste) **do not** scrape sandbox clipboard. **This is what closes 1.1.2 for clipboard.**
-- Clipboard between sandbox and host scopes is independent — a copy in Kate does **not** put text on the host clipboard.
-- Per-compositor policy can also block screencopy/virtual-input from sandboxed clients (not strictly required for our threat model, but free with the tag).
+- The compositor can **deny the sandbox privileged globals** —
+  `wlr-data-control`, screencopy, virtual-keyboard/pointer, layer-shell — and
+  **tag** its identity. This stops a clipboard manager running *inside* the
+  sandbox, and stops the sandboxed app from screen-grabbing / synthesising
+  input.
+- **It does NOT, by protocol, make the sandbox and host clipboards
+  independent.** The `wl_data_device` selection is still shared, so a *host*
+  clipboard manager could read what the sandbox copies. Closing req 1.1.2 for
+  clipboard needs the **separate compositor** of Mode B. *(This corrects an
+  earlier version of this section, which wrongly claimed Mode A closes 1.1.2.)*
 
 ### 5.2 Mode B — nested `weston` (fallback, default on Plasma 5)
 

@@ -58,8 +58,10 @@ What works:
 Known gaps (later):
 - Global hotkeys for clipboard transfer are tray-menu only for now (XDG
   GlobalShortcuts portal integration deferred).
-- Mode A (`wp-security-context-v1`) deferred — needs Plasma 6 / sway
-  1.10+ for testing.
+- Mode A (`wp-security-context-v1`) **intentionally not adopted** — it does
+  not isolate the clipboard (Mode B's separate compositor is what closes req
+  1.1.2), and GNOME/Mutter doesn't implement it. The full implementation spec
+  is kept in `docs/mode-a-security-context.md` if the trade-off ever changes.
 
 ## Install (development)
 
