@@ -4,6 +4,19 @@ Unit tests (`pytest`) cover argv shape, config round-trip, and detection
 logic. The tests in this directory exercise things unit tests can't:
 real privilege drop, real mount NS, real Wayland.
 
+## Automated checks
+
+`test_helper_security.py` asserts the privilege-boundary argument contract on
+the **built** Rust helper (no vault/Wayland/root needed — every case fails
+before any mount). Run after `make build`:
+
+```
+pytest tests/integration/test_helper_security.py -v
+```
+
+The tests below are manual: they need a real Wayland session, a vault, and
+the polkit policy installed (`make install-dev`).
+
 ## Prerequisites
 
 ```

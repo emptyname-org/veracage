@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Unit + lint only. The integration tests (markers requires_root /
+# requires_vault / requires_wayland) need a real Wayland session, a vault and
+# root, so they are not run in CI — they are the on-hardware verification gate.
+
+jobs:
+  python:
+    name: python (ruff + mypy + pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dev tools
+        run: python -m pip install --upgrade pip ruff mypy pytest
+      - name: ruff
+        run: ruff check src/ tests/
+      - name: mypy
+        run: mypy
+      - name: pytest (unit)
+        run: python -m pytest -q
+
+  rust:
+    name: rust helper (fmt + clippy + test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: helper-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: build
+        run: cargo build --release
+      - name: test
+        run: cargo test
