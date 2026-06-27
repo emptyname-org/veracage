@@ -2,6 +2,11 @@
 <!DOCTYPE policyconfig PUBLIC
  "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  Template. `make install` / `make install-dev` substitute @HELPER@ and
+  @CLEANUP@ with the absolute paths of the installed helpers. The generated
+  org.veracage.policy is not checked in (it is host-specific).
+-->
 <policyconfig>
 
   <vendor>Veracage</vendor>
@@ -15,7 +20,7 @@
       <allow_inactive>auth_admin</allow_inactive>
       <allow_active>auth_self_keep</allow_active>
     </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/home/pq/Claude/veracage/helpers/veracage-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.path">@HELPER@</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 
@@ -27,7 +32,7 @@
       <allow_inactive>auth_admin</allow_inactive>
       <allow_active>yes</allow_active>
     </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/home/pq/Claude/veracage/helpers/veracage-cleanup</annotate>
+    <annotate key="org.freedesktop.policykit.exec.path">@CLEANUP@</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 

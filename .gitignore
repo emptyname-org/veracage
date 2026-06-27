@@ -6,6 +6,12 @@ __pycache__/
 # Local dev virtualenv (not part of the project)
 .venv/
 
+# Rust build artifacts
+/helper-rs/target/
+
+# Generated from .in templates at install time
+/install/org.veracage.policy
+
 # Runtime / scratch
 /run/
 *.swp

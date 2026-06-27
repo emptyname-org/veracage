@@ -12,13 +12,25 @@ from . import cleanup, config, configure, session
 from .sandbox import bwrap_command  # noqa: F401  (kept for downstream tests)
 from .wayland import WestonStartFailed, nested_weston  # noqa: F401
 
-HELPER_PATH = os.environ.get(
-    "VERACAGE_HELPER",
-    "/home/pq/Claude/veracage/helpers/veracage-helper",
-)
+# Privileged helpers. An install (`make install`) sets VERACAGE_HELPER /
+# VERACAGE_CLEANUP_HELPER in the generated launcher to point at $LIBEXEC.
+# For a source checkout we derive paths from the repo root: prefer the built
+# Rust mount helper if present, else the Python reference helper. Whatever
+# this resolves to MUST match the polkit policy's exec.path.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _default_mount_helper() -> str:
+    rust = _REPO_ROOT / "helper-rs" / "target" / "release" / "veracage-helper"
+    if rust.is_file():
+        return str(rust)
+    return str(_REPO_ROOT / "helpers" / "veracage-helper")
+
+
+HELPER_PATH = os.environ.get("VERACAGE_HELPER", _default_mount_helper())
 CLEANUP_HELPER_PATH = os.environ.get(
     "VERACAGE_CLEANUP_HELPER",
-    "/home/pq/Claude/veracage/helpers/veracage-cleanup",
+    str(_REPO_ROOT / "helpers" / "veracage-cleanup"),
 )
 
 # Env vars to forward through pkexec (which strips the environment).

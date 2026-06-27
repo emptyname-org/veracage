@@ -1,0 +1,21 @@
+[package]
+name = "veracage-helper"
+version = "0.4.0"
+edition = "2021"
+description = "Veracage privileged mount/dismount helper (root via polkit)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "veracage-helper"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+strip = true
