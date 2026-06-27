@@ -105,3 +105,21 @@ def test_app_args_are_passed(argv):
 
 def test_chdir_to_vault(argv):
     assert ("--chdir", "/vault") in list(zip(argv, argv[1:]))
+
+
+def test_etc_is_not_wholesale_bound(argv):
+    """Security: the whole host /etc must not be exposed — only curated paths."""
+    pairs = list(zip(argv, argv[1:]))
+    assert ("--ro-bind", "/etc") not in pairs
+    assert ("--bind", "/etc") not in pairs
+
+
+def test_essential_etc_paths_bound(argv):
+    """Rendering deps from /etc must survive the curation: fontconfig, the
+    dynamic linker, NSS for getpwuid, timezone, machine-id for Qt/D-Bus."""
+    pairs = list(zip(argv, argv[1:]))
+    bound = {b for a, b in pairs if a in {"--ro-bind", "--ro-bind-try"}}
+    for needed in ("/etc/fonts", "/etc/ld.so.cache", "/etc/passwd",
+                   "/etc/group", "/etc/nsswitch.conf", "/etc/localtime",
+                   "/etc/machine-id"):
+        assert needed in bound, f"{needed} not bound into sandbox"

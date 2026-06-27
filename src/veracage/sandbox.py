@@ -29,7 +29,25 @@ def bwrap_command(mountpoint: str, app: App, wayland_socket: Path) -> list[str]:
         "--dev", "/dev",
         "--tmpfs", "/tmp",
         "--ro-bind", "/usr", "/usr",
-        "--ro-bind", "/etc", "/etc",
+        # Curated /etc instead of a wholesale `--ro-bind /etc /etc`: expose
+        # only what apps need to start and render (dynamic linker, fontconfig,
+        # timezone, NSS for getpwuid, machine-id for Qt/D-Bus, system XDG
+        # config, TLS trust store). Keeps host network/VPN/mail/kerberos
+        # configs and the rest of /etc out of a possibly-hostile viewer.
+        # `-try` so a path absent on some distro doesn't abort the sandbox.
+        "--ro-bind-try", "/etc/ld.so.cache", "/etc/ld.so.cache",
+        "--ro-bind-try", "/etc/ld.so.conf.d", "/etc/ld.so.conf.d",
+        "--ro-bind-try", "/etc/alternatives", "/etc/alternatives",
+        "--ro-bind-try", "/etc/fonts", "/etc/fonts",
+        "--ro-bind-try", "/etc/localtime", "/etc/localtime",
+        "--ro-bind-try", "/etc/machine-id", "/etc/machine-id",
+        "--ro-bind-try", "/etc/passwd", "/etc/passwd",
+        "--ro-bind-try", "/etc/group", "/etc/group",
+        "--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf",
+        "--ro-bind-try", "/etc/xdg", "/etc/xdg",
+        "--ro-bind-try", "/etc/ca-certificates", "/etc/ca-certificates",
+        "--ro-bind-try", "/etc/ca-certificates.conf", "/etc/ca-certificates.conf",
+        "--ro-bind-try", "/etc/ssl", "/etc/ssl",
         "--symlink", "usr/lib",   "/lib",
         "--symlink", "usr/lib64", "/lib64",
         "--symlink", "usr/bin",   "/bin",
