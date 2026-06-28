@@ -26,6 +26,7 @@ import selectors
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -33,6 +34,7 @@ from pathlib import Path
 
 from . import config
 from .sandbox import bwrap_command
+from .wayland import WestonStartFailed, nested_weston
 
 _MAX_REQUEST_BYTES = 64 * 1024  # control requests are tiny; cap to bound memory
 
@@ -43,10 +45,11 @@ _MAX_REQUEST_BYTES = 64 * 1024  # control requests are tiny; cap to bound memory
 class _LeaderState:
     mountpoint: str
     vault: str
-    weston_socket: Path | None = None   # set once weston is up (increment 2)
+    weston_socket: Path | None = None   # set once weston is up
     gpu: bool = False
     children: dict[int, str] = field(default_factory=dict)  # pid -> app key
     closing: bool = False
+    launched_any: bool = False          # gate close-on-empty until first launch
 
 
 # ------------------------------------------------------------- protocol ----
@@ -77,21 +80,28 @@ def _handle_request(state: _LeaderState, req: dict) -> dict:
         key = req.get("app")
         if not isinstance(key, str):
             return {"ok": False, "error": "missing or invalid 'app'"}
-        if state.weston_socket is None:
-            return {"ok": False, "error": "compositor not ready"}
-        cfg = config.load()
-        app = cfg.apps.get(key)
-        if app is None:
-            return {"ok": False, "error": f"app '{key}' is not enabled"}
-        try:
-            argv = bwrap_command(state.mountpoint, app, state.weston_socket, state.gpu)
-            proc = subprocess.Popen(argv)
-        except FileNotFoundError as e:
-            return {"ok": False, "error": f"missing dependency: {e.filename}"}
-        state.children[proc.pid] = key
-        return {"ok": True, "pid": proc.pid}
+        return _launch_app(state, key)
 
     return {"ok": False, "error": f"unknown cmd: {cmd}"}
+
+
+def _launch_app(state: _LeaderState, key: str) -> dict:
+    """Launch app `key` in bwrap against the nested weston; track its pid.
+    Shared by the first-app launch and the `exec` command."""
+    if state.weston_socket is None:
+        return {"ok": False, "error": "compositor not ready"}
+    cfg = config.load()
+    app = cfg.apps.get(key)
+    if app is None:
+        return {"ok": False, "error": f"app '{key}' is not enabled"}
+    try:
+        argv = bwrap_command(state.mountpoint, app, state.weston_socket, state.gpu)
+        proc = subprocess.Popen(argv)
+    except FileNotFoundError as e:
+        return {"ok": False, "error": f"missing dependency: {e.filename}"}
+    state.children[proc.pid] = key
+    state.launched_any = True
+    return {"ok": True, "pid": proc.pid}
 
 
 # ------------------------------------------------------------- reaping -----
@@ -149,9 +159,9 @@ def _control_fd() -> int:
 def run_leader(mountpoint: str, vault: str, first_app_key: str | None) -> int:
     """Become the vault-side session leader. Returns the exit code.
 
-    Increment 1: serve the control socket (ping/list/close; exec replies
-    'compositor not ready' until weston is wired in increment 2) and exit on
-    'close' or a signal.
+    Starts nested weston (against the host fd in VERACAGE_WAYLAND_FD), launches
+    the first app, then serves the control socket (ping/list/exec/close) until
+    'close', a signal, or — once an app has been launched — all apps exit.
     """
     vr = os.environ.get("VERACAGE_VAULT_RUNTIME")
     if vr:
@@ -170,21 +180,39 @@ def run_leader(mountpoint: str, vault: str, first_app_key: str | None) -> int:
 
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno=_control_fd())
     srv.setblocking(False)
-    sel = selectors.DefaultSelector()
-    sel.register(srv, selectors.EVENT_READ)
+
+    wl_raw = os.environ.get("VERACAGE_WAYLAND_FD")
+    upstream = int(wl_raw) if wl_raw else None
+
     try:
-        while not stop.is_set():
-            _reap_children(state)
-            if state.closing:
-                break
-            for key, _ in sel.select(timeout=1.0):
-                if key.fileobj is srv:
-                    _accept_one(srv, state)
+        with nested_weston(upstream_fd=upstream) as wl_socket:
+            state.weston_socket = wl_socket
+            if first_app_key:
+                r = _launch_app(state, first_app_key)
+                if not r["ok"]:
+                    print(f"veracage: first app '{first_app_key}': {r['error']}",
+                          file=sys.stderr)
+
+            sel = selectors.DefaultSelector()
+            sel.register(srv, selectors.EVENT_READ)
+            try:
+                while not stop.is_set():
+                    _reap_children(state)
+                    if state.closing or (state.launched_any and not state.children):
+                        break
+                    for key, _ in sel.select(timeout=1.0):
+                        if key.fileobj is srv:
+                            _accept_one(srv, state)
+            finally:
+                sel.close()
+                _terminate_children(state)
+        return 0
+    except WestonStartFailed as e:
+        print(f"veracage: weston failed to start: {e}", file=sys.stderr)
+        print("(install with: apt install weston)", file=sys.stderr)
+        return 1
     finally:
-        sel.close()
         srv.close()
-        _terminate_children(state)
-    return 0
 
 
 def _terminate_children(state: _LeaderState, timeout: float = 3.0) -> None:

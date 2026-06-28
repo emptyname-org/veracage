@@ -93,3 +93,24 @@ def test_does_not_kill_if_already_exited(fake_runtime):
             # Simulate weston exiting cleanly during the with-block
             proc.poll = mock.Mock(return_value=0)
     killpg.assert_not_called()
+
+
+# ----------------------------------------------- invocation builder --------
+
+def test_invocation_default_no_upstream(tmp_path):
+    argv, env, pass_fds = wayland._weston_invocation("veracage-aa", None, tmp_path)
+    assert argv[0] == "weston"
+    assert "--socket=veracage-aa" in argv
+    assert not any(a.startswith("--backend=") for a in argv)
+    assert "WAYLAND_SOCKET" not in env
+    assert pass_fds == ()
+    assert env["XDG_RUNTIME_DIR"] == str(tmp_path)
+
+
+def test_invocation_with_upstream_fd(tmp_path, monkeypatch):
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    argv, env, pass_fds = wayland._weston_invocation("veracage-bb", 7, tmp_path)
+    assert "--backend=wayland-backend.so" in argv
+    assert env["WAYLAND_SOCKET"] == "7"
+    assert "WAYLAND_DISPLAY" not in env       # forced to use the inherited fd
+    assert pass_fds == (7,)

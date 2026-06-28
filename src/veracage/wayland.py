@@ -40,23 +40,45 @@ def _weston_preexec() -> None:  # pragma: no cover - runs post-fork in the child
         os._exit(0)
 
 
+def _weston_invocation(socket_name: str, upstream_fd: int | None,
+                       runtime: Path) -> tuple[list[str], dict[str, str], tuple[int, ...]]:
+    """Build (argv, env, pass_fds) for a nested weston. Pure, so it's testable.
+
+    With `upstream_fd` set, weston connects to the host compositor via the
+    inherited fd (WAYLAND_SOCKET) and the wayland backend — the deny-by-UID
+    leader uses this because the vault uid can't reach the host's runtime dir by
+    path. Without it, weston auto-detects via WAYLAND_DISPLAY (option-a).
+    """
+    env = {**os.environ, "XDG_RUNTIME_DIR": str(runtime)}
+    # Run a no-op shell so weston doesn't auto-launch a terminal; our bwrap'd
+    # app connects to the socket directly.
+    argv = ["weston", f"--socket={socket_name}", "--shell=desktop-shell.so"]
+    pass_fds: tuple[int, ...] = ()
+    if upstream_fd is not None:
+        argv.insert(1, "--backend=wayland-backend.so")
+        env["WAYLAND_SOCKET"] = str(upstream_fd)
+        env.pop("WAYLAND_DISPLAY", None)  # force the fd, not a path lookup
+        pass_fds = (upstream_fd,)
+    return argv, env, pass_fds
+
+
 @contextlib.contextmanager
-def nested_weston():
-    """Spawn a nested Weston, yield the host-visible socket path, kill on exit."""
+def nested_weston(upstream_fd: int | None = None):
+    """Spawn a nested Weston, yield the host-visible socket path, kill on exit.
+
+    `upstream_fd` (the leader's inherited connection to the host compositor) is
+    passed to weston as WAYLAND_SOCKET; without it weston auto-detects via
+    WAYLAND_DISPLAY.
+    """
     runtime = Path(os.environ["XDG_RUNTIME_DIR"])
     socket_name = f"veracage-{secrets.token_hex(4)}"
     socket_path = runtime / socket_name
 
-    # We rely on Weston's auto-detection: with WAYLAND_DISPLAY set in env,
-    # it picks the wayland-backend (nests inside the host compositor).
+    argv, env, pass_fds = _weston_invocation(socket_name, upstream_fd, runtime)
     proc = subprocess.Popen(
-        [
-            "weston",
-            f"--socket={socket_name}",
-            # Run a no-op shell so weston doesn't auto-launch a terminal;
-            # our bwrap'd app connects to the socket directly.
-            "--shell=desktop-shell.so",
-        ],
+        argv,
+        env=env,
+        pass_fds=pass_fds,
         # New session (Ctrl+C in the launcher doesn't hit weston directly) +
         # die-with-leader via PR_SET_PDEATHSIG (see _weston_preexec).
         preexec_fn=_weston_preexec,
