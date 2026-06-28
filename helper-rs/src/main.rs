@@ -33,6 +33,8 @@ use std::process::Command;
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+mod idmap;
+
 /// Env vars the launcher may forward into the (unprivileged) continuation.
 /// pkexec strips the environment; anything outside this set is dropped, so a
 /// direct pkexec caller can't smuggle e.g. LD_PRELOAD/LD_LIBRARY_PATH through.
