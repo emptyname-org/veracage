@@ -33,6 +33,7 @@ use std::process::Command;
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+mod crypt;
 mod idmap;
 
 /// Env vars the launcher may forward into the (unprivileged) continuation.
