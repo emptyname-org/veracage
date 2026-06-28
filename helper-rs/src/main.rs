@@ -24,7 +24,7 @@
 use std::env;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::RawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -345,17 +345,15 @@ fn child(
         fail(&format!("mount failed: {}", st.code().unwrap_or(-1)), st.code().unwrap_or(1));
     }
 
-    let md = std::fs::metadata(raw).unwrap_or_else(|e| {
-        let _ = Command::new("umount").arg(raw).status();
-        let _ = crypt::close(dm_name);
-        fail(&format!("stat staging: {e}"), 1)
-    });
-    let (on_uid, on_gid) = (md.uid(), md.gid());
-
-    // Present the vault as the vault uid via an idmapped mount (no on-disk change).
+    // Present the vault as the vault uid via an idmapped mount (no on-disk
+    // change). Map the HUMAN's uid/gid -> the vault uid/gid: a single-user
+    // vault's data is owned by the human who created it, so that is the owner
+    // that must become readable as the vault uid. (The fs root is often
+    // root-owned from mkfs; it stays traversable as "nobody". Files owned by
+    // other uids inside the vault remain inaccessible — single-user limitation.)
     std::fs::create_dir_all(mountpoint).unwrap_or_else(|e| fail(&format!("mkdir mountpoint: {e}"), 1));
     set_mode(mountpoint, 0o700);
-    if let Err(e) = idmap::idmap_mount(raw, mountpoint, on_uid, on_gid, vault_uid, vault_gid) {
+    if let Err(e) = idmap::idmap_mount(raw, mountpoint, human_uid, human_gid, vault_uid, vault_gid) {
         let _ = Command::new("umount").arg(raw).status();
         let _ = crypt::close(dm_name);
         fail(&format!("idmap_mount: {e}"), 1);
