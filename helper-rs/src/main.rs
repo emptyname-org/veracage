@@ -25,6 +25,7 @@ use std::env;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::RawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -33,6 +34,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 mod crypt;
 mod idmap;
+mod ipc;
 
 use crypt::Backend;
 
@@ -184,6 +186,18 @@ fn resolve_vault_user(human_uid: u32) -> Result<(u32, u32), String> {
     Ok((uid, gid))
 }
 
+/// Look up a forwarded `--setenv KEY=VALUE` value.
+fn setenv_value(args: &Args, key: &str) -> Option<String> {
+    for kv in &args.setenv {
+        if let Some((k, v)) = kv.split_once('=') {
+            if k == key {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// 16-hex-char hash matching cleanup.vault_hash (sha256(path)[:16]).
 fn vault_hash(p: &Path) -> String {
     use sha2::{Digest, Sha256};
@@ -282,6 +296,8 @@ fn wait_for(pid: i32) -> i32 {
 fn child(
     vault_uid: u32,
     vault_gid: u32,
+    human_uid: u32,
+    human_gid: u32,
     source: &Path,
     backend: Option<Backend>,
     mountpoint: &Path,
@@ -340,6 +356,31 @@ fn child(
     let _ = Command::new("umount").arg(raw).status();
     let _ = std::fs::remove_dir(raw);
 
+    // Past pkexec, the helper is the only place that can hand the leader a
+    // host-Wayland fd and a control socket (pkexec closes inherited fds).
+    let runtime = setenv_value(args, "XDG_RUNTIME_DIR")
+        .unwrap_or_else(|| fail("XDG_RUNTIME_DIR not forwarded; need it for the control socket", 2));
+    let mut wl_fd: Option<RawFd> = None;
+    if let Some(disp) = setenv_value(args, "WAYLAND_DISPLAY") {
+        let wl_path = if disp.starts_with('/') {
+            PathBuf::from(disp)
+        } else {
+            Path::new(&runtime).join(disp)
+        };
+        match ipc::connect_host_wayland(&wl_path) {
+            Ok(fd) => wl_fd = Some(fd),
+            Err(e) => eprintln!(
+                "veracage-helper: host wayland connect ({}) failed: {e}",
+                wl_path.display()
+            ),
+        }
+    }
+    let ctl_path = Path::new(&runtime)
+        .join("veracage/sessions")
+        .join(format!("{}.sock", vault_hash(source)));
+    let ctl_fd = ipc::create_control_socket(&ctl_path, human_uid, human_gid)
+        .unwrap_or_else(|e| fail(&format!("control socket: {e}"), 1));
+
     // Drop privileges to the vault uid (gid first, then uid).
     unsafe {
         if libc::setgroups(0, ptr::null()) != 0 {
@@ -362,6 +403,13 @@ fn child(
         }
     }
 
+    // Tell the leader which inherited fds to use (the numbers aren't secret;
+    // the fds themselves are inherited and the vault uid can't re-open them).
+    if let Some(fd) = wl_fd {
+        env::set_var("VERACAGE_WAYLAND_FD", fd.to_string());
+    }
+    env::set_var("VERACAGE_CONTROL_FD", ctl_fd.to_string());
+
     // Hand off to the pinned continuation (replaces this process).
     let err = Command::new(cont).args(&args.rest).exec();
     fail(&format!("exec continuation {}: {err}", cont.display()), 127);
@@ -376,7 +424,7 @@ fn main() {
 
     // Identities: human from pkexec; vault from a fixed system user. Neither
     // from argv.
-    let (human_uid, _human_gid) = resolve_caller().unwrap_or_else(|e| fail(&e, 2));
+    let (human_uid, human_gid) = resolve_caller().unwrap_or_else(|e| fail(&e, 2));
     let (vault_uid, vault_gid) = resolve_vault_user(human_uid).unwrap_or_else(|e| fail(&e, 2));
 
     let source = std::fs::canonicalize(&args.source)
@@ -411,7 +459,8 @@ fn main() {
         fail_errno("fork");
     }
     if pid == 0 {
-        child(vault_uid, vault_gid, &source, args.backend, &mountpoint, &raw, &dm_name, &cont, &args);
+        child(vault_uid, vault_gid, human_uid, human_gid, &source, args.backend,
+              &mountpoint, &raw, &dm_name, &cont, &args);
     }
 
     // Parent (still root, original mount NS).
