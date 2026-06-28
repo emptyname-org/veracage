@@ -80,6 +80,13 @@ test:
 test-rs:
 	$(CARGO) test --manifest-path helper-rs/Cargo.toml
 
+# Root-only Rust tests (idmap mount). Build AS THE USER (cached crate index),
+# then run the test binary under sudo directly — never `sudo cargo`, which uses
+# root's empty CARGO_HOME and re-fetches the ~900 MB index.
+test-rs-root:
+	$(CARGO) test --manifest-path helper-rs/Cargo.toml --no-run
+	sudo "$$(ls -t helper-rs/target/debug/deps/veracage_helper-* | grep -vE '\.(d|so)$$' | head -1)" --ignored --nocapture
+
 lint:
 	$(VENV)/bin/ruff check src/ tests/ && $(VENV)/bin/mypy
 
