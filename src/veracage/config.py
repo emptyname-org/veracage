@@ -30,12 +30,16 @@ def config_path() -> Path:
     return base / "veracage" / "config.toml"
 
 
+_VALID_BACKENDS = ("auto", "luks", "veracrypt")
+
+
 @dataclass
 class VolumeConfig:
     """Per-volume overrides; unset (None) fields inherit from [default]."""
     gpu: bool | None = None
     default_app: str | None = None
     display_name: str | None = None
+    backend: str | None = None   # "auto" | "luks" | "veracrypt"
 
 
 def _norm_vault(p: str) -> str:
@@ -65,6 +69,13 @@ class Config:
     def default_app_for(self, vault: str) -> str | None:
         vc = self.volumes.get(_norm_vault(vault))
         return vc.default_app if vc is not None else None
+
+    def backend_for(self, vault: str) -> str:
+        """Crypto backend for `vault`: per-volume override, else 'auto'."""
+        vc = self.volumes.get(_norm_vault(vault))
+        if vc is not None and vc.backend is not None:
+            return vc.backend
+        return "auto"
 
 
 def load() -> Config:
@@ -129,10 +140,16 @@ def load() -> Config:
             except (OSError, RuntimeError):
                 nk = str(Path(key).expanduser())
             gval = entry.get("gpu")
+            bval = entry.get("backend")
+            if bval is not None and bval not in _VALID_BACKENDS:
+                print(f'veracage: volumes."{key}".backend {bval!r} invalid; ignoring',
+                      file=sys.stderr)
+                bval = None
             volumes[nk] = VolumeConfig(
                 gpu=_coerce_bool(gval, f'volumes."{key}".gpu') if gval is not None else None,
                 default_app=entry.get("default_app"),
                 display_name=entry.get("display_name"),
+                backend=bval,
             )
     return Config(apps=apps, last_used_app=last, gpu=gpu,
                   suspend_action=suspend_action, volumes=volumes)
@@ -165,6 +182,8 @@ def save(cfg: Config) -> Path:
             lines += [f'default_app  = "{_esc(vc.default_app)}"']
         if vc.gpu is not None:
             lines += [f"gpu          = {_toml_bool(vc.gpu)}"]
+        if vc.backend is not None:
+            lines += [f'backend      = "{_esc(vc.backend)}"']
         lines += [""]
     p.write_text("\n".join(lines))
     return p

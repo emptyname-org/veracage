@@ -165,3 +165,28 @@ def test_control_chars_roundtrip(tmp_xdg_config):
     config.save(config.Config(apps={"w": weird}))
     loaded = config.load()
     assert loaded.apps["w"].name == "line1\nline2\ttab"
+
+
+# ----------------------------------------------------------------- backend --
+
+def test_default_backend_is_auto(tmp_xdg_config):
+    assert config.load().backend_for("/tmp/x.vc") == "auto"
+
+
+def test_per_volume_backend_roundtrip(tmp_xdg_config):
+    config.save(config.Config(
+        apps={},
+        volumes={config._norm_vault("/tmp/x.vc"): config.VolumeConfig(backend="luks")},
+    ))
+    loaded = config.load()
+    assert loaded.backend_for("/tmp/x.vc") == "luks"
+    assert loaded.backend_for("/tmp/other.vc") == "auto"
+
+
+def test_invalid_backend_ignored(tmp_xdg_config, capsys):
+    p = config.config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text('[volumes."/tmp/x.vc"]\nbackend = "rot13"\n')
+    cfg = config.load()
+    assert cfg.backend_for("/tmp/x.vc") == "auto"
+    assert "backend" in capsys.readouterr().err
