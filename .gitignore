@@ -19,3 +19,6 @@ __pycache__/
 
 # Throwaway de-risk prototype (not part of the product)
 /prototype/
+
+# Credentials — NEVER commit (SSH keys, VPS access)
+/VPS-ACCESS/
