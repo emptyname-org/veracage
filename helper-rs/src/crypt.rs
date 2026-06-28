@@ -1,7 +1,6 @@
 //! cryptsetup backend: open LUKS or VeraCrypt volumes (file or device).
 //! We already shelled out to cryptsetup; this just adds LUKS alongside the
 //! existing VeraCrypt path and a detector.
-#![allow(dead_code)] // wired into the helper flow in the next increment
 
 use std::io::{self, ErrorKind};
 use std::path::Path;

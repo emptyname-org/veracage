@@ -98,7 +98,6 @@ fn make_userns(on_disk_uid: u32, vault_uid: u32, on_disk_gid: u32, vault_gid: u3
 
 /// Idmap-mount `source_mount` (must already be a mountpoint) at `target`,
 /// presenting the on-disk owner as the vault uid/gid. The data is untouched.
-#[allow(dead_code)] // wired into the helper flow in the next increment
 pub fn idmap_mount(
     source_mount: &Path,
     target: &Path,
@@ -173,8 +172,72 @@ mod tests {
 
     #[test]
     fn idmap_mount_has_expected_signature() {
-        // Compile-time check that the primitive type-checks; the real behaviour
-        // is exercised under root by the helper integration test.
+        // Compile-time check that the primitive type-checks.
         let _f: fn(&Path, &Path, u32, u32, u32, u32) -> io::Result<()> = idmap_mount;
+    }
+
+    /// Real idmapped-mount test (needs root + ext4 idmap support).
+    ///   sudo cargo test --manifest-path helper-rs/Cargo.toml -- --ignored
+    #[test]
+    #[ignore = "needs root; run with sudo and --ignored"]
+    fn idmap_mount_isolates() {
+        use std::process::Command;
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping idmap_mount_isolates: not root");
+            return;
+        }
+        let on_disk = 1000u32; // typical vault owner
+        let vault = 65500u32; // a uid no human has
+        let work = std::env::temp_dir().join(format!("vc-idmap-{}", std::process::id()));
+        let m0 = work.join("m0");
+        let target = work.join("idmapped");
+        std::fs::create_dir_all(&m0).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let chmod = |p: &Path, m: u32| {
+            let c = CString::new(p.as_os_str().as_bytes()).unwrap();
+            unsafe { libc::chmod(c.as_ptr(), m as libc::mode_t) };
+        };
+        let chown = |p: &Path, u: u32| {
+            let c = CString::new(p.as_os_str().as_bytes()).unwrap();
+            unsafe { libc::chown(c.as_ptr(), u, u) };
+        };
+        chmod(&work, 0o755);
+        let img = work.join("ext4.img");
+        let sh = |c: &str, a: &[&str]| Command::new(c).args(a).status().unwrap().success();
+        assert!(sh("truncate", &["-s", "16M", img.to_str().unwrap()]));
+        assert!(sh("mkfs.ext4", &["-q", img.to_str().unwrap()]));
+        assert!(sh("mount", &["-o", "loop", img.to_str().unwrap(), m0.to_str().unwrap()]));
+        let cleanup = || {
+            let _ = Command::new("umount").arg(&target).status();
+            let _ = Command::new("umount").arg(&m0).status();
+            let _ = std::fs::remove_dir_all(&work);
+        };
+        let d = m0.join("data");
+        std::fs::create_dir(&d).unwrap();
+        let sec = d.join("secret.txt");
+        std::fs::write(&sec, "SECRET").unwrap();
+        chown(&d, on_disk);
+        chmod(&d, 0o700);
+        chown(&sec, on_disk);
+        chmod(&sec, 0o600);
+
+        if let Err(e) = idmap_mount(&m0, &target, on_disk, on_disk, vault, vault) {
+            cleanup();
+            panic!("idmap_mount failed: {e}");
+        }
+        let tsec = target.join("data/secret.txt");
+        let reads = |uid: u32| {
+            Command::new("setpriv")
+                .args(["--reuid", &uid.to_string(), "--regid", &uid.to_string(), "--clear-groups", "cat"])
+                .arg(&tsec)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        let vault_reads = reads(vault);
+        let human_denied = !reads(on_disk);
+        cleanup();
+        assert!(vault_reads, "vault uid {vault} should read the idmapped vault");
+        assert!(human_denied, "on-disk uid {on_disk} must be denied");
     }
 }

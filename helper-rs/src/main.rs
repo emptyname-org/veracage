@@ -1,32 +1,30 @@
-//! Veracage privileged helper (Rust port of helpers/veracage-helper).
+//! Veracage privileged helper — UID-isolation model.
 //!
-//! Invoked as root via pkexec. Sequence:
+//! Invoked as root via pkexec. Opens an encrypted volume (LUKS or VeraCrypt,
+//! file or block device) and presents it, via an *idmapped mount*, as owned by
+//! a dedicated *vault* system user, then runs the vault-side leader as that
+//! user. The decrypted data is owned by a uid the human cannot assume, and the
+//! mount lives in a private namespace — denied AND hidden from host processes.
 //!
-//!   1. fork()
-//!   2. child:
-//!        a. unshare(CLONE_NEWNS), make / rslave
-//!        b. cryptsetup --type tcrypt --veracrypt open VAULT veracage-XXXX
-//!        c. mount /dev/mapper/veracage-XXXX MOUNTPOINT (nodev,nosuid)
-//!        d. drop privileges to the PKEXEC_UID caller (setresgid/setresuid)
-//!        e. exec(continuation)
-//!   3. parent:
-//!        a. waitpid(child)
-//!        b. cryptsetup close veracage-XXXX, tidy mountpoint + lock
+//! Child:
+//!   1. unshare(CLONE_NEWNS), make / rslave
+//!   2. cryptsetup open SOURCE (LUKS|VeraCrypt) -> /dev/mapper/veracage-XXXX
+//!   3. plain-mount it at <mountpoint>.raw, read its on-disk owner
+//!   4. idmap-mount it at MOUNTPOINT, presenting that owner as the vault uid
+//!   5. unmount the staging mount
+//!   6. drop privileges to the vault uid/gid; exec the (pinned) continuation
+//! Parent: waitpid, cryptsetup close, tidy mountpoint + lock.
 //!
-//! The mount is created inside the child's mount NS only — invisible to the
-//! host. The dm-crypt device IS globally visible to root (kernel limitation,
-//! documented in §3 of the design).
-//!
-//! SECURITY: reachable by any active local user via pkexec (polkit
-//! `auth_self_keep`). It therefore does NOT trust caller-supplied identity or
-//! code paths: the uid/gid come from PKEXEC_UID (set by pkexec to the real
-//! caller), the continuation is pinned at build time, and forwarded env vars
-//! are allowlisted. There is no --user / --continuation argument to abuse.
+//! SECURITY: reachable by any active local user via pkexec. It does NOT trust
+//! caller-supplied identity or code paths: the human uid comes from PKEXEC_UID,
+//! the *vault* uid is resolved from a fixed system user (not argv), the
+//! continuation is pinned at build time, forwarded env is allowlisted, and the
+//! mountpoint must be a direct child of the canonical /run/veracage.
 
 use std::env;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -35,6 +33,13 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 mod crypt;
 mod idmap;
+
+use crypt::Backend;
+
+/// The dedicated system user the vault is presented as, and the vault-side
+/// leader/apps run as. Resolved at runtime (never from argv); created by
+/// `make install`.
+const VAULT_USER: &str = "veracage";
 
 /// Env vars the launcher may forward into the (unprivileged) continuation.
 /// pkexec strips the environment; anything outside this set is dropped, so a
@@ -65,8 +70,7 @@ fn mountpoint_ok(arg: &str) -> bool {
         && c.next().is_none()
 }
 
-/// Resolve the validated mountpoint under the *canonical* /run/veracage, so
-/// neither `..` nor a symlinked component can redirect the root chown/mount.
+/// Resolve the validated mountpoint under the *canonical* /run/veracage.
 fn validated_mountpoint(arg: &str) -> Result<PathBuf, String> {
     if !mountpoint_ok(arg) {
         return Err(format!("mountpoint must be /run/veracage/<name>: {arg}"));
@@ -89,23 +93,35 @@ fn fail_errno(what: &str) -> ! {
 }
 
 struct Args {
-    vault: String,
+    source: String,
+    backend: Option<Backend>, // None = auto-detect
     mountpoint: String,
     setenv: Vec<String>,
     rest: Vec<String>,
 }
 
-/// Parse argv. Only --vault/--mountpoint/--setenv are accepted before `--`;
-/// anything else is an error (notably there is no --user/--continuation).
+/// Parse argv. Only --source/--backend/--mountpoint/--setenv are accepted
+/// before `--`; anything else is an error (notably no --user/--continuation).
 fn parse_args() -> Args {
-    let mut vault: Option<String> = None;
+    let mut source: Option<String> = None;
+    let mut backend: Option<Backend> = None;
     let mut mountpoint: Option<String> = None;
     let mut setenv: Vec<String> = Vec::new();
     let mut rest: Vec<String> = Vec::new();
     let mut it = env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--vault" => vault = it.next(),
+            "--source" => source = it.next(),
+            "--backend" => {
+                match it.next().as_deref() {
+                    Some("auto") | None => backend = None,
+                    Some(v) => {
+                        backend = Some(Backend::parse(v).unwrap_or_else(|| {
+                            fail(&format!("unknown backend: {v}"), 2)
+                        }))
+                    }
+                }
+            }
             "--mountpoint" => mountpoint = it.next(),
             "--setenv" => {
                 if let Some(kv) = it.next() {
@@ -120,14 +136,15 @@ fn parse_args() -> Args {
         }
     }
     Args {
-        vault: vault.unwrap_or_else(|| fail("--vault required", 2)),
+        source: source.unwrap_or_else(|| fail("--source required", 2)),
+        backend,
         mountpoint: mountpoint.unwrap_or_else(|| fail("--mountpoint required", 2)),
         setenv,
         rest,
     }
 }
 
-/// (uid, gid) of the invoking user, taken from PKEXEC_UID — never from argv.
+/// (uid, gid) of the invoking human, taken from PKEXEC_UID — never from argv.
 fn resolve_caller() -> Result<(u32, u32), String> {
     let raw = env::var("PKEXEC_UID")
         .map_err(|_| "PKEXEC_UID not set; refusing to run outside pkexec".to_string())?;
@@ -147,16 +164,32 @@ fn resolve_caller() -> Result<(u32, u32), String> {
     Ok((uid, gid))
 }
 
+/// (uid, gid) of the dedicated vault system user — resolved by NAME, never
+/// from argv, so the caller can't choose to run as their own (or root's) uid.
+fn resolve_vault_user(human_uid: u32) -> Result<(u32, u32), String> {
+    let name = CString::new(VAULT_USER).unwrap();
+    let pw = unsafe { libc::getpwnam(name.as_ptr()) };
+    if pw.is_null() {
+        return Err(format!(
+            "system user '{VAULT_USER}' not found; run `make install` to create it"
+        ));
+    }
+    let (uid, gid) = unsafe { ((*pw).pw_uid, (*pw).pw_gid) };
+    if uid == 0 {
+        return Err(format!("vault user '{VAULT_USER}' must not be uid 0"));
+    }
+    if uid == human_uid {
+        return Err(format!("vault user '{VAULT_USER}' must differ from the caller"));
+    }
+    Ok((uid, gid))
+}
+
 /// 16-hex-char hash matching cleanup.vault_hash (sha256(path)[:16]).
 fn vault_hash(p: &Path) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(p.as_os_str().as_bytes());  // raw bytes — matches Python on UTF-8 paths
-    h.finalize()
-        .iter()
-        .take(8)
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    h.update(p.as_os_str().as_bytes()); // raw bytes — matches Python on UTF-8 paths
+    h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
 /// "veracage-" + 12 lowercase hex, matching DM_NAME_RE in cleanup.py.
@@ -172,13 +205,6 @@ fn random_dm_name() -> String {
 
 fn set_mode<P: AsRef<Path>>(p: P, mode: u32) {
     let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode));
-}
-
-fn chown(p: &Path, uid: u32, gid: u32) {
-    let c = CString::new(p.as_os_str().as_bytes()).unwrap();
-    if unsafe { libc::chown(c.as_ptr(), uid, gid) } != 0 {
-        fail_errno("chown mountpoint");
-    }
 }
 
 fn is_executable(p: &Path) -> bool {
@@ -250,69 +276,79 @@ fn wait_for(pid: i32) -> i32 {
     }
 }
 
-/// Child path: new mount NS, mount the vault inside it, drop privs, exec.
+/// Child path: new mount NS, open + idmap-mount the vault as the vault uid,
+/// drop to the vault uid, exec the continuation.
 #[allow(clippy::too_many_arguments)]
-fn child(uid: u32, gid: u32, vault: &Path, mountpoint: &Path, dm_name: &str, cont: &Path, args: &Args) -> ! {
+fn child(
+    vault_uid: u32,
+    vault_gid: u32,
+    source: &Path,
+    backend: Option<Backend>,
+    mountpoint: &Path,
+    raw: &Path,
+    dm_name: &str,
+    cont: &Path,
+    args: &Args,
+) -> ! {
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
         fail_errno("unshare(CLONE_NEWNS)");
     }
     let root = CString::new("/").unwrap();
     if unsafe {
-        libc::mount(
-            ptr::null(),
-            root.as_ptr(),
-            ptr::null(),
-            libc::MS_REC | libc::MS_SLAVE,
-            ptr::null(),
-        )
+        libc::mount(ptr::null(), root.as_ptr(), ptr::null(), libc::MS_REC | libc::MS_SLAVE, ptr::null())
     } != 0
     {
         fail_errno("mount --make-rslave /");
     }
 
-    std::fs::create_dir_all(mountpoint)
-        .unwrap_or_else(|e| fail(&format!("mkdir mountpoint: {e}"), 1));
-    set_mode(mountpoint, 0o700);
-    chown(mountpoint, uid, gid);
-
+    // Open the encrypted volume (prompts for the passphrase on the tty).
+    let backend = backend.unwrap_or_else(|| crypt::detect(source));
+    crypt::open(source, backend, dm_name).unwrap_or_else(|e| fail(&format!("{e}"), 1));
     let dm_path = format!("/dev/mapper/{dm_name}");
 
-    // Open the VeraCrypt volume. Prompts for the password on the tty.
-    let st = Command::new("cryptsetup")
-        .args(["--type", "tcrypt", "--veracrypt", "open"])
-        .arg(vault)
-        .arg(dm_name)
-        .status()
-        .unwrap_or_else(|e| fail(&format!("spawn cryptsetup: {e}"), 1));
-    if !st.success() {
-        fail(
-            &format!("cryptsetup open failed: {}", st.code().unwrap_or(-1)),
-            st.code().unwrap_or(1),
-        );
-    }
-
+    // Stage-mount the decrypted fs so we can read its on-disk owner and clone
+    // it into an idmapped mount.
+    std::fs::create_dir_all(raw).unwrap_or_else(|e| fail(&format!("mkdir staging: {e}"), 1));
+    set_mode(raw, 0o700);
     let st = Command::new("mount")
         .args(["-o", "nodev,nosuid", &dm_path])
-        .arg(mountpoint)
+        .arg(raw)
         .status()
         .unwrap_or_else(|e| fail(&format!("spawn mount: {e}"), 1));
     if !st.success() {
-        let _ = Command::new("cryptsetup").args(["close", dm_name]).status();
-        fail(
-            &format!("mount failed: {}", st.code().unwrap_or(-1)),
-            st.code().unwrap_or(1),
-        );
+        let _ = crypt::close(dm_name);
+        fail(&format!("mount failed: {}", st.code().unwrap_or(-1)), st.code().unwrap_or(1));
     }
 
-    // Drop privileges to the pkexec caller (gid first, then uid).
+    let md = std::fs::metadata(raw).unwrap_or_else(|e| {
+        let _ = Command::new("umount").arg(raw).status();
+        let _ = crypt::close(dm_name);
+        fail(&format!("stat staging: {e}"), 1)
+    });
+    let (on_uid, on_gid) = (md.uid(), md.gid());
+
+    // Present the vault as the vault uid via an idmapped mount (no on-disk change).
+    std::fs::create_dir_all(mountpoint).unwrap_or_else(|e| fail(&format!("mkdir mountpoint: {e}"), 1));
+    set_mode(mountpoint, 0o700);
+    if let Err(e) = idmap::idmap_mount(raw, mountpoint, on_uid, on_gid, vault_uid, vault_gid) {
+        let _ = Command::new("umount").arg(raw).status();
+        let _ = crypt::close(dm_name);
+        fail(&format!("idmap_mount: {e}"), 1);
+    }
+
+    // The idmapped clone is independent; drop the staging mount.
+    let _ = Command::new("umount").arg(raw).status();
+    let _ = std::fs::remove_dir(raw);
+
+    // Drop privileges to the vault uid (gid first, then uid).
     unsafe {
         if libc::setgroups(0, ptr::null()) != 0 {
             fail_errno("setgroups");
         }
-        if libc::setresgid(gid, gid, gid) != 0 {
+        if libc::setresgid(vault_gid, vault_gid, vault_gid) != 0 {
             fail_errno("setresgid");
         }
-        if libc::setresuid(uid, uid, uid) != 0 {
+        if libc::setresuid(vault_uid, vault_uid, vault_uid) != 0 {
             fail_errno("setresuid");
         }
     }
@@ -338,13 +374,18 @@ fn main() {
         fail("must be invoked as root (via pkexec)", 2);
     }
 
-    // Identity comes from pkexec, never from argv.
-    let (uid, gid) = resolve_caller().unwrap_or_else(|e| fail(&e, 2));
+    // Identities: human from pkexec; vault from a fixed system user. Neither
+    // from argv.
+    let (human_uid, _human_gid) = resolve_caller().unwrap_or_else(|e| fail(&e, 2));
+    let (vault_uid, vault_gid) = resolve_vault_user(human_uid).unwrap_or_else(|e| fail(&e, 2));
 
-    let vault = std::fs::canonicalize(&args.vault)
-        .unwrap_or_else(|_| fail(&format!("vault not found: {}", args.vault), 2));
-    if !vault.is_file() {
-        fail(&format!("vault is not a file: {}", vault.display()), 2);
+    let source = std::fs::canonicalize(&args.source)
+        .unwrap_or_else(|_| fail(&format!("source not found: {}", args.source), 2));
+    let ft = std::fs::metadata(&source)
+        .unwrap_or_else(|e| fail(&format!("stat source: {e}"), 2))
+        .file_type();
+    if !(ft.is_file() || ft.is_block_device()) {
+        fail(&format!("source must be a file or block device: {}", source.display()), 2);
     }
 
     // Create the root-owned mountpoint parent BEFORE validating against it.
@@ -353,11 +394,8 @@ fn main() {
     }
     set_mode("/run/veracage", 0o755);
 
-    // Mountpoint must be a direct child of the canonical /run/veracage —
-    // resolved here so `..` traversal, the bare dir, or symlinked components
-    // can't redirect the root chown/mount that the child performs.
-    let mountpoint = validated_mountpoint(&args.mountpoint)
-        .unwrap_or_else(|e| fail(&e, 2));
+    let mountpoint = validated_mountpoint(&args.mountpoint).unwrap_or_else(|e| fail(&e, 2));
+    let raw = PathBuf::from(format!("{}.raw", mountpoint.display()));
 
     let cont = PathBuf::from(continuation());
     if !is_executable(&cont) {
@@ -365,16 +403,15 @@ fn main() {
     }
 
     let dm_name = random_dm_name();
-
-    let lock = format!("/run/veracage/{}.lock", vault_hash(&vault));
-    write_lock(&lock, &dm_name, &mountpoint, uid);
+    let lock = format!("/run/veracage/{}.lock", vault_hash(&source));
+    write_lock(&lock, &dm_name, &mountpoint, human_uid);
 
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         fail_errno("fork");
     }
     if pid == 0 {
-        child(uid, gid, &vault, &mountpoint, &dm_name, &cont, &args);
+        child(vault_uid, vault_gid, &source, args.backend, &mountpoint, &raw, &dm_name, &cont, &args);
     }
 
     // Parent (still root, original mount NS).
@@ -384,9 +421,9 @@ fn main() {
     let dm_path = format!("/dev/mapper/{dm_name}");
     let mut close_ok = true;
     if Path::new(&dm_path).exists() {
-        let st = Command::new("cryptsetup").args(["close", &dm_name]).status();
-        close_ok = matches!(st, Ok(s) if s.success());
+        close_ok = crypt::close(&dm_name).is_ok();
     }
+    let _ = std::fs::remove_dir(&raw);
     let _ = std::fs::remove_dir(&mountpoint);
     // Remove the lock only if the device is actually gone, so a failed close
     // leaves a recovery trail for the ExecStopPost cleanup.
@@ -438,7 +475,6 @@ mod tests {
 
     #[test]
     fn mountpoint_rejects_traversal_and_bare_dir() {
-        // C1 regression guard: these must NOT pass.
         assert!(!mountpoint_ok("/run/veracage/../../etc/cron.d"));
         assert!(!mountpoint_ok("/run/veracage/../veracage/x"));
         assert!(!mountpoint_ok("/run/veracage"));
@@ -449,7 +485,5 @@ mod tests {
         assert!(!mountpoint_ok("run/veracage/x"));
     }
 
-    // Filled in from `python3 -c 'import hashlib;
-    // print(hashlib.sha256(b"/tmp/veracage-x.vc").hexdigest()[:16])'`
     const PY_KNOWN_HASH: &str = "0631c55cceb0614f";
 }
