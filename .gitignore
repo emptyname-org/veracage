@@ -16,3 +16,6 @@ __pycache__/
 /run/
 *.swp
 *.orig
+
+# Throwaway de-risk prototype (not part of the product)
+/prototype/
