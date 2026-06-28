@@ -148,3 +148,90 @@ def test_wire_roundtrip_via_accept_one(tmp_path):
     t.join(timeout=2)
     srv.close()
     assert replies and replies[0]["ok"] and replies[0]["uid"] == os.getuid()
+
+
+# --------------------------------------------------------------- bridge ----
+
+def test_safe_name_rejects_traversal():
+    assert leader._safe_name("../../etc/passwd") == "passwd"
+    assert leader._safe_name("a/b/c.txt") == "c.txt"
+    assert leader._safe_name("..") is None
+    assert leader._safe_name("") is None
+    assert leader._safe_name(None) is None
+
+
+def test_do_import_writes_inbox(tmp_path):
+    st = leader._LeaderState(mountpoint=str(tmp_path))
+    src = tmp_path / "host.bin"
+    src.write_bytes(b"PAYLOAD")
+    fd = os.open(src, os.O_RDONLY)
+    try:
+        r = leader._do_import(st, {"name": "host.bin"}, [fd])
+    finally:
+        os.close(fd)
+    assert r["ok"]
+    assert (tmp_path / ".veracage" / "in" / "host.bin").read_bytes() == b"PAYLOAD"
+
+
+def test_do_import_needs_fd(tmp_path):
+    st = leader._LeaderState(mountpoint=str(tmp_path))
+    assert leader._do_import(st, {"name": "x"}, [])["ok"] is False
+
+
+def test_do_export_opens_outbox(tmp_path):
+    st = leader._LeaderState(mountpoint=str(tmp_path))
+    out = tmp_path / ".veracage" / "out"
+    out.mkdir(parents=True)
+    (out / "r.txt").write_text("RESULT")
+    reply, fds = leader._do_export(st, {"name": "r.txt"})
+    try:
+        assert reply["ok"] and len(fds) == 1
+        assert os.read(fds[0], 64) == b"RESULT"
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def test_do_export_missing_file(tmp_path):
+    st = leader._LeaderState(mountpoint=str(tmp_path))
+    reply, fds = leader._do_export(st, {"name": "nope.txt"})
+    assert reply["ok"] is False and fds == []
+
+
+def test_bridge_fd_passing_roundtrip(tmp_path, monkeypatch):
+    """End-to-end import + export through _accept_one + the human-side clients,
+    exercising real SCM_RIGHTS fd-passing."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    vault = "/tmp/vault-under-test.luks"
+    sock_path = leader.session_socket_path(vault)
+    sock_path.parent.mkdir(parents=True, exist_ok=True)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(2)
+    vaultdir = tmp_path / "vaultroot"
+    vaultdir.mkdir()
+    st = leader._LeaderState(mountpoint=str(vaultdir))
+
+    def serve():
+        for _ in range(2):
+            leader._accept_one(srv, st)
+
+    t = threading.Thread(target=serve)
+    t.start()
+    try:
+        src = tmp_path / "host.txt"
+        src.write_text("HELLO")
+        r1 = leader.import_file(vault, str(src))
+        assert r1["ok"]
+        assert (vaultdir / ".veracage" / "in" / "host.txt").read_text() == "HELLO"
+
+        outdir = vaultdir / ".veracage" / "out"
+        outdir.mkdir(parents=True, exist_ok=True)
+        (outdir / "result.txt").write_text("WORLD")
+        dest = tmp_path / "exported.txt"
+        r2 = leader.export_file(vault, "result.txt", str(dest))
+        assert r2["ok"]
+        assert dest.read_text() == "WORLD"
+    finally:
+        t.join(timeout=5)
+        srv.close()

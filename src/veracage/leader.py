@@ -26,6 +26,7 @@ import contextlib
 import json
 import os
 import selectors
+import shutil
 import signal
 import socket
 import subprocess
@@ -115,6 +116,56 @@ def _launch_app(state: _LeaderState, spec) -> dict:
     return {"ok": True, "pid": proc.pid}
 
 
+# --------------------------------------------------------------- bridge ----
+#
+# The vault is owned by the vault uid, so the human can't read/write it
+# directly. Files cross via fd-passing over the control socket:
+#   import: the human sends a host-file fd; the leader writes it to the inbox.
+#   export: the human asks for an outbox file; the leader sends back its fd.
+# This is the user's own deliberate channel; the security property (external
+# processes can't read the *vault*) is unchanged — only the inbox/outbox cross.
+
+def _vault_subdir(state: _LeaderState, sub: str) -> Path:
+    d = Path(state.mountpoint) / ".veracage" / sub
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _safe_name(raw) -> str | None:
+    """A basename within the inbox/outbox — never a path that escapes them."""
+    name = os.path.basename(str(raw or "")).strip()
+    return name if name and name not in (".", "..") else None
+
+
+def _do_import(state: _LeaderState, req: dict, fds: list[int]) -> dict:
+    """Write a received host-file fd into the vault inbox (.veracage/in/)."""
+    if not fds:
+        return {"ok": False, "error": "import needs a file descriptor"}
+    name = _safe_name(req.get("name"))
+    if not name:
+        return {"ok": False, "error": "invalid import name"}
+    dest = _vault_subdir(state, "in") / name
+    try:
+        with os.fdopen(fds[0], "rb", closefd=False) as src, open(dest, "wb") as out:
+            shutil.copyfileobj(src, out)
+    except OSError as e:
+        return {"ok": False, "error": f"import failed: {e}"}
+    return {"ok": True, "path": str(dest)}
+
+
+def _do_export(state: _LeaderState, req: dict) -> tuple[dict, list[int]]:
+    """Open an outbox file (.veracage/out/) and hand its fd back to the human."""
+    name = _safe_name(req.get("name"))
+    if not name:
+        return {"ok": False, "error": "invalid export name"}, []
+    src = _vault_subdir(state, "out") / name
+    try:
+        fd = os.open(src, os.O_RDONLY)
+    except OSError as e:
+        return {"ok": False, "error": f"export failed: {e}"}, []
+    return {"ok": True, "name": name}, [fd]
+
+
 # ------------------------------------------------------------- reaping -----
 
 def _reap_children(state: _LeaderState) -> None:
@@ -136,23 +187,31 @@ def _accept_one(srv: socket.socket, state: _LeaderState) -> None:
     conn, _ = srv.accept()
     with conn:
         conn.settimeout(2.0)
+        in_fds: list[int] = []
+        out_fds: list[int] = []
         try:
-            data = b""
-            while not data.endswith(b"\n"):
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-                if len(data) > _MAX_REQUEST_BYTES:
-                    raise ValueError("request too large")
+            data, in_fds, _flags, _addr = socket.recv_fds(conn, _MAX_REQUEST_BYTES, 1)
             req = json.loads(data.decode().strip() or "{}")
-            reply = _handle_request(state, req)
+            cmd = req.get("cmd") if isinstance(req, dict) else None
+            if cmd == "import":
+                reply = _do_import(state, req, in_fds)
+            elif cmd == "export":
+                reply, out_fds = _do_export(state, req)
+            else:
+                reply = _handle_request(state, req)
         except (ValueError, OSError) as e:
             reply = {"ok": False, "error": str(e)}
         except Exception as e:  # a handler bug must not kill the serve loop
             reply = {"ok": False, "error": f"internal error: {e}"}
+        msg = (json.dumps(reply) + "\n").encode()
         with contextlib.suppress(OSError):
-            conn.sendall((json.dumps(reply) + "\n").encode())
+            if out_fds:
+                socket.send_fds(conn, [msg], out_fds)
+            else:
+                conn.sendall(msg)
+        for fd in in_fds + out_fds:
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
 
 def _control_fd() -> int:
@@ -274,5 +333,52 @@ def send_request(vault: str, request: dict) -> dict:
                 break
             data += chunk
         return json.loads(data.decode().strip() or "{}")
+    finally:
+        s.close()
+
+
+def _connect(vault: str) -> socket.socket:
+    sock_path = session_socket_path(vault)
+    if not sock_path.exists():
+        raise FileNotFoundError(f"no active session for {vault}")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5.0)
+    s.connect(str(sock_path))
+    return s
+
+
+def import_file(vault: str, host_path: str) -> dict:
+    """Pass a host file's fd to the leader, which writes it to the vault inbox.
+    The leader reads the data as the vault uid; the human never touches the vault."""
+    name = os.path.basename(host_path)
+    fd = os.open(host_path, os.O_RDONLY)
+    s = _connect(vault)
+    try:
+        req = json.dumps({"cmd": "import", "name": name}).encode() + b"\n"
+        socket.send_fds(s, [req], [fd])
+        data, _fds, _f, _a = socket.recv_fds(s, 65536, 0)
+        return json.loads(data.decode().strip() or "{}")
+    finally:
+        os.close(fd)
+        s.close()
+
+
+def export_file(vault: str, name: str, dest_path: str) -> dict:
+    """Ask the leader for an outbox file; it sends the fd, we write it host-side."""
+    s = _connect(vault)
+    try:
+        req = json.dumps({"cmd": "export", "name": name}).encode() + b"\n"
+        s.sendall(req)
+        data, fds, _f, _a = socket.recv_fds(s, 65536, 1)
+        reply = json.loads(data.decode().strip() or "{}")
+        try:
+            if reply.get("ok") and fds:
+                with os.fdopen(fds[0], "rb", closefd=False) as src, open(dest_path, "wb") as out:
+                    shutil.copyfileobj(src, out)
+        finally:
+            for fd in fds:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        return reply
     finally:
         s.close()
