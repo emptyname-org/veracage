@@ -221,6 +221,13 @@ fn set_mode<P: AsRef<Path>>(p: P, mode: u32) {
     let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode));
 }
 
+fn chown(p: &Path, uid: u32, gid: u32) {
+    let c = CString::new(p.as_os_str().as_bytes()).unwrap();
+    if unsafe { libc::chown(c.as_ptr(), uid, gid) } != 0 {
+        fail_errno("chown");
+    }
+}
+
 fn is_executable(p: &Path) -> bool {
     p.is_file()
         && std::fs::metadata(p)
@@ -302,6 +309,7 @@ fn child(
     backend: Option<Backend>,
     mountpoint: &Path,
     raw: &Path,
+    vault_run: &Path,
     dm_name: &str,
     cont: &Path,
     args: &Args,
@@ -381,6 +389,12 @@ fn child(
     let ctl_fd = ipc::create_control_socket(&ctl_path, human_uid, human_gid)
         .unwrap_or_else(|e| fail(&format!("control socket: {e}"), 1));
 
+    // Provision a vault-writable runtime dir (weston nested socket, bwrap
+    // /run/user) — the vault uid can't write under root-owned /run/veracage.
+    std::fs::create_dir_all(vault_run).unwrap_or_else(|e| fail(&format!("mkdir vault-run: {e}"), 1));
+    set_mode(vault_run, 0o700);
+    chown(vault_run, vault_uid, vault_gid);
+
     // Drop privileges to the vault uid (gid first, then uid).
     unsafe {
         if libc::setgroups(0, ptr::null()) != 0 {
@@ -409,6 +423,7 @@ fn child(
         env::set_var("VERACAGE_WAYLAND_FD", fd.to_string());
     }
     env::set_var("VERACAGE_CONTROL_FD", ctl_fd.to_string());
+    env::set_var("VERACAGE_VAULT_RUNTIME", vault_run);
 
     // Hand off to the pinned continuation (replaces this process).
     let err = Command::new(cont).args(&args.rest).exec();
@@ -444,6 +459,7 @@ fn main() {
 
     let mountpoint = validated_mountpoint(&args.mountpoint).unwrap_or_else(|e| fail(&e, 2));
     let raw = PathBuf::from(format!("{}.raw", mountpoint.display()));
+    let vault_run = PathBuf::from(format!("{}.run", mountpoint.display()));
 
     let cont = PathBuf::from(continuation());
     if !is_executable(&cont) {
@@ -460,7 +476,7 @@ fn main() {
     }
     if pid == 0 {
         child(vault_uid, vault_gid, human_uid, human_gid, &source, args.backend,
-              &mountpoint, &raw, &dm_name, &cont, &args);
+              &mountpoint, &raw, &vault_run, &dm_name, &cont, &args);
     }
 
     // Parent (still root, original mount NS).
@@ -473,6 +489,7 @@ fn main() {
         close_ok = crypt::close(&dm_name).is_ok();
     }
     let _ = std::fs::remove_dir(&raw);
+    let _ = std::fs::remove_dir_all(&vault_run);
     let _ = std::fs::remove_dir(&mountpoint);
     // Remove the lock only if the device is actually gone, so a failed close
     // leaves a recovery trail for the ExecStopPost cleanup.
