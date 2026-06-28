@@ -9,11 +9,10 @@ import time
 from pathlib import Path
 
 from veracage import leader
-from veracage.apps import App
 
 
 def _state(**kw):
-    return leader._LeaderState(mountpoint="/run/veracage/x", vault="/v.luks", **kw)
+    return leader._LeaderState(mountpoint="/run/veracage/x", **kw)
 
 
 # --------------------------------------------------------------- protocol --
@@ -47,26 +46,22 @@ def test_non_dict_request():
 # ------------------------------------------------------------------ exec ---
 
 def test_exec_without_weston_is_refused():
-    r = leader._handle_request(_state(), {"cmd": "exec", "app": "kate"})
+    r = leader._handle_request(_state(), {"cmd": "exec", "app": {"exec": "kate"}})
     assert r["ok"] is False and "compositor" in r["error"]
 
 
-def test_exec_missing_app_key():
+def test_exec_missing_spec():
     st = _state(weston_socket=Path("/run/x/wayland-1"))
     assert leader._handle_request(st, {"cmd": "exec"})["ok"] is False
 
 
-def test_exec_unknown_app(monkeypatch):
-    monkeypatch.setattr(leader.config, "load", lambda: leader.config.Config(apps={}))
+def test_exec_needs_exec_field():
     st = _state(weston_socket=Path("/run/x/wayland-1"))
-    r = leader._handle_request(st, {"cmd": "exec", "app": "ghost"})
-    assert r["ok"] is False and "not enabled" in r["error"]
+    r = leader._handle_request(st, {"cmd": "exec", "app": {"args": ["x"]}})
+    assert r["ok"] is False and "exec" in r["error"]
 
 
 def test_exec_launches_and_tracks(monkeypatch):
-    app = App(key="kate", name="Kate", category="text", exec="kate", args=["/vault"])
-    monkeypatch.setattr(leader.config, "load",
-                        lambda: leader.config.Config(apps={"kate": app}))
     monkeypatch.setattr(leader, "bwrap_command", lambda mp, a, ws, gpu: ["true"])
 
     class FakeProc:
@@ -74,15 +69,31 @@ def test_exec_launches_and_tracks(monkeypatch):
     monkeypatch.setattr(leader.subprocess, "Popen", lambda argv: FakeProc())
 
     st = _state(weston_socket=Path("/run/x/wayland-1"))
-    r = leader._handle_request(st, {"cmd": "exec", "app": "kate"})
+    r = leader._handle_request(
+        st, {"cmd": "exec", "app": {"name": "Kate", "exec": "kate", "args": ["/vault"]}})
     assert r == {"ok": True, "pid": 4321}
-    assert st.children == {4321: "kate"}
+    assert st.children == {4321: "Kate"}
+
+
+def test_exec_runs_exactly_what_it_is_handed(monkeypatch):
+    """No config lookup / allowlist on the vault side — the leader runs the
+    resolved command verbatim (bwrap is what prevents exfiltration)."""
+    captured = {}
+
+    def fake_bwrap(mp, app, ws, gpu):
+        captured["exec"], captured["args"] = app.exec, app.args
+        return ["true"]
+    monkeypatch.setattr(leader, "bwrap_command", fake_bwrap)
+    monkeypatch.setattr(leader.subprocess, "Popen",
+                        lambda argv: type("P", (), {"pid": 1})())
+
+    st = _state(weston_socket=Path("/run/x/wayland-1"))
+    leader._handle_request(
+        st, {"cmd": "exec", "app": {"exec": "okular", "args": ["/vault/a.pdf"]}})
+    assert captured == {"exec": "okular", "args": ["/vault/a.pdf"]}
 
 
 def test_exec_missing_dependency(monkeypatch):
-    app = App(key="kate", name="Kate", category="text", exec="kate", args=[])
-    monkeypatch.setattr(leader.config, "load",
-                        lambda: leader.config.Config(apps={"kate": app}))
     monkeypatch.setattr(leader, "bwrap_command", lambda *a: ["bwrap"])
 
     def boom(argv):
@@ -90,7 +101,7 @@ def test_exec_missing_dependency(monkeypatch):
     monkeypatch.setattr(leader.subprocess, "Popen", boom)
 
     st = _state(weston_socket=Path("/run/x/wayland-1"))
-    r = leader._handle_request(st, {"cmd": "exec", "app": "kate"})
+    r = leader._handle_request(st, {"cmd": "exec", "app": {"exec": "kate"}})
     assert r["ok"] is False and "missing dependency" in r["error"]
 
 

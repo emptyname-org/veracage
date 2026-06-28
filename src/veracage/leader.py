@@ -3,19 +3,22 @@
 The Rust helper has already opened the volume, idmap-mounted it at MOUNTPOINT as
 the vault uid (in a private mount NS), connected the host Wayland socket, created
 the control listening socket, and provisioned a vault-writable runtime dir. It
-passes those to us through the environment and execs us:
+passes those through the environment and execs us:
 
   VERACAGE_CONTROL_FD     inherited control *listening* socket (we accept on it)
   VERACAGE_WAYLAND_FD     inherited connected fd to the host compositor (weston)
   VERACAGE_VAULT_RUNTIME  our XDG_RUNTIME_DIR (weston socket, bwrap /run/user)
 
-We serve the control protocol over the inherited socket and (from increment 2)
-run nested weston against the host fd + launch apps in bwrap. The human side
-connects to the socket *by path* to drive the session; it has no vault access.
+We run nested weston against the host fd and launch apps in bwrap. The leader is
+a plain executor: it runs the command the human hands it, sandboxed. The
+security property — *external processes can't read the vault* — comes from the
+idmap (the vault is owned by a uid no one else has) + the mount NS (hidden) +
+bwrap (apps have no net/host-FS, so they can't exfiltrate). The app allowlist is
+UX on the human side (which apps to offer); it is NOT a vault-side restriction,
+so the leader does not load config or police what it's told to run.
 
-This is the deny-by-UID counterpart of session.py (the option-a leader, which
-ran as the human inside a hide-only mount NS). session.py stays until cli.py is
-rewired onto this module.
+This is the deny-by-UID counterpart of session.py (the option-a leader). session
+.py stays until cli.py is rewired onto this module.
 """
 from __future__ import annotations
 
@@ -32,7 +35,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config
+from .apps import App
 from .sandbox import bwrap_command
 from .wayland import WestonStartFailed, nested_weston
 
@@ -44,10 +47,9 @@ _MAX_REQUEST_BYTES = 64 * 1024  # control requests are tiny; cap to bound memory
 @dataclass
 class _LeaderState:
     mountpoint: str
-    vault: str
     weston_socket: Path | None = None   # set once weston is up
     gpu: bool = False
-    children: dict[int, str] = field(default_factory=dict)  # pid -> app key
+    children: dict[int, str] = field(default_factory=dict)  # pid -> label
     closing: bool = False
     launched_any: bool = False          # gate close-on-empty until first launch
 
@@ -55,10 +57,11 @@ class _LeaderState:
 # ------------------------------------------------------------- protocol ----
 #
 # One line of JSON per request, one per reply.
-#   {"cmd": "ping"}                  -> {"ok": true, "uid": <vault uid>, ...}
-#   {"cmd": "list"}                  -> {"ok": true, "apps": [{"pid","app"}, ...]}
-#   {"cmd": "exec", "app": "<key>"}  -> {"ok": true, "pid": N} | {"ok": false,...}
-#   {"cmd": "close"}                 -> {"ok": true}
+#   {"cmd": "ping"}                       -> {"ok": true, "uid": <vault uid>, ...}
+#   {"cmd": "list"}                       -> {"ok": true, "apps": [{"pid","app"}]}
+#   {"cmd": "exec", "app": {"exec","args","name"}}
+#                                         -> {"ok": true, "pid": N} | {"ok": false}
+#   {"cmd": "close"}                      -> {"ok": true}
 
 def _handle_request(state: _LeaderState, req: dict) -> dict:
     if not isinstance(req, dict):
@@ -77,29 +80,37 @@ def _handle_request(state: _LeaderState, req: dict) -> dict:
         return {"ok": True}
 
     if cmd == "exec":
-        key = req.get("app")
-        if not isinstance(key, str):
-            return {"ok": False, "error": "missing or invalid 'app'"}
-        return _launch_app(state, key)
+        return _launch_app(state, req.get("app"))
 
     return {"ok": False, "error": f"unknown cmd: {cmd}"}
 
 
-def _launch_app(state: _LeaderState, key: str) -> dict:
-    """Launch app `key` in bwrap against the nested weston; track its pid.
-    Shared by the first-app launch and the `exec` command."""
+def _launch_app(state: _LeaderState, spec) -> dict:
+    """Launch the command in `spec` (an {exec, args, name} dict the human side
+    resolved) in bwrap against the nested weston; track its pid. Shared by the
+    first-app launch and the `exec` command. The leader runs what it's given —
+    bwrap, not an allowlist, is what stops a launched app exfiltrating."""
     if state.weston_socket is None:
         return {"ok": False, "error": "compositor not ready"}
-    cfg = config.load()
-    app = cfg.apps.get(key)
-    if app is None:
-        return {"ok": False, "error": f"app '{key}' is not enabled"}
+    if not isinstance(spec, dict):
+        return {"ok": False, "error": "missing app spec"}
+    command = spec.get("exec")
+    if not isinstance(command, str) or not command:
+        return {"ok": False, "error": "app spec needs a non-empty 'exec'"}
+    args = spec.get("args", [])
+    if not isinstance(args, list):
+        return {"ok": False, "error": "app 'args' must be a list"}
+    name_val = spec.get("name")
+    label = name_val if isinstance(name_val, str) else command
+
+    app = App(key=label, name=label, category="app",
+              exec=command, args=[str(a) for a in args])
     try:
         argv = bwrap_command(state.mountpoint, app, state.weston_socket, state.gpu)
         proc = subprocess.Popen(argv)
     except FileNotFoundError as e:
         return {"ok": False, "error": f"missing dependency: {e.filename}"}
-    state.children[proc.pid] = key
+    state.children[proc.pid] = label
     state.launched_any = True
     return {"ok": True, "pid": proc.pid}
 
@@ -156,19 +167,18 @@ def _control_fd() -> int:
 
 # --------------------------------------------------------- leader run ------
 
-def run_leader(mountpoint: str, vault: str, first_app_key: str | None) -> int:
+def run_leader(mountpoint: str, gpu: bool, first_app: dict | None) -> int:
     """Become the vault-side session leader. Returns the exit code.
 
     Starts nested weston (against the host fd in VERACAGE_WAYLAND_FD), launches
-    the first app, then serves the control socket (ping/list/exec/close) until
-    'close', a signal, or — once an app has been launched — all apps exit.
+    `first_app` if given, then serves the control socket (ping/list/exec/close)
+    until 'close', a signal, or — once an app has launched — all apps exit.
     """
     vr = os.environ.get("VERACAGE_VAULT_RUNTIME")
     if vr:
         os.environ["XDG_RUNTIME_DIR"] = vr
 
-    cfg = config.load()
-    state = _LeaderState(mountpoint=mountpoint, vault=vault, gpu=cfg.gpu_for(vault))
+    state = _LeaderState(mountpoint=mountpoint, gpu=gpu)
 
     stop = threading.Event()
 
@@ -187,11 +197,10 @@ def run_leader(mountpoint: str, vault: str, first_app_key: str | None) -> int:
     try:
         with nested_weston(upstream_fd=upstream) as wl_socket:
             state.weston_socket = wl_socket
-            if first_app_key:
-                r = _launch_app(state, first_app_key)
+            if first_app:
+                r = _launch_app(state, first_app)
                 if not r["ok"]:
-                    print(f"veracage: first app '{first_app_key}': {r['error']}",
-                          file=sys.stderr)
+                    print(f"veracage: first app: {r['error']}", file=sys.stderr)
 
             sel = selectors.DefaultSelector()
             sel.register(srv, selectors.EVENT_READ)
