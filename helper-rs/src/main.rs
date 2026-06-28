@@ -310,6 +310,7 @@ fn child(
     mountpoint: &Path,
     raw: &Path,
     vault_run: &Path,
+    ctl_path: &Path,
     dm_name: &str,
     cont: &Path,
     args: &Args,
@@ -383,10 +384,7 @@ fn child(
             ),
         }
     }
-    let ctl_path = Path::new(&runtime)
-        .join("veracage/sessions")
-        .join(format!("{}.sock", vault_hash(source)));
-    let ctl_fd = ipc::create_control_socket(&ctl_path, human_uid, human_gid)
+    let ctl_fd = ipc::create_control_socket(ctl_path, human_uid, human_gid)
         .unwrap_or_else(|e| fail(&format!("control socket: {e}"), 1));
 
     // Provision a vault-writable runtime dir (weston nested socket, bwrap
@@ -460,6 +458,11 @@ fn main() {
     let mountpoint = validated_mountpoint(&args.mountpoint).unwrap_or_else(|e| fail(&e, 2));
     let raw = PathBuf::from(format!("{}.raw", mountpoint.display()));
     let vault_run = PathBuf::from(format!("{}.run", mountpoint.display()));
+    let runtime_dir = setenv_value(&args, "XDG_RUNTIME_DIR")
+        .unwrap_or_else(|| fail("XDG_RUNTIME_DIR not forwarded; need it for the control socket", 2));
+    let ctl_path = PathBuf::from(&runtime_dir)
+        .join("veracage/sessions")
+        .join(format!("{}.sock", vault_hash(&source)));
 
     let cont = PathBuf::from(continuation());
     if !is_executable(&cont) {
@@ -476,7 +479,7 @@ fn main() {
     }
     if pid == 0 {
         child(vault_uid, vault_gid, human_uid, human_gid, &source, args.backend,
-              &mountpoint, &raw, &vault_run, &dm_name, &cont, &args);
+              &mountpoint, &raw, &vault_run, &ctl_path, &dm_name, &cont, &args);
     }
 
     // Parent (still root, original mount NS).
@@ -490,6 +493,7 @@ fn main() {
     }
     let _ = std::fs::remove_dir(&raw);
     let _ = std::fs::remove_dir_all(&vault_run);
+    let _ = std::fs::remove_file(&ctl_path);
     let _ = std::fs::remove_dir(&mountpoint);
     // Remove the lock only if the device is actually gone, so a failed close
     // leaves a recovery trail for the ExecStopPost cleanup.
