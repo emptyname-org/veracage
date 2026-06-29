@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from unittest import mock
 
@@ -14,7 +15,7 @@ from veracage import apps, cli, config
 def _no_active_session(monkeypatch):
     """Pretend there's no running session so cmd_open doesn't refuse."""
     monkeypatch.setattr(
-        "veracage.cli.session.send_request",
+        "veracage.cli.leader.send_request",
         mock.Mock(side_effect=FileNotFoundError),
     )
 
@@ -87,7 +88,7 @@ def test_open_passes_vault_but_not_identity(monkeypatch, configured, fake_vault)
     continuation itself, so a direct `pkexec` call can't choose --user 0."""
     _, argv = _run_open(monkeypatch, fake_vault, "kate")
     pairs = list(zip(argv, argv[1:]))
-    assert ("--vault", str(fake_vault)) in pairs
+    assert ("--source", str(fake_vault)) in pairs
     assert ("--user", str(os.getuid())) not in pairs
     assert ("--group", str(os.getgid())) not in pairs
     assert "--continuation" not in argv
@@ -111,10 +112,11 @@ def test_open_uses_last_used_app_when_unspecified(monkeypatch, configured, fake_
     _, argv = _run_open(monkeypatch, fake_vault, app=None)
     sep = argv.index("--")
     after = argv[sep + 1:]
-    assert after[0] == "_continue"
-    pairs = list(zip(after, after[1:]))
-    assert ("--app", "kate") in pairs           # configured.last_used_app
-    assert ("--vault", str(fake_vault)) in pairs
+    assert after[0] == "_leader"
+    pairs = dict(zip(after, after[1:]))
+    assert "--mountpoint" in pairs
+    spec = json.loads(pairs["--app"])           # resolved app, not the bare key
+    assert spec["exec"] == apps.KNOWN_APPS["kate"].exec   # configured.last_used_app
 
 
 def test_open_rejects_unenabled_app(monkeypatch, configured, fake_vault, capsys):

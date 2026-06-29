@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import json
 import os
 import secrets
 import subprocess
 import sys
 from pathlib import Path
 
-from . import cleanup, config, configure, session
+from . import cleanup, config, configure, leader, session
 from .sandbox import bwrap_command  # noqa: F401  (kept for downstream tests)
 from .wayland import WestonStartFailed, nested_weston  # noqa: F401
 
@@ -72,8 +74,9 @@ def cmd_open(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
 
+    app = cfg.apps[app_key]
     vault = Path(args.vault).resolve()
-    if not vault.is_file():
+    if not vault.exists():   # file or block device; the helper validates which
         print(f"veracage: vault not found: {vault}", file=sys.stderr)
         return 2
 
@@ -82,6 +85,8 @@ def cmd_open(args: argparse.Namespace) -> int:
     config.save(cfg)
 
     mountpoint = Path(f"/run/veracage/{secrets.token_hex(8)}")
+    gpu = cfg.gpu_for(str(vault))
+    backend = cfg.backend_for(str(vault))
 
     env_args: list[str] = []
     for k in _FORWARD_ENV:
@@ -91,7 +96,7 @@ def cmd_open(args: argparse.Namespace) -> int:
 
     # Refuse if a session is already running for this vault.
     try:
-        existing = session.send_request(str(vault), {"cmd": "list"})
+        existing = leader.send_request(str(vault), {"cmd": "list"})
         if existing.get("ok"):
             print(f"veracage: a session is already open for {vault}\n"
                   f"Use `veracage exec {vault} {app_key}` to add an app to it.",
@@ -101,34 +106,38 @@ def cmd_open(args: argparse.Namespace) -> int:
         pass  # no session running — good
     except OSError:
         # Stale socket file. Remove and proceed.
-        from .session import session_socket_path
-        with __import__("contextlib").suppress(FileNotFoundError):
-            session_socket_path(str(vault)).unlink()
+        with contextlib.suppress(FileNotFoundError):
+            leader.session_socket_path(str(vault)).unlink()
 
-    # Wrap the launch in a systemd transient scope so cleanup is guaranteed
-    # even if the wrapper is SIGKILL'd. ExecStopPost fires whenever the
-    # scope is destroyed (graceful exit, panic, OOM, log-out).
+    # The human side resolves the app from config; the vault-side leader runs
+    # the {exec,args} verbatim (the allowlist is UX here, not a vault-side
+    # restriction — bwrap is what stops a launched app exfiltrating).
+    app_json = json.dumps({"name": app.name, "exec": app.exec, "args": app.args})
+    leader_args = ["_leader", "--mountpoint", str(mountpoint), "--app", app_json]
+    if gpu:
+        leader_args.append("--gpu")
+
+    # Wrap the launch in a systemd transient scope so cleanup is guaranteed even
+    # if the wrapper is SIGKILL'd. ExecStopPost fires whenever the scope is
+    # destroyed (graceful exit, panic, OOM, log-out).
     vh = cleanup.vault_hash(str(vault))
-    exec_stop_post = (
-        f"ExecStopPost=pkexec {CLEANUP_HELPER_PATH} --vault-hash {vh}"
-    )
+    exec_stop_post = f"ExecStopPost=pkexec {CLEANUP_HELPER_PATH} --vault-hash {vh}"
     scope_unit = f"veracage-{vh[:8]}.scope"
 
     cmd = [
         "systemd-run", "--user", "--scope", "--quiet",
         "--collect",
         f"--unit={scope_unit}",
-        f"--description=Veracage session for {Path(vault).name}",
+        f"--description=Veracage session for {vault.name}",
         "--property", exec_stop_post,
         "pkexec",
         HELPER_PATH,
-        "--vault", str(vault),
+        "--source", str(vault),
+        "--backend", backend,
         "--mountpoint", str(mountpoint),
         *env_args,
         "--",
-        "_continue", "--mountpoint", str(mountpoint),
-                     "--vault", str(vault),
-                     "--app", app_key,
+        *leader_args,
     ]
     return subprocess.run(cmd).returncode
 
@@ -136,8 +145,16 @@ def cmd_open(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------- _continue ----
 
 def cmd_continue(args: argparse.Namespace) -> int:
-    """Run inside the private mount NS as the user. Becomes the session leader."""
+    """Option-a leader (run inside the private mount NS as the user). Retained
+    until session.py is retired; cmd_open now uses _leader (deny-by-UID)."""
     return session.run_session(args.mountpoint, args.vault, args.app)
+
+
+def cmd_leader(args: argparse.Namespace) -> int:
+    """B2 leader: runs inside the private mount NS AS the vault uid (the helper
+    dropped to us and passed the control/wayland fds via the environment)."""
+    first_app = json.loads(args.app) if args.app else None
+    return leader.run_leader(args.mountpoint, args.gpu, first_app)
 
 
 # ----------------------------------------------- veracage exec / list / close
@@ -145,12 +162,15 @@ def cmd_continue(args: argparse.Namespace) -> int:
 def cmd_exec(args: argparse.Namespace) -> int:
     vault = str(Path(args.vault).resolve())
     cfg = config.load()
-    if args.app not in cfg.apps:
+    app = cfg.apps.get(args.app)
+    if app is None:
         print(f"veracage: app '{args.app}' not enabled\n"
               f"Enabled: {', '.join(cfg.apps) or '(none)'}", file=sys.stderr)
         return 2
+    # Resolve the app here (human side); the leader runs it verbatim.
+    spec = {"name": app.name, "exec": app.exec, "args": app.args}
     try:
-        reply = session.send_request(vault, {"cmd": "exec", "app": args.app})
+        reply = leader.send_request(vault, {"cmd": "exec", "app": spec})
     except FileNotFoundError:
         print(f"veracage: no active session for {vault}\n"
               f"Run `veracage open {vault}` first.", file=sys.stderr)
@@ -164,7 +184,7 @@ def cmd_exec(args: argparse.Namespace) -> int:
 def cmd_list(args: argparse.Namespace) -> int:
     vault = str(Path(args.vault).resolve())
     try:
-        reply = session.send_request(vault, {"cmd": "list"})
+        reply = leader.send_request(vault, {"cmd": "list"})
     except FileNotFoundError:
         print(f"veracage: no active session for {vault}", file=sys.stderr)
         return 2
@@ -176,7 +196,7 @@ def cmd_list(args: argparse.Namespace) -> int:
 def cmd_close(args: argparse.Namespace) -> int:
     vault = str(Path(args.vault).resolve())
     try:
-        session.send_request(vault, {"cmd": "close"})
+        leader.send_request(vault, {"cmd": "close"})
     except FileNotFoundError:
         print(f"veracage: no active session for {vault}", file=sys.stderr)
         return 2
@@ -205,6 +225,12 @@ def main() -> int:
     p_cont.add_argument("--vault", required=True)
     p_cont.add_argument("--app", required=True)
     p_cont.set_defaults(func=cmd_continue)
+
+    p_leader = sub.add_parser("_leader", help=argparse.SUPPRESS)
+    p_leader.add_argument("--mountpoint", required=True)
+    p_leader.add_argument("--app", default=None)
+    p_leader.add_argument("--gpu", action="store_true")
+    p_leader.set_defaults(func=cmd_leader)
 
     p_exec = sub.add_parser("exec", help="add an app to a running session")
     p_exec.add_argument("vault")
