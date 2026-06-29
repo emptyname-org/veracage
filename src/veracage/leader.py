@@ -83,6 +83,12 @@ def _handle_request(state: _LeaderState, req: dict) -> dict:
     if cmd == "exec":
         return _launch_app(state, req.get("app"))
 
+    if cmd == "clip-push":
+        return _do_clip_push(state, req)
+
+    if cmd == "clip-pull":
+        return _do_clip_pull(state)
+
     return {"ok": False, "error": f"unknown cmd: {cmd}"}
 
 
@@ -164,6 +170,51 @@ def _do_export(state: _LeaderState, req: dict) -> tuple[dict, list[int]]:
     except OSError as e:
         return {"ok": False, "error": f"export failed: {e}"}, []
     return {"ok": True, "name": name}, [fd]
+
+
+# ------------------------------------------------------------- clipboard ---
+#
+# The sandbox clipboard is the nested weston's, which the human side can't
+# reach. text-only: clip-push runs wl-copy against the nested compositor so
+# sandbox apps can paste it; clip-pull runs wl-paste to read it back. Images go
+# through the file bridge, not here.
+
+def _clip_env(state: _LeaderState) -> dict[str, str]:
+    env = {**os.environ}
+    if state.weston_socket is not None:
+        env["WAYLAND_DISPLAY"] = state.weston_socket.name
+    return env
+
+
+def _do_clip_push(state: _LeaderState, req: dict) -> dict:
+    if state.weston_socket is None:
+        return {"ok": False, "error": "compositor not ready"}
+    text = req.get("text")
+    if not isinstance(text, str):
+        return {"ok": False, "error": "clip-push needs 'text'"}
+    try:
+        subprocess.run(["wl-copy"], input=text.encode(), env=_clip_env(state),
+                       timeout=5, check=True)
+    except FileNotFoundError:
+        return {"ok": False, "error": "wl-clipboard not installed"}
+    except (subprocess.SubprocessError, OSError) as e:
+        return {"ok": False, "error": f"clip-push failed: {e}"}
+    return {"ok": True}
+
+
+def _do_clip_pull(state: _LeaderState) -> dict:
+    if state.weston_socket is None:
+        return {"ok": False, "error": "compositor not ready"}
+    try:
+        r = subprocess.run(["wl-paste", "--no-newline"], env=_clip_env(state),
+                           capture_output=True, timeout=5)
+    except FileNotFoundError:
+        return {"ok": False, "error": "wl-clipboard not installed"}
+    except (subprocess.SubprocessError, OSError) as e:
+        return {"ok": False, "error": f"clip-pull failed: {e}"}
+    # wl-paste exits non-zero on an empty selection; treat that as empty text.
+    text = r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+    return {"ok": True, "text": text}
 
 
 # ------------------------------------------------------------- reaping -----
@@ -382,3 +433,13 @@ def export_file(vault: str, name: str, dest_path: str) -> dict:
         return reply
     finally:
         s.close()
+
+
+def clip_push(vault: str, text: str) -> dict:
+    """Set the sandbox clipboard (text) from the host side."""
+    return send_request(vault, {"cmd": "clip-push", "text": text})
+
+
+def clip_pull(vault: str) -> dict:
+    """Read the sandbox clipboard (text) to the host side."""
+    return send_request(vault, {"cmd": "clip-pull"})

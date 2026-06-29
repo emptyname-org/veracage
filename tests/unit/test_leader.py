@@ -235,3 +235,56 @@ def test_bridge_fd_passing_roundtrip(tmp_path, monkeypatch):
     finally:
         t.join(timeout=5)
         srv.close()
+
+
+# -------------------------------------------------------------- clipboard --
+
+def test_clip_env_sets_wayland_display():
+    st = _state(weston_socket=Path("/run/x/veracage-aabbccdd"))
+    assert leader._clip_env(st)["WAYLAND_DISPLAY"] == "veracage-aabbccdd"
+
+
+def test_clip_push_without_weston():
+    assert leader._handle_request(_state(), {"cmd": "clip-push", "text": "hi"})["ok"] is False
+
+
+def test_clip_push_needs_text():
+    st = _state(weston_socket=Path("/run/x/wl-1"))
+    assert leader._handle_request(st, {"cmd": "clip-push"})["ok"] is False
+
+
+def test_clip_push_runs_wl_copy(monkeypatch):
+    calls = {}
+
+    def fake_run(argv, **kw):
+        calls["argv"] = argv
+        calls["input"] = kw.get("input")
+        return type("R", (), {"returncode": 0})()
+    monkeypatch.setattr(leader.subprocess, "run", fake_run)
+    st = _state(weston_socket=Path("/run/x/wl-1"))
+    assert leader._handle_request(st, {"cmd": "clip-push", "text": "hello"}) == {"ok": True}
+    assert calls["argv"] == ["wl-copy"]
+    assert calls["input"] == b"hello"
+
+
+def test_clip_push_no_wl_clipboard(monkeypatch):
+    def boom(*a, **k):
+        raise FileNotFoundError(2, "no", "wl-copy")
+    monkeypatch.setattr(leader.subprocess, "run", boom)
+    st = _state(weston_socket=Path("/run/x/wl-1"))
+    r = leader._handle_request(st, {"cmd": "clip-push", "text": "x"})
+    assert r["ok"] is False and "wl-clipboard" in r["error"]
+
+
+def test_clip_pull_returns_text(monkeypatch):
+    monkeypatch.setattr(leader.subprocess, "run",
+                        lambda argv, **kw: type("R", (), {"returncode": 0, "stdout": b"clip text"})())
+    st = _state(weston_socket=Path("/run/x/wl-1"))
+    assert leader._handle_request(st, {"cmd": "clip-pull"}) == {"ok": True, "text": "clip text"}
+
+
+def test_clip_pull_empty_selection(monkeypatch):
+    monkeypatch.setattr(leader.subprocess, "run",
+                        lambda argv, **kw: type("R", (), {"returncode": 1, "stdout": b""})())
+    st = _state(weston_socket=Path("/run/x/wl-1"))
+    assert leader._handle_request(st, {"cmd": "clip-pull"}) == {"ok": True, "text": ""}
