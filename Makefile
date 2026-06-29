@@ -1,4 +1,4 @@
-.PHONY: help build install install-dev uninstall uninstall-dev test test-rs lint clean test-vault smoke
+.PHONY: help build install install-dev uninstall uninstall-dev test test-rs test-rs-root lint clean test-vault smoke veracage-user
 
 PREFIX     ?= /usr/local
 BINDIR     ?= $(PREFIX)/bin
@@ -31,9 +31,19 @@ build: CONT ?= $(BINDIR)/veracage
 build:
 	VERACAGE_CONTINUATION='$(CONT)' $(CARGO) build --release --manifest-path helper-rs/Cargo.toml
 
+# --- vault user ----------------------------------------------------------
+# The helper presents the vault as (and runs apps as) this dedicated system
+# user; it must exist before `veracage open`. Idempotent.
+veracage-user:
+	@id veracage >/dev/null 2>&1 || sudo useradd -r -M -s /usr/sbin/nologin veracage
+	@echo "veracage user uid: $$(id -u veracage)"
+
 # --- real install --------------------------------------------------------
 install: CONT := $(BINDIR)/veracage
 install: build
+	# Dedicated vault system user (skipped for staged/packaged DESTDIR builds,
+	# where a package postinst should create it instead).
+	@if [ -z "$(DESTDIR)" ]; then id veracage >/dev/null 2>&1 || sudo useradd -r -M -s /usr/sbin/nologin veracage; fi
 	# Python package
 	install -d "$(DESTDIR)$(LIBDIR)"
 	cp -r src/veracage "$(DESTDIR)$(LIBDIR)/veracage"
@@ -57,7 +67,7 @@ install: build
 
 # --- dev install: polkit points at this checkout -------------------------
 install-dev: CONT := $(DEV_ROOT)/src/bin/veracage
-install-dev: build
+install-dev: veracage-user build
 	chmod +x "$(DEV_ROOT)/src/bin/veracage" "$(DEV_ROOT)/helpers/veracage-cleanup"
 	sed -e 's|@HELPER@|$(DEV_ROOT)/$(HELPER_BIN)|g' \
 	    -e 's|@CLEANUP@|$(DEV_ROOT)/helpers/veracage-cleanup|g' \

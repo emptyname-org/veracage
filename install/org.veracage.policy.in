@@ -13,7 +13,7 @@
   <vendor_url>https://example.invalid/veracage</vendor_url>
 
   <action id="org.veracage.helper">
-    <description>Mount a VeraCrypt vault into a private namespace</description>
+    <description>Open an encrypted volume (LUKS or VeraCrypt) into an isolated workspace</description>
     <message>Authentication is required to open a Veracage vault</message>
     <defaults>
       <allow_any>auth_admin</allow_any>
