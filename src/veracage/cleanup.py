@@ -17,9 +17,11 @@ make us close arbitrary dm devices.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -96,13 +98,26 @@ def cleanup_one(p: Path) -> int:
               f"(does not match veracage-<12-hex>)", file=sys.stderr)
         rc = 2
 
-    # Best-effort: remove the (now-orphan) mountpoint dir.
+    # Best-effort: remove the (now-orphan) mountpoint dir and the B2 helper's
+    # sibling scratch (the idmap staging `.raw` and the vault runtime `.run`).
+    # The helper's own teardown clears these on a clean exit; this path only
+    # matters on a crash. None hold plaintext (the key is in the dm device we
+    # just closed; the idmap mount died with the leader's namespace).
     mp = fields.get("mountpoint", "")
     if mp.startswith("/run/veracage/") and not Path(mp).is_symlink():
-        try:
+        with contextlib.suppress(OSError):
             Path(mp).rmdir()
-        except OSError:
-            pass
+        with contextlib.suppress(OSError):
+            Path(mp + ".raw").rmdir()
+        run_dir = Path(mp + ".run")
+        if not run_dir.is_symlink():
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    # Remove the (now-orphan) control socket in the human's runtime dir.
+    uid = fields.get("user_uid", "")
+    if uid.isdigit():
+        with contextlib.suppress(OSError):
+            (Path(f"/run/user/{uid}/veracage/sessions") / f"{p.stem}.sock").unlink()
 
     # Only remove the lock once the device is actually gone. A failed close
     # (e.g. EBUSY) must leave the lock as a recovery trail, not orphan the

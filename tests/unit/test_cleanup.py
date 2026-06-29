@@ -129,7 +129,8 @@ def test_cleanup_one_returns_cryptsetup_failure(tmp_path):
 
 
 def test_cleanup_one_removes_orphan_mountpoint(tmp_path):
-    """The (host-side empty) mountpoint dir under /run/veracage/ is rmdir'd."""
+    """The (host-side empty) mountpoint dir + its `.raw` staging under
+    /run/veracage/ are rmdir'd."""
     mp = tmp_path / "orphan"
     mp.mkdir()
     p = _lock(tmp_path,
@@ -139,7 +140,7 @@ def test_cleanup_one_removes_orphan_mountpoint(tmp_path):
          mock.patch("veracage.cleanup.Path.exists", return_value=True), \
          mock.patch("veracage.cleanup.Path.rmdir") as rmdir:
         cleanup.cleanup_one(p)
-    rmdir.assert_called_once()
+    assert rmdir.call_count == 2          # mountpoint + .raw staging
 
 
 def test_cleanup_one_ignores_non_run_veracage_mountpoint(tmp_path):
