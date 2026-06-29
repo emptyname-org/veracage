@@ -139,7 +139,20 @@ def cmd_open(args: argparse.Namespace) -> int:
         "--",
         *leader_args,
     ]
-    return subprocess.run(cmd).returncode
+
+    # Spawn the human-side agent (tray). It connects to the control socket
+    # lazily once the session is up, and we tear it down when the session ends.
+    agent_proc = subprocess.Popen([sys.argv[0], "_agent", "--vault", str(vault)])
+    try:
+        rc = subprocess.run(cmd).returncode
+    finally:
+        if agent_proc.poll() is None:
+            agent_proc.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                agent_proc.wait(timeout=3)
+            if agent_proc.poll() is None:
+                agent_proc.kill()
+    return rc
 
 
 # ---------------------------------------------------------- _continue ----
@@ -205,7 +218,7 @@ def cmd_close(args: argparse.Namespace) -> int:
 
 def cmd_agent(args: argparse.Namespace) -> int:
     from . import agent
-    return agent.run(args.vault, args.mountpoint, args.weston_socket)
+    return agent.run(args.vault)
 
 
 # ----------------------------------------------------------- main --------
@@ -247,8 +260,6 @@ def main() -> int:
 
     p_agent = sub.add_parser("_agent", help=argparse.SUPPRESS)
     p_agent.add_argument("--vault", required=True)
-    p_agent.add_argument("--mountpoint", required=True)
-    p_agent.add_argument("--weston-socket", required=True)
     p_agent.set_defaults(func=cmd_agent)
 
     configure.add_subparser(sub)

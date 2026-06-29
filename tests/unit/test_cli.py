@@ -41,8 +41,9 @@ def _run_open(monkeypatch, vault, app=None):
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
     monkeypatch.setenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     ns = argparse.Namespace(vault=str(vault), app=app)
-    with mock.patch("subprocess.run") as run:
+    with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
         run.return_value.returncode = 0
+        popen.return_value.poll.return_value = 0  # agent "exited" -> skip teardown
         rc = cli.cmd_open(ns)
     argv = run.call_args.args[0] if run.called else None
     return rc, argv
@@ -137,8 +138,9 @@ def test_open_auto_configures_when_no_config(monkeypatch, tmp_xdg_config, fake_v
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
     monkeypatch.setenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     ns = argparse.Namespace(vault=str(fake_vault), app=None)
-    with mock.patch("subprocess.run") as run:
+    with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
         run.return_value.returncode = 0
+        popen.return_value.poll.return_value = 0
         rc = cli.cmd_open(ns)
     assert rc == 0
     # config now exists

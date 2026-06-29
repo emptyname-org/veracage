@@ -1,18 +1,19 @@
-"""Veracage agent — Qt UI running on the host alongside the session.
+"""Veracage agent — Qt tray UI running on the host, as the human.
 
-Provides:
+In the deny-by-UID model the agent has **no vault access**: it can't read the
+vault, the outbox, or the sandbox clipboard. Everything goes through the leader
+over the control socket (the same one `veracage exec` uses), so the agent holds
+no privilege and sees no plaintext:
 
-  - Tray icon with menu (open app, push/pull clipboard, drop zone, close)
-  - Drop-zone window for host→sandbox file transfer
-  - Outbox watcher (sandbox→host file transfer)
+  - Open app in vault   -> leader exec (resolved app spec)
+  - Push/pull clipboard -> leader clip-push / clip-pull (text)
+  - Drop zone (import)  -> leader import_file (host fd passed to the vault uid)
+  - Export from sandbox -> leader list_outbox + export_file (vault fd passed back)
+  - Close vault         -> leader close
 
-Spawned by the session leader. Communicates with it through the same
-control socket that `veracage exec` uses, so the agent has no special
-privilege.
-
-Soft-imports PySide6: if it's missing the agent exits 0 and the session
-continues without UI (the user can still use `veracage exec/list/close`
-from the CLI).
+Spawned by the launcher (`veracage open`). Soft-imports PySide6: if it's missing
+the agent exits 0 and the session continues headless (use `veracage exec/list/
+close` from the CLI).
 """
 from __future__ import annotations
 
@@ -21,10 +22,10 @@ import sys
 import time
 from pathlib import Path
 
-from . import clipboard, config, session, transfer
+from . import config, leader
 
 
-def run(vault: str, mountpoint: str, weston_socket: str) -> int:
+def run(vault: str) -> int:
     try:
         from PySide6.QtGui import QIcon
         from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
@@ -35,8 +36,6 @@ def run(vault: str, mountpoint: str, weston_socket: str) -> int:
         )
         return 0
 
-    sock = Path(weston_socket)
-    transfer.ensure_staging(mountpoint)
     cfg = config.load()
 
     qt = QApplication(sys.argv)
@@ -48,36 +47,34 @@ def run(vault: str, mountpoint: str, weston_socket: str) -> int:
     tray.setToolTip(f"Veracage — {Path(vault).name}")
     menu = QMenu()
 
-    # ---- Launch app submenu ----
+    # ---- Launch app submenu (apps resolved here; leader runs them verbatim) ----
     launch_menu = menu.addMenu("Open app in vault…")
-    for key, app_def in cfg.apps.items():
+    for app_def in cfg.apps.values():
         action = launch_menu.addAction(app_def.name)
-        action.triggered.connect(_launch_app(vault, key, tray))
+        action.triggered.connect(_launch_app(vault, app_def, tray))
     if not cfg.apps:
         empty = launch_menu.addAction("(no apps configured)")
         empty.setEnabled(False)
 
     menu.addSeparator()
 
-    # ---- Clipboard transfer ----
+    # ---- Clipboard transfer (text) ----
     push = menu.addAction("Push host clipboard → sandbox")
     pull = menu.addAction("Pull sandbox clipboard → host")
-    push.triggered.connect(_clipboard_op(clipboard.push_host_to_sandbox, sock,
-                                         tray, "Pushed to sandbox"))
-    pull.triggered.connect(_clipboard_op(clipboard.pull_sandbox_to_host, sock,
-                                         tray, "Pulled to host"))
+    push.triggered.connect(_clip_push(vault, qt, tray))
+    pull.triggered.connect(_clip_pull(vault, qt, tray))
 
     menu.addSeparator()
 
-    # ---- Drop zone ----
-    drop = DropZone(mountpoint, tray)
+    # ---- Drop zone (import) ----
+    drop = DropZone(vault, tray)
     dz_action = menu.addAction("Show drop zone…")
     dz_action.triggered.connect(drop.toggle)
 
     menu.addSeparator()
 
-    # ---- Outbox ----
-    outbox = OutboxHandler(mountpoint, tray)
+    # ---- Outbox (export) ----
+    outbox = OutboxHandler(vault, tray)
     out_action = menu.addAction("Export from sandbox…")
     out_action.triggered.connect(outbox.export_dialog)
 
@@ -89,7 +86,6 @@ def run(vault: str, mountpoint: str, weston_socket: str) -> int:
 
     tray.setContextMenu(menu)
 
-    # Left-click also opens the export dialog.
     def _on_activated(reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             outbox.export_dialog()
@@ -101,48 +97,78 @@ def run(vault: str, mountpoint: str, weston_socket: str) -> int:
 
 # --------------------------------------------------------------- helpers ----
 
-def _launch_app(vault: str, app_key: str, tray):
+def _notify(tray, msg: str, level: str = "info", ms: int = 2500) -> None:
+    from PySide6.QtWidgets import QSystemTrayIcon
+    icon = {
+        "info": QSystemTrayIcon.MessageIcon.Information,
+        "warn": QSystemTrayIcon.MessageIcon.Warning,
+        "error": QSystemTrayIcon.MessageIcon.Critical,
+    }.get(level, QSystemTrayIcon.MessageIcon.Information)
+    tray.showMessage("Veracage", msg, icon, ms)
+
+
+def _launch_app(vault: str, app_def, tray):
+    spec = {"name": app_def.name, "exec": app_def.exec, "args": app_def.args}
+
     def _do():
-        from PySide6.QtWidgets import QSystemTrayIcon
         try:
-            reply = session.send_request(vault, {"cmd": "exec", "app": app_key})
+            reply = leader.send_request(vault, {"cmd": "exec", "app": spec})
             if not reply.get("ok"):
-                tray.showMessage(
-                    "Veracage", f"Failed to start {app_key}: {reply.get('error')}",
-                    QSystemTrayIcon.MessageIcon.Warning, 4000,
-                )
+                _notify(tray, f"Failed to start {app_def.name}: {reply.get('error')}", "warn", 4000)
         except Exception as e:
-            tray.showMessage("Veracage", str(e),
-                             QSystemTrayIcon.MessageIcon.Critical, 4000)
+            _notify(tray, str(e), "error", 4000)
     return _do
 
 
-def _clipboard_op(fn, sock: Path, tray, ok_msg: str):
+def _clip_push(vault: str, qt, tray):
     def _do():
-        from PySide6.QtWidgets import QSystemTrayIcon
         try:
-            fn(sock)
-            tray.showMessage("Veracage", ok_msg,
-                             QSystemTrayIcon.MessageIcon.Information, 1800)
+            text = qt.clipboard().text()
+            reply = leader.clip_push(vault, text)
+            _notify(tray, "Pushed to sandbox" if reply.get("ok")
+                    else f"Clipboard push failed: {reply.get('error')}",
+                    "info" if reply.get("ok") else "warn", 1800)
         except Exception as e:
-            tray.showMessage("Veracage", f"Clipboard transfer failed: {e}",
-                             QSystemTrayIcon.MessageIcon.Warning, 4000)
+            _notify(tray, f"Clipboard push failed: {e}", "warn", 4000)
     return _do
 
+
+def _clip_pull(vault: str, qt, tray):
+    def _do():
+        try:
+            reply = leader.clip_pull(vault)
+            if reply.get("ok"):
+                qt.clipboard().setText(reply.get("text", ""))
+                _notify(tray, "Pulled to host", "info", 1800)
+            else:
+                _notify(tray, f"Clipboard pull failed: {reply.get('error')}", "warn", 4000)
+        except Exception as e:
+            _notify(tray, f"Clipboard pull failed: {e}", "warn", 4000)
+    return _do
+
+
+def _close_session(vault: str, qt_app):
+    def _do():
+        try:
+            leader.send_request(vault, {"cmd": "close"})
+        except FileNotFoundError:
+            pass
+        qt_app.quit()
+    return _do
+
+
+# ------------------------------------------------------- suspend watcher ----
 
 def _start_suspend_watcher(vault: str, suspend_action: str = "dismount") -> None:
     """Subscribe to login1 PrepareForSleep; close the session on suspend.
 
-    Takes a logind *delay* inhibitor lock so the system waits for us to start
-    tearing the session down before it actually sleeps — otherwise it can
-    suspend with the dm-crypt key still in RAM. With `suspend_action =
-    "ignore"` no watcher is installed. Soft-imports `gi`; without it, suspend
-    handling is disabled with a warning.
+    Takes a logind *delay* inhibitor so the system waits for teardown to start
+    before sleeping — otherwise it can suspend with the dm-crypt key still in
+    RAM. `suspend_action = "ignore"` skips this. Soft-imports `gi`.
     """
     if suspend_action == "ignore":
         sys.stderr.write(
-            "veracage-agent: suspend_action=ignore; vault stays mounted "
-            "across suspend.\n"
+            "veracage-agent: suspend_action=ignore; vault stays mounted across suspend.\n"
         )
         return
     try:
@@ -151,13 +177,10 @@ def _start_suspend_watcher(vault: str, suspend_action: str = "dismount") -> None
         gi.require_version("GLib", "2.0")
         from gi.repository import Gio, GLib
     except (ImportError, ValueError):
-        sys.stderr.write(
-            "veracage-agent: python3-gi not available; suspend handling off.\n"
-        )
+        sys.stderr.write("veracage-agent: python3-gi not available; suspend handling off.\n")
         return
 
     def _take_delay_lock(bus):
-        """logind 'delay' sleep inhibitor → held fd, or None on failure."""
         try:
             ret, fds = bus.call_with_unix_fd_list_sync(
                 "org.freedesktop.login1", "/org/freedesktop/login1",
@@ -176,18 +199,14 @@ def _start_suspend_watcher(vault: str, suspend_action: str = "dismount") -> None
     lock = {"fd": None}
 
     def _on_signal(_conn, _sender, _path, _iface, _signal, params):
-        # PrepareForSleep(b active) — True just before suspending.
         try:
             suspending = bool(params[0]) if params else False
         except Exception:
             return
         if not suspending:
             return
-        # Hold the delay lock across the close request, give teardown a brief
-        # bounded window (logind InhibitDelayMaxSec ~5s), then release so the
-        # system may sleep.
         try:
-            session.send_request(vault, {"cmd": "close"})
+            leader.send_request(vault, {"cmd": "close"})
         except Exception:
             pass
         _wait_session_gone(vault, timeout=4.0)
@@ -204,28 +223,23 @@ def _start_suspend_watcher(vault: str, suspend_action: str = "dismount") -> None
             bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
             lock["fd"] = _take_delay_lock(bus)
             bus.signal_subscribe(
-                "org.freedesktop.login1",
-                "org.freedesktop.login1.Manager",
-                "PrepareForSleep",
-                "/org/freedesktop/login1",
-                None,
-                Gio.DBusSignalFlags.NONE,
-                _on_signal,
+                "org.freedesktop.login1", "org.freedesktop.login1.Manager",
+                "PrepareForSleep", "/org/freedesktop/login1", None,
+                Gio.DBusSignalFlags.NONE, _on_signal,
             )
             loop.run()
         except Exception as e:
             sys.stderr.write(f"veracage-agent: suspend watcher: {e}\n")
 
     import threading
-    t = threading.Thread(target=_run, daemon=True, name="veracage-suspend")
-    t.start()
+    threading.Thread(target=_run, daemon=True, name="veracage-suspend").start()
 
 
 def _wait_session_gone(vault: str, timeout: float) -> None:
-    """Poll until the session control socket disappears, up to `timeout`s —
-    a proxy for 'teardown has started' before we release the suspend lock."""
+    """Poll until the control socket disappears, up to `timeout`s — a proxy for
+    'teardown has started' before we release the suspend lock."""
     try:
-        sock = session.session_socket_path(vault)
+        sock = leader.session_socket_path(vault)
     except Exception:
         return
     deadline = time.monotonic() + timeout
@@ -235,23 +249,13 @@ def _wait_session_gone(vault: str, timeout: float) -> None:
         time.sleep(0.1)
 
 
-def _close_session(vault: str, qt_app):
-    def _do():
-        try:
-            session.send_request(vault, {"cmd": "close"})
-        except FileNotFoundError:
-            pass
-        qt_app.quit()
-    return _do
-
-
 # ------------------------------------------------------------ drop zone -----
 
 class DropZone:
-    def __init__(self, mountpoint: str, tray):
+    def __init__(self, vault: str, tray):
         from PySide6.QtCore import Qt
         from PySide6.QtWidgets import QLabel, QVBoxLayout
-        self.mountpoint = mountpoint
+        self.vault = vault
         self.tray = tray
         self.widget = _DropWidget(self._handle_drop)
         self.widget.setWindowTitle("Veracage drop zone")
@@ -271,21 +275,17 @@ class DropZone:
             self.widget.activateWindow()
 
     def _handle_drop(self, urls):
-        from PySide6.QtWidgets import QSystemTrayIcon
         for url in urls:
             if not url.isLocalFile():
                 continue
             try:
-                dst = transfer.import_file(url.toLocalFile(), self.mountpoint)
-                self.tray.showMessage(
-                    "Veracage", f"Imported: {dst.name}",
-                    QSystemTrayIcon.MessageIcon.Information, 2500,
-                )
+                reply = leader.import_file(self.vault, url.toLocalFile())
+                if reply.get("ok"):
+                    _notify(self.tray, f"Imported: {Path(reply['path']).name}", "info", 2500)
+                else:
+                    _notify(self.tray, f"Import failed: {reply.get('error')}", "warn", 4000)
             except Exception as e:
-                self.tray.showMessage(
-                    "Veracage", f"Import failed: {e}",
-                    QSystemTrayIcon.MessageIcon.Warning, 4000,
-                )
+                _notify(self.tray, f"Import failed: {e}", "warn", 4000)
 
 
 def _DropWidget(on_drop):
@@ -311,48 +311,31 @@ def _DropWidget(on_drop):
 # ------------------------------------------------------------- outbox -------
 
 class OutboxHandler:
-    def __init__(self, mountpoint: str, tray):
-        from PySide6.QtCore import QFileSystemWatcher
-        self.mountpoint = mountpoint
+    def __init__(self, vault: str, tray):
+        self.vault = vault
         self.tray = tray
-        _, out_dir = transfer.staging_dirs(mountpoint)
-        self.out_dir = out_dir
-        self.watcher = QFileSystemWatcher([str(out_dir)])
-        self.watcher.directoryChanged.connect(self._on_changed)
-
-    def _on_changed(self, _path: str):
-        from PySide6.QtWidgets import QSystemTrayIcon
-        new = transfer.list_outbox(self.mountpoint)
-        if new:
-            self.tray.showMessage(
-                "Veracage outbox",
-                f"{len(new)} file(s) in outbox — click tray to export.",
-                QSystemTrayIcon.MessageIcon.Information, 4000,
-            )
 
     def export_dialog(self):
-        from PySide6.QtWidgets import QFileDialog, QSystemTrayIcon
-        files = transfer.list_outbox(self.mountpoint)
-        if not files:
-            self.tray.showMessage(
-                "Veracage", "Outbox is empty.",
-                QSystemTrayIcon.MessageIcon.Information, 2000,
-            )
+        from PySide6.QtWidgets import QFileDialog
+        try:
+            reply = leader.list_outbox(self.vault)
+        except Exception as e:
+            _notify(self.tray, f"Outbox unavailable: {e}", "warn", 4000)
             return
-        for f in files:
+        files = reply.get("files", []) if reply.get("ok") else []
+        if not files:
+            _notify(self.tray, "Outbox is empty.", "info", 2000)
+            return
+        for name in files:
             target, _ = QFileDialog.getSaveFileName(
-                None, f"Export {f.name}",
-                str(Path.home() / f.name),
-            )
-            if target:
-                try:
-                    transfer.export_file(str(f), target)
-                    self.tray.showMessage(
-                        "Veracage", f"Exported to {target}",
-                        QSystemTrayIcon.MessageIcon.Information, 2500,
-                    )
-                except Exception as e:
-                    self.tray.showMessage(
-                        "Veracage", f"Export failed: {e}",
-                        QSystemTrayIcon.MessageIcon.Warning, 4000,
-                    )
+                None, f"Export {name}", str(Path.home() / name))
+            if not target:
+                continue
+            try:
+                r = leader.export_file(self.vault, name, target)
+                if r.get("ok"):
+                    _notify(self.tray, f"Exported to {target}", "info", 2500)
+                else:
+                    _notify(self.tray, f"Export failed: {r.get('error')}", "warn", 4000)
+            except Exception as e:
+                _notify(self.tray, f"Export failed: {e}", "warn", 4000)
