@@ -7,12 +7,11 @@ Schema (slice 1.5):
 
     [apps.kate]
     name     = "Kate"
-    category = "text"
     exec     = "kate"
     args     = ["/vault"]
 
-The `apps.*` table is the user's enabled allowlist. Anything not in the
-config is not launchable by `veracage open`.
+The `apps.*` table is the user's enabled list — any installed binary they added.
+Anything not in the config is not shown as a toolbar launcher by `veracage open`.
 """
 from __future__ import annotations
 
@@ -54,6 +53,7 @@ class Config:
     last_used_app: str | None = None
     gpu: bool = False                     # /dev/dri passthrough default (off)
     suspend_action: str = "dismount"      # "dismount" | "ignore"
+    exchange: bool = True                 # host<->vault shared folder (~/Veracage/Exchange)
     volumes: dict[str, VolumeConfig] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
@@ -107,10 +107,8 @@ def load() -> Config:
                 apps[key] = App(
                     key=key,
                     name=entry["name"],
-                    category=entry["category"],
                     exec=entry["exec"],
                     args=list(entry.get("args", [])),
-                    note=entry.get("note", ""),
                 )
             except (KeyError, TypeError) as e:
                 print(f"veracage: config entry [apps.{key}] invalid ({e}); skipping",
@@ -123,6 +121,7 @@ def load() -> Config:
     if not isinstance(last, str):
         last = None
     gpu = _coerce_bool(default.get("gpu", False), "default.gpu")
+    exchange = _coerce_bool(default.get("exchange", True), "default.exchange")
     suspend_action = default.get("suspend_action", "dismount")
     if suspend_action not in ("dismount", "ignore"):
         print(f"veracage: invalid suspend_action {suspend_action!r} "
@@ -152,7 +151,7 @@ def load() -> Config:
                 backend=bval,
             )
     return Config(apps=apps, last_used_app=last, gpu=gpu,
-                  suspend_action=suspend_action, volumes=volumes)
+                  suspend_action=suspend_action, exchange=exchange, volumes=volumes)
 
 
 def save(cfg: Config) -> Path:
@@ -163,17 +162,15 @@ def save(cfg: Config) -> Path:
     if cfg.last_used_app:
         lines += [f'last_used_app  = "{_esc(cfg.last_used_app)}"']
     lines += [f"gpu            = {_toml_bool(cfg.gpu)}",
+              f"exchange       = {_toml_bool(cfg.exchange)}",
               f'suspend_action = "{_esc(cfg.suspend_action)}"',
               ""]
     for key, a in cfg.apps.items():
         lines += [f"[apps.{key}]",
                   f'name     = "{_esc(a.name)}"',
-                  f'category = "{_esc(a.category)}"',
                   f'exec     = "{_esc(a.exec)}"',
-                  f"args     = {_toml_list(a.args)}"]
-        if a.note:
-            lines += [f'note     = "{_esc(a.note)}"']
-        lines += [""]
+                  f"args     = {_toml_list(a.args)}",
+                  ""]
     for key, vc in cfg.volumes.items():
         lines += [f'[volumes."{_esc(key)}"]']
         if vc.display_name is not None:
@@ -185,7 +182,15 @@ def save(cfg: Config) -> Path:
         if vc.backend is not None:
             lines += [f'backend      = "{_esc(vc.backend)}"']
         lines += [""]
-    p.write_text("\n".join(lines))
+    # Atomic write: a concurrent `veracage open` reading config mid-save must
+    # never see a truncated file (which load() treats as "no apps", then
+    # auto-detect overwrites the user's curated selection).
+    # Unique (pid-tagged) temp name so a concurrent save from another process
+    # (e.g. the Settings window racing the configure picker) can't clobber our
+    # tmp mid-write; the rename stays atomic either way.
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+    tmp.write_text("\n".join(lines))
+    tmp.replace(p)
     return p
 
 

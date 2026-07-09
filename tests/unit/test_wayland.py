@@ -1,8 +1,12 @@
-"""Nested-Weston context manager — spawn args, startup wait, cleanup."""
+"""Liveness of the ONE persistent compositor — pidfile read, up/down logic, wait.
+
+The per-vault `nested_compositor` spawn is gone (Phase 2): the compositor is
+brought up by the privileged helper on a fixed socket, and this module only
+observes it.
+"""
 from __future__ import annotations
 
-import signal
-from unittest import mock
+import os
 
 import pytest
 
@@ -10,107 +14,103 @@ from veracage import wayland
 
 
 @pytest.fixture
-def fake_runtime(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    return tmp_path
+def fake_rt(monkeypatch, tmp_path):
+    """Redirect the fixed compositor paths into a tmp dir."""
+    sock = tmp_path / "wl-vc"
+    pidf = tmp_path / "compositor.pid"
+    monkeypatch.setattr(wayland, "COMPOSITOR_RUNTIME", tmp_path)
+    monkeypatch.setattr(wayland, "COMPOSITOR_SOCKET", sock)
+    monkeypatch.setattr(wayland, "COMPOSITOR_PIDFILE", pidf)
+    return tmp_path, sock, pidf
 
 
-def _popen_that_creates_socket(tmp_path):
-    """Side-effect: when Popen is called, create the requested socket file."""
-    proc = mock.MagicMock()
-    proc.pid = 12345
-    proc.poll = mock.Mock(return_value=None)  # stays alive
+# ------------------------------------------------------------- pidfile -----
 
-    def side_effect(argv, **_):
-        for arg in argv:
-            if isinstance(arg, str) and arg.startswith("--socket="):
-                (tmp_path / arg.split("=", 1)[1]).touch()
-        return proc
-
-    return proc, side_effect
+def test_compositor_pid_reads_pidfile(fake_rt):
+    _, _, pidf = fake_rt
+    pidf.write_text("4321\n")
+    assert wayland.compositor_pid() == 4321
 
 
-def test_yields_socket_path_under_runtime_dir(fake_runtime):
-    _, popen = _popen_that_creates_socket(fake_runtime)
-    with mock.patch("veracage.wayland.subprocess.Popen", side_effect=popen), \
-         mock.patch("veracage.wayland.os.killpg"):
-        with wayland.nested_weston() as sock:
-            assert sock.exists()
-            assert sock.parent == fake_runtime
-            assert sock.name.startswith("veracage-")
+def test_compositor_pid_none_when_absent(fake_rt):
+    assert wayland.compositor_pid() is None
 
 
-def test_invokes_weston_with_socket_arg(fake_runtime):
-    _, popen = _popen_that_creates_socket(fake_runtime)
-    with mock.patch("veracage.wayland.subprocess.Popen",
-                    side_effect=popen) as p, \
-         mock.patch("veracage.wayland.os.killpg"):
-        with wayland.nested_weston():
-            pass
-    argv = p.call_args.args[0]
-    assert argv[0] == "weston"
-    assert any(a.startswith("--socket=veracage-") for a in argv)
+def test_compositor_pid_none_when_garbage(fake_rt):
+    _, _, pidf = fake_rt
+    pidf.write_text("not-a-pid")
+    assert wayland.compositor_pid() is None
 
 
-def test_raises_when_weston_exits_early(fake_runtime):
-    proc = mock.MagicMock()
-    proc.pid = 12345
-    proc.poll = mock.Mock(return_value=1)  # already exited
-    proc.returncode = 1
-    with mock.patch("veracage.wayland.subprocess.Popen", return_value=proc), \
-         mock.patch("veracage.wayland.os.killpg"):
-        with pytest.raises(wayland.WestonStartFailed, match="exited early"):
-            with wayland.nested_weston():
-                pass
+# --------------------------------------------------------------- up/down ---
+
+def test_is_up_true_when_pid_alive_and_socket(fake_rt, monkeypatch):
+    _, sock, pidf = fake_rt
+    pidf.write_text("4321\n")
+    sock.touch()
+    monkeypatch.setattr(wayland, "_pid_alive", lambda pid: True)
+    assert wayland.compositor_is_up() is True
 
 
-def test_raises_when_socket_does_not_appear(fake_runtime, monkeypatch):
-    proc = mock.MagicMock()
-    proc.pid = 12345
-    proc.poll = mock.Mock(return_value=None)  # alive but no socket file
-    monkeypatch.setattr(wayland, "WESTON_STARTUP_TIMEOUT_S", 0.05)
-    with mock.patch("veracage.wayland.subprocess.Popen", return_value=proc), \
-         mock.patch("veracage.wayland.os.killpg"):
-        with pytest.raises(wayland.WestonStartFailed, match="did not appear"):
-            with wayland.nested_weston():
-                pass
+def test_is_down_when_pid_dead(fake_rt, monkeypatch):
+    _, sock, pidf = fake_rt
+    pidf.write_text("4321\n")
+    sock.touch()
+    monkeypatch.setattr(wayland, "_pid_alive", lambda pid: False)
+    assert wayland.compositor_is_up() is False
 
 
-def test_kills_process_group_on_exit(fake_runtime):
-    proc, popen = _popen_that_creates_socket(fake_runtime)
-    with mock.patch("veracage.wayland.subprocess.Popen", side_effect=popen), \
-         mock.patch("veracage.wayland.os.killpg") as killpg:
-        with wayland.nested_weston():
-            pass
-    killpg.assert_called_with(12345, signal.SIGTERM)
+def test_is_down_when_socket_missing(fake_rt, monkeypatch):
+    _, _, pidf = fake_rt
+    pidf.write_text("4321\n")  # pid alive but no socket yet (half-started)
+    monkeypatch.setattr(wayland, "_pid_alive", lambda pid: True)
+    assert wayland.compositor_is_up() is False
 
 
-def test_does_not_kill_if_already_exited(fake_runtime):
-    proc, popen = _popen_that_creates_socket(fake_runtime)
-    with mock.patch("veracage.wayland.subprocess.Popen", side_effect=popen), \
-         mock.patch("veracage.wayland.os.killpg") as killpg:
-        with wayland.nested_weston():
-            # Simulate weston exiting cleanly during the with-block
-            proc.poll = mock.Mock(return_value=0)
-    killpg.assert_not_called()
+def test_is_down_when_no_pidfile(fake_rt, monkeypatch):
+    _, sock, _ = fake_rt
+    sock.touch()
+    monkeypatch.setattr(wayland, "_pid_alive", lambda pid: True)
+    assert wayland.compositor_is_up() is False
 
 
-# ----------------------------------------------- invocation builder --------
+# --------------------------------------------------------------- wait ------
 
-def test_invocation_default_no_upstream(tmp_path):
-    argv, env, pass_fds = wayland._weston_invocation("veracage-aa", None, tmp_path)
-    assert argv[0] == "weston"
-    assert "--socket=veracage-aa" in argv
-    assert not any(a.startswith("--backend=") for a in argv)
-    assert "WAYLAND_SOCKET" not in env
-    assert pass_fds == ()
-    assert env["XDG_RUNTIME_DIR"] == str(tmp_path)
+def test_wait_returns_when_up(fake_rt, monkeypatch):
+    _, sock, pidf = fake_rt
+    pidf.write_text("4321\n")
+    sock.touch()
+    monkeypatch.setattr(wayland, "_pid_alive", lambda pid: True)
+    wayland.wait_for_compositor(timeout=0.5)  # returns without raising
 
 
-def test_invocation_with_upstream_fd(tmp_path, monkeypatch):
-    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
-    argv, env, pass_fds = wayland._weston_invocation("veracage-bb", 7, tmp_path)
-    assert "--backend=wayland-backend.so" in argv
-    assert env["WAYLAND_SOCKET"] == "7"
-    assert "WAYLAND_DISPLAY" not in env       # forced to use the inherited fd
-    assert pass_fds == (7,)
+def test_wait_raises_on_timeout(fake_rt):
+    with pytest.raises(wayland.CompositorStartFailed, match="did not appear"):
+        wayland.wait_for_compositor(timeout=0.05)
+
+
+# ----------------------------------------------------- _pid_alive (real) ----
+
+def test_pid_alive_true_for_running():
+    assert wayland._pid_alive(os.getpid()) is True
+
+
+def test_pid_alive_false_for_absent():
+    # PID 2**31-1 is above pid_max on any real system → no such process.
+    assert wayland._pid_alive(2**31 - 1) is False
+
+
+def test_pid_alive_false_for_zombie():
+    """A defunct compositor keeps a /proc entry in state Z until reaped — it must
+    read as *down* so the leader tears the session down (the window-close bug)."""
+    pid = os.fork()
+    if pid == 0:  # child: exit immediately, become a zombie (parent won't reap yet)
+        os._exit(0)
+    try:
+        # Give the child a moment to exit and enter Z; poll rather than sleep long.
+        for _ in range(100):
+            if not wayland._pid_alive(pid):
+                break
+        assert wayland._pid_alive(pid) is False
+    finally:
+        os.waitpid(pid, 0)

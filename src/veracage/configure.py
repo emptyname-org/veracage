@@ -1,187 +1,115 @@
-"""`veracage configure` — choose which detected apps are enabled.
+"""`veracage configure` — manage the enabled app list.
 
-Three modes:
+There is no catalog / whitelist: you enable ANY installed binary. It is launched
+in the sandbox against the vault (bwrap-confined — no host filesystem, no
+network), so which binary it is doesn't widen what the vault can do.
 
-  * Qt window  — default if PySide6 is importable and stdin is a tty/no
-                 special flags
-  * Auto       — enable everything detected, no UI
-  * Text       — interactive y/N prompts on the terminal
+  veracage configure --add kate --arg /vault   # enable `kate /vault`
+  veracage configure --add /opt/foo/bin/foo    # enable an arbitrary binary
+  veracage configure --remove kate             # disable it
+  veracage configure --list                    # show enabled apps
+  veracage configure                           # open the GUI picker
 """
 from __future__ import annotations
 
 import argparse
+import re
+import shutil
+import subprocess
 import sys
+from pathlib import Path
 
 from . import config
-from .apps import CATEGORY_LABELS, CATEGORY_ORDER, KNOWN_APPS, App, detected
-
-# ---------------------------------------------------------------- helpers ---
-
-def _by_category(apps: dict[str, App]) -> dict[str, list[App]]:
-    out: dict[str, list[App]] = {c: [] for c in CATEGORY_ORDER}
-    for a in apps.values():
-        out.setdefault(a.category, []).append(a)
-    return out
+from .apps import App
 
 
-def _save_and_report(cfg: config.Config) -> int:
+def _resolve(binary: str) -> str | None:
+    """The runnable path for `binary`: a $PATH lookup, or an absolute/relative
+    path that exists. None if it isn't installed."""
+    return shutil.which(binary) or (binary if Path(binary).is_file() else None)
+
+
+def _key_for(binary: str, taken: set[str]) -> str:
+    base = re.sub(r"[^a-z0-9_-]", "-", Path(binary).name.lower()).strip("-") or "app"
+    key, n = base, 2
+    while key in taken:
+        key, n = f"{base}-{n}", n + 1
+    return key
+
+
+def _add(args: argparse.Namespace) -> int:
+    if _resolve(args.add) is None:
+        print(f"veracage: '{args.add}' is not installed / not on $PATH.\n"
+              "Pass an installed binary name (e.g. `--add kate`) or an absolute path.",
+              file=sys.stderr)
+        return 2
+    cfg = config.load()
+    # Re-adding the same binary updates its entry rather than duplicating it.
+    existing = next((k for k, a in cfg.apps.items() if a.exec == args.add), None)
+    key = args.key or existing or _key_for(args.add, set(cfg.apps))
+    name = args.name or Path(args.add).name
+    cfg.apps = {**cfg.apps, key: App(key=key, name=name, exec=args.add,
+                                     args=list(args.arg or []))}
     p = config.save(cfg)
-    n = len(cfg.apps)
-    print(f"veracage: wrote {p} ({n} app{'s' if n != 1 else ''} enabled)")
+    print(f"veracage: enabled '{name}' ({args.add}) as [{key}] → {p}")
     return 0
 
 
-# ------------------------------------------------------------- modes -------
-
-def _auto(_args: argparse.Namespace) -> int:
-    found = detected()
+def _remove(args: argparse.Namespace) -> int:
     cfg = config.load()
-    cfg.apps = found
-    return _save_and_report(cfg)
+    if args.remove not in cfg.apps:
+        print(f"veracage: '{args.remove}' is not enabled.\n"
+              f"Enabled: {', '.join(cfg.apps) or '(none)'}", file=sys.stderr)
+        return 2
+    cfg.apps = {k: a for k, a in cfg.apps.items() if k != args.remove}
+    config.save(cfg)
+    print(f"veracage: removed '{args.remove}'.")
+    return 0
 
 
 def _list(_args: argparse.Namespace) -> int:
     cfg = config.load()
-    found = detected()
-    enabled = set(cfg.apps)
-    print(f"Catalog: {len(KNOWN_APPS)} known, {len(found)} installed,"
-          f" {len(enabled)} enabled.\n")
-    for cat in CATEGORY_ORDER:
-        rows = [a for a in KNOWN_APPS.values() if a.category == cat]
-        if not rows:
-            continue
-        print(f"== {CATEGORY_LABELS[cat]} ==")
-        for a in rows:
-            mark = "[x]" if a.key in enabled else (
-                "[ ]" if a.key in found else "[-]")
-            tag = "" if a.key in found else "  (not installed)"
-            print(f"  {mark} {a.key:<14} {a.name}{tag}")
-        print()
-    print("Legend: [x] enabled  [ ] installed but disabled  [-] not installed")
+    if not cfg.apps:
+        print("No apps enabled. Add one with `veracage configure --add <binary>`.")
+        return 0
+    print(f"{len(cfg.apps)} app(s) enabled:")
+    for key, a in cfg.apps.items():
+        missing = "" if _resolve(a.exec) else "  (not installed)"
+        argstr = (" " + " ".join(a.args)) if a.args else ""
+        print(f"  {key:<16} {a.exec}{argstr}{missing}")
     return 0
 
 
-def _text(_args: argparse.Namespace) -> int:
-    found = detected()
-    cfg = config.load()
-    enabled = set(cfg.apps)
-    print(f"Found {len(found)} installed app(s) from the catalog.")
-    print("Enable each? (y/N, Enter = keep current)\n")
-    new_apps: dict[str, App] = {}
-    for cat in CATEGORY_ORDER:
-        rows = [a for a in found.values() if a.category == cat]
-        if not rows:
-            continue
-        print(f"-- {CATEGORY_LABELS[cat]} --")
-        for a in rows:
-            cur = "y" if a.key in enabled else "n"
-            ans = input(f"  {a.name:<24} [{cur}] > ").strip().lower()
-            if not ans:
-                ans = cur
-            if ans.startswith("y"):
-                new_apps[a.key] = a
-    cfg.apps = new_apps
-    return _save_and_report(cfg)
+def _gui(_args: argparse.Namespace) -> int:
+    """Open the Rust agent's config-picker window (it writes config.toml itself)."""
+    from .cli import AGENT_PATH  # lazy import avoids a cli <-> configure cycle
+    exe = AGENT_PATH
+    if not (Path(exe).is_file() or shutil.which(exe)):
+        print("veracage: GUI agent not found. Use `--add` / `--remove` / `--list`,\n"
+              "or build/install it with `make install`.", file=sys.stderr)
+        return 2
+    return subprocess.run([exe, "configure"]).returncode
 
-
-def _qt(_args: argparse.Namespace) -> int:
-    try:
-        from PySide6.QtWidgets import (
-            QApplication,
-            QCheckBox,
-            QDialog,
-            QDialogButtonBox,
-            QGroupBox,
-            QLabel,
-            QScrollArea,
-            QVBoxLayout,
-            QWidget,
-        )
-    except ImportError:
-        print("veracage: PySide6 not installed — falling back to text mode.\n"
-              "(install with: sudo apt install python3-pyside6.qtwidgets)\n",
-              file=sys.stderr)
-        return _text(_args)
-
-    found = detected()
-    cfg = config.load()
-    enabled = set(cfg.apps)
-
-    app = QApplication.instance() or QApplication([])  # noqa: F841  keep QApplication alive
-    dlg = QDialog()
-    dlg.setWindowTitle("Veracage — choose sandbox apps")
-    dlg.resize(520, 600)
-
-    root = QVBoxLayout(dlg)
-    intro = QLabel(
-        f"Detected {len(found)} installed app(s). "
-        "Tick the ones to make available inside the sandbox."
-    )
-    intro.setWordWrap(True)
-    root.addWidget(intro)
-
-    inner = QWidget()
-    inner_l = QVBoxLayout(inner)
-    boxes: dict[str, QCheckBox] = {}
-    for cat in CATEGORY_ORDER:
-        rows = [a for a in found.values() if a.category == cat]
-        if not rows:
-            continue
-        gb = QGroupBox(CATEGORY_LABELS[cat])
-        gl = QVBoxLayout(gb)
-        for a in rows:
-            cb = QCheckBox(f"{a.name}  —  {a.exec}")
-            cb.setChecked(a.key in enabled or not enabled)  # default-on if no prior config
-            if a.note:
-                cb.setToolTip(a.note)
-            boxes[a.key] = cb
-            gl.addWidget(cb)
-        inner_l.addWidget(gb)
-    inner_l.addStretch()
-
-    scroll = QScrollArea()
-    scroll.setWidgetResizable(True)
-    scroll.setWidget(inner)
-    root.addWidget(scroll)
-
-    buttons = QDialogButtonBox(
-        QDialogButtonBox.StandardButton.Save
-        | QDialogButtonBox.StandardButton.Cancel
-    )
-    buttons.accepted.connect(dlg.accept)
-    buttons.rejected.connect(dlg.reject)
-    root.addWidget(buttons)
-
-    if dlg.exec() != QDialog.DialogCode.Accepted:
-        print("veracage: configuration cancelled.")
-        return 1
-
-    cfg.apps = {k: found[k] for k, cb in boxes.items() if cb.isChecked()}
-    return _save_and_report(cfg)
-
-
-# -------------------------------------------------------------- entry ------
 
 def main(args: argparse.Namespace) -> int:
-    if args.auto:
-        return _auto(args)
+    if args.add is not None:
+        return _add(args)
+    if args.remove is not None:
+        return _remove(args)
     if args.list:
         return _list(args)
-    if args.text:
-        return _text(args)
-    return _qt(args)
+    return _gui(args)
 
 
 def add_subparser(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser(
-        "configure",
-        help="choose which sandbox apps are enabled",
-    )
+    p = sub.add_parser("configure", help="manage the enabled sandbox apps")
     g = p.add_mutually_exclusive_group()
-    g.add_argument("--auto", action="store_true",
-                   help="enable all detected apps; no UI")
-    g.add_argument("--list", action="store_true",
-                   help="print catalog state, no changes")
-    g.add_argument("--text", action="store_true",
-                   help="text-mode prompt instead of Qt window")
+    g.add_argument("--add", metavar="BINARY",
+                   help="enable an installed binary (name on $PATH, or a path)")
+    g.add_argument("--remove", metavar="KEY", help="disable an app by its key")
+    g.add_argument("--list", action="store_true", help="list enabled apps")
+    p.add_argument("--name", help="display name for --add (default: the binary name)")
+    p.add_argument("--arg", action="append", metavar="ARG",
+                   help="argument to pass the app (repeatable), e.g. --arg /vault")
+    p.add_argument("--key", help="explicit config key for --add")
     p.set_defaults(func=main)

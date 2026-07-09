@@ -25,6 +25,11 @@ const AT_RECURSIVE: libc::c_long = 0x8000;
 const MOVE_MOUNT_F_EMPTY_PATH: libc::c_long = 4;
 const MOUNT_ATTR_IDMAP: u64 = 0x0010_0000;
 
+/// `nosuid,nodev,noexec` as a `mount_setattr` attr_set — pass as `extra_attr` for
+/// the exchange folder (a host-shared dir the sandbox can write, so it must never
+/// carry setuid/device/executable semantics). The vault passes `0`.
+pub const ATTR_NOSUID_NODEV_NOEXEC: u64 = 0x2 | 0x4 | 0x8;
+
 #[repr(C)]
 struct MountAttr {
     attr_set: u64,
@@ -105,6 +110,7 @@ pub fn idmap_mount(
     on_disk_gid: u32,
     vault_uid: u32,
     vault_gid: u32,
+    extra_attr: u64,
 ) -> io::Result<()> {
     let ns = make_userns(on_disk_uid, vault_uid, on_disk_gid, vault_gid)?;
     let src = CString::new(source_mount.as_os_str().as_bytes())
@@ -127,7 +133,7 @@ pub fn idmap_mount(
     let mnt_fd = mnt_fd as libc::c_int;
 
     let attr = MountAttr {
-        attr_set: MOUNT_ATTR_IDMAP,
+        attr_set: MOUNT_ATTR_IDMAP | extra_attr,
         attr_clr: 0,
         propagation: 0,
         userns_fd: ns.as_raw_fd() as u64,
@@ -173,7 +179,7 @@ mod tests {
     #[test]
     fn idmap_mount_has_expected_signature() {
         // Compile-time check that the primitive type-checks.
-        let _f: fn(&Path, &Path, u32, u32, u32, u32) -> io::Result<()> = idmap_mount;
+        let _f: fn(&Path, &Path, u32, u32, u32, u32, u64) -> io::Result<()> = idmap_mount;
     }
 
     /// Real idmapped-mount test (needs root + ext4 idmap support).
@@ -221,7 +227,7 @@ mod tests {
         chown(&sec, on_disk);
         chmod(&sec, 0o600);
 
-        if let Err(e) = idmap_mount(&m0, &target, on_disk, on_disk, vault, vault) {
+        if let Err(e) = idmap_mount(&m0, &target, on_disk, on_disk, vault, vault, 0) {
             cleanup();
             panic!("idmap_mount failed: {e}");
         }

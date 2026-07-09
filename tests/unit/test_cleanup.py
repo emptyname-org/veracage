@@ -155,6 +155,49 @@ def test_cleanup_one_ignores_non_run_veracage_mountpoint(tmp_path):
     rmdir.assert_not_called()
 
 
+def test_cleanup_one_refuses_wrong_owner(tmp_path, monkeypatch):
+    """The action is passwordless, so a caller whose uid != the session owner
+    (PKEXEC_UID mismatch) must be refused before touching anything."""
+    monkeypatch.setenv("PKEXEC_UID", "1001")            # attacker
+    p = _lock(tmp_path, dm_name="veracage-abc123def456",
+              mountpoint="/run/veracage/xyz", user_uid="1000")  # owner
+    with mock.patch("veracage.cleanup.subprocess.run") as r:
+        rc = cleanup.cleanup_one(p)
+    assert rc == 2
+    r.assert_not_called()          # device never touched
+    assert p.exists()              # lock left intact
+
+
+def test_cleanup_one_allows_matching_owner(tmp_path, monkeypatch):
+    monkeypatch.setenv("PKEXEC_UID", "1000")
+    p = _lock(tmp_path, dm_name="veracage-abc123def456", user_uid="1000")
+    with mock.patch("veracage.cleanup.subprocess.run",
+                    return_value=mock.MagicMock(returncode=0)), \
+         mock.patch("veracage.cleanup.Path.exists", return_value=True):
+        rc = cleanup.cleanup_one(p)
+    assert rc == 0
+
+
+def test_cleanup_one_keeps_scratch_and_lock_on_failed_close(tmp_path, monkeypatch):
+    """A failed (EBUSY) close means the session is still LIVE — its scratch dir /
+    socket must NOT be torn down, and the lock stays as a recovery trail."""
+    monkeypatch.delenv("PKEXEC_UID", raising=False)
+    mp = tmp_path / "orphan"
+    mp.mkdir()
+    p = _lock(tmp_path, dm_name="veracage-abc123def456",
+              mountpoint=f"/run/veracage/{mp.name}", user_uid="1000")
+    with mock.patch("veracage.cleanup.subprocess.run",
+                    return_value=mock.MagicMock(returncode=5, stderr="busy")), \
+         mock.patch("veracage.cleanup.Path.exists", return_value=True), \
+         mock.patch("veracage.cleanup.Path.rmdir") as rmdir, \
+         mock.patch("veracage.cleanup.shutil.rmtree") as rmtree:
+        rc = cleanup.cleanup_one(p)
+    assert rc == 5
+    rmdir.assert_not_called()
+    rmtree.assert_not_called()
+    assert p.exists()
+
+
 # --------------------------------------------------------------- main() ---
 
 def test_main_requires_root(monkeypatch, capsys):

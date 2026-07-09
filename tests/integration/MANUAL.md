@@ -20,10 +20,13 @@ the polkit policy installed (`make install-dev`).
 ## Prerequisites
 
 ```
-sudo apt install python3-pytest bubblewrap cryptsetup veracrypt weston \
-                 wl-clipboard
+sudo apt install python3-pytest bubblewrap cryptsetup veracrypt
 make install-dev    # polkit policy
 ```
+
+The nested compositor and clipboard bridge are our own Rust binaries
+(`veracage-compositor` / `veracage-agent`), built by `make install` — no
+`weston` or `wl-clipboard` needed.
 
 Create a 50 MB test vault (password: `veracage-test`):
 
@@ -194,10 +197,10 @@ src/bin/veracage open /tmp/veracage-test.vc kate
 # Terminal B — find the launcher PID
 pgrep -a -f 'veracage open'
 
-# Terminal B — kill the *entire scope*, simulating a crash
+# Terminal B — kill the *entire unit*, simulating a crash
 loginctl kill-session $(loginctl | awk '$3=="'$USER'"{print $1; exit}') --signal=SIGKILL
 # OR more targeted:
-systemctl --user stop veracage-*.scope
+systemctl --user stop veracage-*.service
 
 # Terminal B — verify
 ls /dev/mapper/ | grep veracage    # expect: NO output

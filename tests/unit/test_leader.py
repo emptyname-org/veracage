@@ -43,65 +43,71 @@ def test_non_dict_request():
     assert leader._handle_request(_state(), ["not", "a", "dict"])["ok"] is False
 
 
-# ------------------------------------------------------------------ exec ---
+# --------------------------------------------------------------- launch ----
+# `_launch_app` is the ONLY launch path. It is fed specs from the leader's own
+# enabled list (first_app at open, or app_specs[idx] on a toolbar click), never
+# from a control-socket peer.
 
-def test_exec_without_weston_is_refused():
-    r = leader._handle_request(_state(), {"cmd": "exec", "app": {"exec": "kate"}})
+def test_control_socket_has_no_launch_or_bridge():
+    """Regression for the pen-test finding: the human-owned control socket must
+    NOT expose exec / import / export / outbox. Any process running as the human
+    uid can reach it, so those would be a same-uid vault-exfiltration primitive."""
+    st = _state(wl_socket=Path("/run/x/wayland-1"))
+    for cmd in ("exec", "import", "export", "outbox"):
+        r = leader._handle_request(st, {"cmd": cmd, "app": {"exec": "kate"}})
+        assert r["ok"] is False and "unknown cmd" in r["error"]
+
+
+def test_launch_app_without_compositor_is_refused():
+    r = leader._launch_app(_state(), {"exec": "kate"})
     assert r["ok"] is False and "compositor" in r["error"]
 
 
-def test_exec_missing_spec():
-    st = _state(weston_socket=Path("/run/x/wayland-1"))
-    assert leader._handle_request(st, {"cmd": "exec"})["ok"] is False
+def test_launch_app_missing_spec():
+    st = _state(wl_socket=Path("/run/x/wayland-1"))
+    assert leader._launch_app(st, None)["ok"] is False
 
 
-def test_exec_needs_exec_field():
-    st = _state(weston_socket=Path("/run/x/wayland-1"))
-    r = leader._handle_request(st, {"cmd": "exec", "app": {"args": ["x"]}})
+def test_launch_app_needs_exec_field():
+    st = _state(wl_socket=Path("/run/x/wayland-1"))
+    r = leader._launch_app(st, {"args": ["x"]})
     assert r["ok"] is False and "exec" in r["error"]
 
 
-def test_exec_launches_and_tracks(monkeypatch):
-    monkeypatch.setattr(leader, "bwrap_command", lambda mp, a, ws, gpu: ["true"])
+def test_launch_app_launches_and_tracks(monkeypatch):
+    monkeypatch.setattr(leader, "bwrap_command",
+                        lambda mp, a, ws, gpu, places=None, exchange=None: ["true"])
+
+    captured: dict = {}
 
     class FakeProc:
         pid = 4321
-    monkeypatch.setattr(leader.subprocess, "Popen", lambda argv: FakeProc())
 
-    st = _state(weston_socket=Path("/run/x/wayland-1"))
-    r = leader._handle_request(
-        st, {"cmd": "exec", "app": {"name": "Kate", "exec": "kate", "args": ["/vault"]}})
+    def fake_popen(argv, **kw):
+        captured.update(kw)
+        return FakeProc()
+    monkeypatch.setattr(leader.subprocess, "Popen", fake_popen)
+
+    st = _state(wl_socket=Path("/run/x/wayland-1"))
+    r = leader._launch_app(st, {"name": "Kate", "exec": "kate", "args": ["/vault"]})
     assert r == {"ok": True, "pid": 4321}
     assert st.children == {4321: "Kate"}
+    # M1: the app's stdio must be detached so a viewer can't leak /vault paths to
+    # the leader's terminal/journal.
+    assert captured["stdin"] == leader.subprocess.DEVNULL
+    assert captured["stdout"] == leader.subprocess.DEVNULL
+    assert captured["stderr"] == leader.subprocess.DEVNULL
 
 
-def test_exec_runs_exactly_what_it_is_handed(monkeypatch):
-    """No config lookup / allowlist on the vault side — the leader runs the
-    resolved command verbatim (bwrap is what prevents exfiltration)."""
-    captured = {}
+def test_launch_app_missing_dependency(monkeypatch):
+    monkeypatch.setattr(leader, "bwrap_command", lambda *a, **k: ["bwrap"])
 
-    def fake_bwrap(mp, app, ws, gpu):
-        captured["exec"], captured["args"] = app.exec, app.args
-        return ["true"]
-    monkeypatch.setattr(leader, "bwrap_command", fake_bwrap)
-    monkeypatch.setattr(leader.subprocess, "Popen",
-                        lambda argv: type("P", (), {"pid": 1})())
-
-    st = _state(weston_socket=Path("/run/x/wayland-1"))
-    leader._handle_request(
-        st, {"cmd": "exec", "app": {"exec": "okular", "args": ["/vault/a.pdf"]}})
-    assert captured == {"exec": "okular", "args": ["/vault/a.pdf"]}
-
-
-def test_exec_missing_dependency(monkeypatch):
-    monkeypatch.setattr(leader, "bwrap_command", lambda *a: ["bwrap"])
-
-    def boom(argv):
+    def boom(argv, **kw):
         raise FileNotFoundError(2, "no such file", "bwrap")
     monkeypatch.setattr(leader.subprocess, "Popen", boom)
 
-    st = _state(weston_socket=Path("/run/x/wayland-1"))
-    r = leader._handle_request(st, {"cmd": "exec", "app": {"exec": "kate"}})
+    st = _state(wl_socket=Path("/run/x/wayland-1"))
+    r = leader._launch_app(st, {"exec": "kate"})
     assert r["ok"] is False and "missing dependency" in r["error"]
 
 
@@ -150,141 +156,85 @@ def test_wire_roundtrip_via_accept_one(tmp_path):
     assert replies and replies[0]["ok"] and replies[0]["uid"] == os.getuid()
 
 
-# --------------------------------------------------------------- bridge ----
-
-def test_safe_name_rejects_traversal():
-    assert leader._safe_name("../../etc/passwd") == "passwd"
-    assert leader._safe_name("a/b/c.txt") == "c.txt"
-    assert leader._safe_name("..") is None
-    assert leader._safe_name("") is None
-    assert leader._safe_name(None) is None
+# The vault file bridge (import/export/outbox) and the clipboard channel are no
+# longer part of the leader's control socket — their former tests are gone. The
+# bridge was removed as a same-uid exfiltration surface (see
+# test_control_socket_has_no_launch_or_bridge); clipboard is owned in-process by
+# the compositor.
 
 
-def test_do_import_writes_inbox(tmp_path):
-    st = leader._LeaderState(mountpoint=str(tmp_path))
-    src = tmp_path / "host.bin"
-    src.write_bytes(b"PAYLOAD")
-    fd = os.open(src, os.O_RDONLY)
+# ------------------------------------------------- toolbar app channel -----
+
+def test_publish_apps_writes_socket_and_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(leader, "COMPOSITOR_RUNTIME", tmp_path)
+    st = leader._LeaderState(
+        mountpoint="/run/veracage/deadbeef",
+        volume_label="MyVol",
+        app_specs=[{"name": "Kate", "exec": "kate", "args": []},
+                   {"name": "Okular", "exec": "okular", "args": []}])
+    srv = leader._publish_apps(st)
     try:
-        r = leader._do_import(st, {"name": "host.bin"}, [fd])
+        assert srv is not None
+        lines = (tmp_path / "app-deadbeef.apps").read_text().splitlines()
+        assert lines[0] == "app-deadbeef.sock"     # compositor connects to this
+        assert lines[1] == "MyVol"                 # volume label (window title)
+        assert lines[2:] == ["Kate", "Okular"]     # button labels, in order
+        assert (tmp_path / "app-deadbeef.sock").is_socket()
     finally:
-        os.close(fd)
-    assert r["ok"]
-    assert (tmp_path / ".veracage" / "in" / "host.bin").read_bytes() == b"PAYLOAD"
-
-
-def test_do_import_needs_fd(tmp_path):
-    st = leader._LeaderState(mountpoint=str(tmp_path))
-    assert leader._do_import(st, {"name": "x"}, [])["ok"] is False
-
-
-def test_do_export_opens_outbox(tmp_path):
-    st = leader._LeaderState(mountpoint=str(tmp_path))
-    out = tmp_path / ".veracage" / "out"
-    out.mkdir(parents=True)
-    (out / "r.txt").write_text("RESULT")
-    reply, fds = leader._do_export(st, {"name": "r.txt"})
-    try:
-        assert reply["ok"] and len(fds) == 1
-        assert os.read(fds[0], 64) == b"RESULT"
-    finally:
-        for fd in fds:
-            os.close(fd)
-
-
-def test_do_export_missing_file(tmp_path):
-    st = leader._LeaderState(mountpoint=str(tmp_path))
-    reply, fds = leader._do_export(st, {"name": "nope.txt"})
-    assert reply["ok"] is False and fds == []
-
-
-def test_bridge_fd_passing_roundtrip(tmp_path, monkeypatch):
-    """End-to-end import + export through _accept_one + the human-side clients,
-    exercising real SCM_RIGHTS fd-passing."""
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    vault = "/tmp/vault-under-test.luks"
-    sock_path = leader.session_socket_path(vault)
-    sock_path.parent.mkdir(parents=True, exist_ok=True)
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(str(sock_path))
-    srv.listen(2)
-    vaultdir = tmp_path / "vaultroot"
-    vaultdir.mkdir()
-    st = leader._LeaderState(mountpoint=str(vaultdir))
-
-    def serve():
-        for _ in range(2):
-            leader._accept_one(srv, st)
-
-    t = threading.Thread(target=serve)
-    t.start()
-    try:
-        src = tmp_path / "host.txt"
-        src.write_text("HELLO")
-        r1 = leader.import_file(vault, str(src))
-        assert r1["ok"]
-        assert (vaultdir / ".veracage" / "in" / "host.txt").read_text() == "HELLO"
-
-        outdir = vaultdir / ".veracage" / "out"
-        outdir.mkdir(parents=True, exist_ok=True)
-        (outdir / "result.txt").write_text("WORLD")
-        dest = tmp_path / "exported.txt"
-        r2 = leader.export_file(vault, "result.txt", str(dest))
-        assert r2["ok"]
-        assert dest.read_text() == "WORLD"
-    finally:
-        t.join(timeout=5)
         srv.close()
+        leader._unpublish_apps(st)
+    assert not (tmp_path / "app-deadbeef.sock").exists()
+    assert not (tmp_path / "app-deadbeef.apps").exists()
 
 
-# -------------------------------------------------------------- clipboard --
-
-def test_clip_env_sets_wayland_display():
-    st = _state(weston_socket=Path("/run/x/veracage-aabbccdd"))
-    assert leader._clip_env(st)["WAYLAND_DISPLAY"] == "veracage-aabbccdd"
-
-
-def test_clip_push_without_weston():
-    assert leader._handle_request(_state(), {"cmd": "clip-push", "text": "hi"})["ok"] is False
-
-
-def test_clip_push_needs_text():
-    st = _state(weston_socket=Path("/run/x/wl-1"))
-    assert leader._handle_request(st, {"cmd": "clip-push"})["ok"] is False
-
-
-def test_clip_push_runs_wl_copy(monkeypatch):
-    calls = {}
-
-    def fake_run(argv, **kw):
-        calls["argv"] = argv
-        calls["input"] = kw.get("input")
-        return type("R", (), {"returncode": 0})()
-    monkeypatch.setattr(leader.subprocess, "run", fake_run)
-    st = _state(weston_socket=Path("/run/x/wl-1"))
-    assert leader._handle_request(st, {"cmd": "clip-push", "text": "hello"}) == {"ok": True}
-    assert calls["argv"] == ["wl-copy"]
-    assert calls["input"] == b"hello"
+def test_accept_app_launch_execs_by_index(tmp_path, monkeypatch):
+    monkeypatch.setattr(leader, "COMPOSITOR_RUNTIME", tmp_path)
+    launched: dict = {}
+    monkeypatch.setattr(leader, "_launch_app",
+                        lambda st, spec: launched.update(spec=spec) or {"ok": True})
+    st = leader._LeaderState(
+        mountpoint="/run/veracage/abc123",
+        app_specs=[{"name": "Kate", "exec": "kate", "args": []},
+                   {"name": "Okular", "exec": "okular", "args": []}])
+    srv = leader._publish_apps(st)
+    assert srv is not None
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.connect(str(leader._app_socket_path(st)))
+        c.sendall(b"1\n")               # launch index 1 -> Okular
+        c.close()
+        leader._accept_app_launch(srv, st)
+    finally:
+        srv.close()
+        leader._unpublish_apps(st)
+    assert launched["spec"]["exec"] == "okular"
 
 
-def test_clip_push_no_wl_clipboard(monkeypatch):
-    def boom(*a, **k):
-        raise FileNotFoundError(2, "no", "wl-copy")
-    monkeypatch.setattr(leader.subprocess, "run", boom)
-    st = _state(weston_socket=Path("/run/x/wl-1"))
-    r = leader._handle_request(st, {"cmd": "clip-push", "text": "x"})
-    assert r["ok"] is False and "wl-clipboard" in r["error"]
+def test_write_places_file_uses_label(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    p = leader._write_places_file("Photos & Docs")
+    assert p == tmp_path / "user-places.xbel"
+    body = p.read_text()
+    assert 'href="file:///vault"' in body
+    assert "<title>Photos &amp; Docs</title>" in body   # XML-escaped label
 
 
-def test_clip_pull_returns_text(monkeypatch):
-    monkeypatch.setattr(leader.subprocess, "run",
-                        lambda argv, **kw: type("R", (), {"returncode": 0, "stdout": b"clip text"})())
-    st = _state(weston_socket=Path("/run/x/wl-1"))
-    assert leader._handle_request(st, {"cmd": "clip-pull"}) == {"ok": True, "text": "clip text"}
+def test_accept_app_launch_ignores_out_of_range(tmp_path, monkeypatch):
+    monkeypatch.setattr(leader, "COMPOSITOR_RUNTIME", tmp_path)
 
-
-def test_clip_pull_empty_selection(monkeypatch):
-    monkeypatch.setattr(leader.subprocess, "run",
-                        lambda argv, **kw: type("R", (), {"returncode": 1, "stdout": b""})())
-    st = _state(weston_socket=Path("/run/x/wl-1"))
-    assert leader._handle_request(st, {"cmd": "clip-pull"}) == {"ok": True, "text": ""}
+    def boom(*_a):
+        raise AssertionError("must not launch on a bad index")
+    monkeypatch.setattr(leader, "_launch_app", boom)
+    st = leader._LeaderState(
+        mountpoint="/run/veracage/abc123",
+        app_specs=[{"name": "Kate", "exec": "kate", "args": []}])
+    srv = leader._publish_apps(st)
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.connect(str(leader._app_socket_path(st)))
+        c.sendall(b"9\n")               # out of range -> no launch, no raise
+        c.close()
+        leader._accept_app_launch(srv, st)
+    finally:
+        srv.close()
+        leader._unpublish_apps(st)

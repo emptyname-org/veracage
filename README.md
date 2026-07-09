@@ -1,128 +1,105 @@
 # Veracage
 
-VeraCrypt sandboxing wrapper. See `veracage-design.md` for the full design.
+Runs apps against an encrypted volume (LUKS or VeraCrypt) in a sandbox, so the
+decrypted contents stay unreadable to the rest of the host. Full design in
+[`docs/veracage-design.md`](docs/veracage-design.md); security model in
+[`docs/SECURITY.md`](docs/SECURITY.md); the isolation core in
+[`docs/uid-isolation.md`](docs/uid-isolation.md).
 
-## Status
+## How it works
 
-**Slice 4.** Slice 3b + crash-safe cleanup via systemd transient scope
-+ suspend handling via `login1`.
+A small root helper (via `pkexec`) `cryptsetup open`s the vault and **idmap-mounts**
+it so its contents are owned by a dedicated `veracage` system uid, inside a **private
+mount namespace** — so the human and every other non-root uid are denied by
+ownership, and the mount never appears in `/proc/mounts`. Apps run as `veracage`
+under **bubblewrap** (no network, no host filesystem, curated `/etc`, `--clearenv`),
+rendered by our own persistent nested Wayland compositor (`veracage-compositor`),
+which owns the clipboard and hosts an in-window toolbar.
 
-What works:
-- `veracage configure` — pick installed apps via Qt window (or
-  `--text` / `--auto` / `--list`).
-- `veracage open <vault.vc> [app]` — mount in a private mount NS, spawn
-  nested `weston`, run the first app, become session leader, listen on
-  a per-vault UNIX control socket.
-- `veracage exec <vault.vc> <app>` — add another app to the same session
-  (no second password prompt; runs inside the same Weston window).
-- `veracage list <vault.vc>` — show running apps.
-- `veracage close <vault.vc>` — gracefully tear down the session.
-- A **tray icon** appears while a session is open. Menu items:
-  - Open app in vault → submenu of enabled apps
-  - Push host clipboard → sandbox / Pull sandbox clipboard → host
-  - Show drop zone (host file → vault inbox)
-  - Export from sandbox (vault outbox → host file)
-  - Close vault
-- **Drop zone** window: drag any host file onto it → copied into
-  `/vault/.veracage/in/` (sandbox apps see it via `Open` dialog).
-- **Outbox watcher**: anything saved to `/vault/.veracage/out/` triggers a
-  tray notification; click the tray icon to export to a host path.
-- bwrap flags: `--unshare-pid/uts/ipc/cgroup/net`, host runtime dir
-  hidden behind a tmpfs (only the Weston socket is bind-mounted in),
-  curated `/etc` (linker/fontconfig/tz/NSS/machine-id/XDG/TLS only, not
-  all of host `/etc`).
-- App allowlist driven by `~/.config/veracage/config.toml`.
-- On session end: SIGTERM remaining apps → kill agent → kill weston → dismount.
-- **Crash-safe cleanup.** The launcher runs inside a `systemd-run --user
-  --scope` transient unit. Its `ExecStopPost` invokes
-  `pkexec veracage-cleanup --vault-hash <h>`, which reads
-  `/run/veracage/<h>.lock` and `cryptsetup close`s the dm-crypt device.
-  This fires on SIGKILL, OOM, panic, log-out — anything that destroys
-  the scope. The cleanup polkit action allows active sessions without a
-  prompt (`<allow_active>yes</allow_active>`); the helper rejects any
-  `dm_name` not matching `veracage-[0-9a-f]{12}` for safety.
-- **Suspend handling.** The agent subscribes to
-  `org.freedesktop.login1.Manager.PrepareForSleep`; on suspend, sends
-  `close` to the session leader so the dm-crypt key isn't left in RAM.
-  Requires `python3-gi`; soft-fails otherwise.
-- **Privilege helper in Rust** (`helper-rs/`), polkit-authorised. Derives
-  the caller's uid/gid from `PKEXEC_UID` (never argv), pins the continuation
-  at build time, and allowlists forwarded env — closing a local
-  privilege-escalation hole. A Python reference helper is kept as the
-  pre-build fallback. See `SECURITY.md`.
-- **Config**: per-volume settings (`[volumes."<path>"]`), a `gpu` opt-in
-  (`/dev/dri` passthrough, default off) and `suspend_action`
-  (`dismount` | `ignore`). See [Config](#config) below.
-- ruff + mypy clean; GitHub Actions CI (Python + Rust helper); 123 unit tests.
+## What works
 
-Known gaps (later):
-- Global hotkeys for clipboard transfer are tray-menu only for now (XDG
-  GlobalShortcuts portal integration deferred).
-- Mode A (`wp-security-context-v1`) **intentionally not adopted** — it does
-  not isolate the clipboard (Mode B's separate compositor is what closes req
-  1.1.2), and GNOME/Mutter doesn't implement it. The full implementation spec
-  is kept in `docs/mode-a-security-context.md` if the trade-off ever changes.
+- **One window: the compositor**, with a **File / Edit / Apps / Settings** menu bar
+  in its chrome. The human-side helper (`veracage-agent`) is a **windowless broker**
+  — it does the host-side things a `veracage`-uid process can't (`pkexec` the mount,
+  host file dialogs, write `~/.config`) and shows only transient dialogs. The front
+  door (app-menu icon, or "Open with" a `.vc`) is a volume picker + passphrase
+  dialog, not a standing window. (Design: `docs/single-window-ux.md`.)
+- **`veracage open <vault> [app]`** — mount + bring up the compositor in one pkexec;
+  launch apps from the compositor **Apps menu** (no second prompt).
+- **`veracage list <vault>` / `veracage close <vault>`** — inspect / tear down.
+- **Clipboard** — Ctrl+Alt+V (host→sandbox) / Ctrl+Alt+C (sandbox→host) or the
+  toolbar buttons; text-only, user-triggered, owned by the compositor.
+- **File transfer** — a shared **Exchange folder**: `~/Veracage/Exchange` on the
+  host is idmap-mounted into the sandbox at `/exchange`. Drop a file in on either
+  side and it's there on the other, owned by you — no dialogs, no copies. Off via
+  `exchange = false`. (Design: `docs/single-window-ux.md`.)
+- **Multi-vault** — one compositor hosts every open vault's apps (shared clipboard).
+- **Enable any installed app** — `veracage configure` (GUI picker) or
+  `--add <binary>` / `--remove <key>` / `--list`. No fixed catalog.
+- **Crash-safe teardown** — the session is a `systemd --user` transient service
+  whose `ExecStopPost` `cryptsetup close`s the device on any exit
+  (SIGKILL/OOM/panic/logout).
+- **Suspend** — a static root `system-sleep` hook dismounts every session before
+  sleep (no D-Bus watcher).
+- **Privilege helper in Rust** (`helper-rs/`): derives the caller uid from
+  `PKEXEC_UID` (never argv), pins the continuation at build time, allowlists
+  forwarded env. See `docs/SECURITY.md`.
 
-## Install (development)
+Deferred: host-file import/export (the old socket file bridge was removed — see
+`docs/fixed-problems.md`) and GlobalShortcuts-portal integration for the clipboard
+keybinds. `wp_security_context_v1` (Mode A) was evaluated and **not** adopted
+([`docs/mode-a-security-context.md`](docs/mode-a-security-context.md)).
 
-System packages on Debian 12:
+## Install
+
+Debian 12 system packages:
 
 ```
-sudo apt install bubblewrap cryptsetup veracrypt weston wl-clipboard \
-                 python3 python3-pyside6.qtwidgets python3-gi
+sudo apt install bubblewrap cryptsetup veracrypt python3
 ```
 
-- `python3-pyside6.qtwidgets` — config screen + tray UI (agent). Without
-  it the launcher/CLI still work; tray/drop-zone/clipboard bridge don't.
-- `wl-clipboard` — clipboard bridge.
-- `python3-gi` — suspend handling via login1. Soft-fail without it.
+`bubblewrap` + `cryptsetup` (+ `veracrypt` for VC volumes) are required. **No
+weston, no wl-clipboard, no Qt/GTK, no python3-gi** — the agent and compositor are
+self-contained Rust binaries that link only what a desktop session already has
+(Mesa GL, Wayland/X11, `libxkbcommon.so.0`).
 
-The privilege helper is written in Rust, so you also need a toolchain
-(`rustup`, or distro `cargo` + `rustc`).
+### Toolchain (build only)
 
-Dev install — builds the helper and points a polkit policy at this checkout:
-
-```
-make install-dev
-```
-
-System install to `/usr/local` (override with `PREFIX=`):
+- The privilege **helper** builds on Debian 12's stock `rustc` 1.63.
+- The **agent** and **compositor** need rustup + recent stable
+  (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`); `make install`
+  uses rustup's cargo for both. If `libxkbcommon-dev` is absent, `make` synthesises
+  a private linker symlink to `libxkbcommon.so.0` (no `-dev` package needed).
 
 ```
-sudo make install
+make install-dev     # build the helper + point a polkit policy at this checkout
+sudo make install    # system install to /usr/local (override with PREFIX=)
 ```
 
-`make install` lays down the package under `PREFIX/lib/veracage`, the
-launcher at `PREFIX/bin/veracage`, the privileged helpers under
-`PREFIX/libexec/veracage`, and a polkit policy generated from
-`install/org.veracage.policy.in`. `make build` / `make test-rs` build and
-test just the Rust helper.
+`make install` lays down the package under `PREFIX/lib/veracage`; `veracage`,
+`veracage-agent`, and `veracage-compositor` in `PREFIX/bin`; the privileged helpers
+in `PREFIX/libexec/veracage`; a polkit policy, a `.desktop` + icon, a udev rule
+(hides the dm device from UDisks), and the `system-sleep` hook. It also creates the
+`veracage` system user.
 
-## First run
-
-```
-src/bin/veracage configure         # Qt window; tick the apps you want
-# or:
-src/bin/veracage configure --auto  # enable everything detected
-src/bin/veracage configure --list  # see catalog state
-```
-
-Config file: `~/.config/veracage/config.toml` (auto-created).
-
-## Open a vault
+## Usage
 
 ```
-src/bin/veracage open /path/to/vault.vc          # uses last app, or first enabled
-src/bin/veracage open /path/to/vault.vc kate
-src/bin/veracage open /path/to/vault.vc okular
+veracage configure                    # enable apps (GUI picker)
+veracage configure --add dolphin      # or by binary name
+veracage open /path/to/vault.vc       # mount + open the compositor
+veracage open /path/to/vault.vc kate  # auto-launch an app too
+veracage list  /path/to/vault.vc
+veracage close /path/to/vault.vc
 ```
 
-`pkexec` will prompt for your account password (polkit), then `cryptsetup`
-prompts for the vault password on the same terminal.
+`pkexec` prompts for your account password; the CLI then prompts for the vault
+passphrase on the terminal. The GUI launcher (`veracage-agent`, or the "Veracage"
+app-menu entry) collects the passphrase in a window and pipes it to `cryptsetup`.
 
 ## Config
 
-`~/.config/veracage/config.toml` (auto-created by `configure`):
+`~/.config/veracage/config.toml` (auto-created):
 
 ```toml
 [default]
@@ -130,7 +107,7 @@ last_used_app  = "kate"
 gpu            = false          # /dev/dri passthrough (side channel; off)
 suspend_action = "dismount"     # or "ignore" to keep mounted across suspend
 
-[apps.kate]                     # the enabled-app allowlist
+[apps.kate]                     # the enabled-app allowlist (any installed binary)
 name     = "Kate"
 category = "text"
 exec     = "kate"
@@ -138,27 +115,21 @@ args     = ["/vault"]
 
 [volumes."/home/you/Documents/work.vc"]   # optional per-volume overrides
 default_app  = "okular"
-gpu          = true             # overrides [default].gpu for this vault
+gpu          = true
 ```
 
-Per-volume settings inherit from `[default]`. Only apps under `[apps.*]`
-are launchable.
+Per-volume settings inherit from `[default]`. Only apps under `[apps.*]` launch —
+add one with `veracage configure --add <binary>` (there is no hardcoded catalog).
 
 ## Tests
 
 ```
-make test        # Python unit suite (pytest)
-make lint        # ruff + mypy (needs .venv dev deps)
+make test        # Python unit suite (pytest) — 154 tests
+make lint        # ruff + mypy
 make test-rs     # Rust helper unit tests (cargo)
 ```
 
-`tests/integration/test_helper_security.py` runs against the built Rust
-helper (after `make build`). The remaining privileged/GUI integration tests
-are documented in `tests/integration/MANUAL.md` — they need a real vault and
-Wayland session.
-
-## Adding a new app to the catalog
-
-Edit `src/veracage/apps.py`, add an `App(...)` entry. The `exec` field is
-the binary name we look up via `shutil.which`. Re-run `veracage configure`
-to detect and enable it.
+`tests/integration/test_helper_security.py` runs against the built helper;
+privileged/GUI integration steps are in `tests/integration/MANUAL.md`.
+`tests/regression.sh` runs the full gate (all three Rust crates + the Python suite +
+lint + a headless compositor smoke).

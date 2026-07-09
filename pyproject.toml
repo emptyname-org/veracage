@@ -19,7 +19,8 @@ readme = "README.md"
 keywords = ["veracrypt", "sandbox", "bubblewrap", "wayland", "security"]
 
 [project.optional-dependencies]
-ui = ["PySide6"]          # config screen, tray, drop zone, clipboard bridge
+# The GUI is the standalone Rust `veracage-agent` binary (see agent-rs/), not a
+# Python/Qt dependency — nothing to pip-install for the UI.
 dev = ["pytest", "ruff", "mypy"]
 
 [tool.setuptools]
@@ -46,6 +47,6 @@ ignore = [
 # --- type checking -------------------------------------------------------
 [tool.mypy]
 python_version = "3.11"
-ignore_missing_imports = true   # PySide6 / gi are optional/untyped system deps
+ignore_missing_imports = true   # tolerate optional/untyped system deps
 warn_unused_ignores = true
 files = ["src/veracage"]

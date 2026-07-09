@@ -13,7 +13,8 @@ from veracage import apps, cli, config
 
 @pytest.fixture(autouse=True)
 def _no_active_session(monkeypatch):
-    """Pretend there's no running session so cmd_open doesn't refuse."""
+    """Pretend there's no running session so cmd_open doesn't refuse. (The
+    compositor is brought up by the mount helper now, not cmd_open.)"""
     monkeypatch.setattr(
         "veracage.cli.leader.send_request",
         mock.Mock(side_effect=FileNotFoundError),
@@ -30,7 +31,8 @@ def fake_vault(tmp_path):
 @pytest.fixture
 def configured(tmp_xdg_config):
     cfg = config.Config(
-        apps={"kate": apps.KNOWN_APPS["kate"], "okular": apps.KNOWN_APPS["okular"]},
+        apps={"kate": apps.App("kate", "Kate", "kate", ["/vault"]),
+              "okular": apps.App("okular", "Okular", "okular")},
         last_used_app="kate",
     )
     config.save(cfg)
@@ -40,7 +42,7 @@ def configured(tmp_xdg_config):
 def _run_open(monkeypatch, vault, app=None):
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
     monkeypatch.setenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-    ns = argparse.Namespace(vault=str(vault), app=app)
+    ns = argparse.Namespace(vault=str(vault), app=app, passphrase_stdin=False)
     with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
         run.return_value.returncode = 0
         popen.return_value.poll.return_value = 0  # agent "exited" -> skip teardown
@@ -55,12 +57,29 @@ def test_open_invokes_pkexec_helper(monkeypatch, configured, fake_vault):
     assert argv[argv.index("pkexec") + 1].endswith("/veracage-helper")
 
 
-def test_open_wraps_in_systemd_transient_scope(monkeypatch, configured, fake_vault):
+def test_open_wraps_in_systemd_transient_service(monkeypatch, configured, fake_vault):
+    # A transient *service* (via --pty), not a --scope: scope units reject the
+    # Exec* properties, so ExecStopPost cleanup would never register on a scope.
     _, argv = _run_open(monkeypatch, fake_vault, "kate")
     assert argv[0] == "systemd-run"
     assert "--user" in argv
-    assert "--scope" in argv
+    assert "--pty" in argv
+    assert "--scope" not in argv
     assert "--collect" in argv
+
+
+def test_open_passphrase_stdin_uses_pipe(monkeypatch, configured, fake_vault):
+    """The GUI path (--passphrase-stdin) uses systemd-run --pipe, not --pty, so
+    the piped passphrase reaches the helper — and forwards --passphrase-stdin."""
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    ns = argparse.Namespace(vault=str(fake_vault), app=None, passphrase_stdin=True)
+    with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen"):
+        run.return_value.returncode = 0
+        cli.cmd_open(ns)
+    argv = run.call_args.args[0]
+    assert "--pipe" in argv and "--pty" not in argv
+    assert "--passphrase-stdin" in argv
 
 
 def test_open_registers_execstoppost_cleanup(monkeypatch, configured, fake_vault):
@@ -79,6 +98,7 @@ def test_open_unit_name_includes_vault_hash(monkeypatch, configured, fake_vault)
     _, argv = _run_open(monkeypatch, fake_vault, "kate")
     unit = next((a for a in argv if a.startswith("--unit=")), None)
     assert unit is not None
+    assert unit.endswith(".service")
     expected = cleanup.vault_hash(str(fake_vault))[:8]
     assert expected in unit
 
@@ -109,15 +129,39 @@ def test_open_forwards_xdg_runtime_dir(monkeypatch, configured, fake_vault):
     assert any(s.startswith("XDG_RUNTIME_DIR=") for s in setenv_pairs)
 
 
-def test_open_uses_last_used_app_when_unspecified(monkeypatch, configured, fake_vault):
+def test_open_omits_compositor_flag(monkeypatch, configured, fake_vault):
+    """Phase 2: the leader no longer spawns a compositor, so cmd_open threads no
+    --compositor to it — it attaches to the shared /run/veracage socket."""
+    _, argv = _run_open(monkeypatch, fake_vault, "kate")
+    sep = argv.index("--")
+    assert "--compositor" not in argv[sep + 1:]
+
+
+def test_open_without_app_launches_nothing(monkeypatch, configured, fake_vault):
+    """`veracage open <vault>` (no app) auto-launches nothing — it publishes all
+    enabled apps to the toolbar via --apps and passes no --first."""
     _, argv = _run_open(monkeypatch, fake_vault, app=None)
     sep = argv.index("--")
     after = argv[sep + 1:]
     assert after[0] == "_leader"
     pairs = dict(zip(after, after[1:]))
     assert "--mountpoint" in pairs
-    spec = json.loads(pairs["--app"])           # resolved app, not the bare key
-    assert spec["exec"] == apps.KNOWN_APPS["kate"].exec   # configured.last_used_app
+    assert "--first" not in after                # nothing auto-launched
+    specs = json.loads(pairs["--apps"])          # all enabled apps for the toolbar
+    execs = {s["exec"] for s in specs}
+    assert "kate" in execs
+    assert "okular" in execs
+
+
+def test_open_with_app_sets_first(monkeypatch, configured, fake_vault):
+    """Naming an app still auto-launches it (via --first) on top of publishing
+    the full toolbar list."""
+    _, argv = _run_open(monkeypatch, fake_vault, "okular")
+    sep = argv.index("--")
+    after = argv[sep + 1:]
+    pairs = dict(zip(after, after[1:]))
+    assert json.loads(pairs["--first"])["exec"] == "okular"
+    assert "--apps" in pairs
 
 
 def test_open_rejects_unenabled_app(monkeypatch, configured, fake_vault, capsys):
@@ -132,25 +176,29 @@ def test_open_rejects_missing_vault(monkeypatch, configured, tmp_path, capsys):
     assert "not found" in capsys.readouterr().err
 
 
-def test_open_auto_configures_when_no_config(monkeypatch, tmp_xdg_config, fake_vault, fake_path_with):
-    """First-run path: empty config triggers _auto and proceeds."""
-    fake_path_with(["kate"])
+def test_open_refuses_when_no_apps_configured(monkeypatch, tmp_xdg_config, fake_vault, capsys):
+    """No catalog auto-detection any more: an empty config refuses cleanly (no
+    mount) and points at `veracage configure --add`, rather than guessing."""
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
-    monkeypatch.setenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-    ns = argparse.Namespace(vault=str(fake_vault), app=None)
-    with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
-        run.return_value.returncode = 0
-        popen.return_value.poll.return_value = 0
-        rc = cli.cmd_open(ns)
-    assert rc == 0
-    # config now exists
-    cfg = config.load()
-    assert "kate" in cfg.apps
-
-
-def test_open_fails_when_no_apps_installed(monkeypatch, tmp_xdg_config, fake_vault, fake_path_with, capsys):
-    fake_path_with([])
-    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
-    rc, _ = _run_open(monkeypatch, fake_vault, app=None)
+    with mock.patch("subprocess.run") as run:
+        rc = cli.cmd_open(argparse.Namespace(
+            vault=str(fake_vault), app=None, passphrase_stdin=False))
     assert rc == 2
-    assert "Install at least one" in capsys.readouterr().err
+    assert not run.called                       # no vault mount attempted
+    assert "configure --add" in capsys.readouterr().err
+    assert config.load().is_empty()
+
+
+# ---------------------------------------------- persistent compositor ----
+
+def test_cmd_compositor_execs_binary(monkeypatch, tmp_path):
+    exe = tmp_path / "veracage-compositor"
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    monkeypatch.setattr("veracage.cli.COMPOSITOR_PATH", str(exe))
+    captured = {}
+    monkeypatch.setattr("veracage.cli.os.execv",
+                        lambda path, argv: captured.update(path=path, argv=argv))
+    cli.cmd_compositor(argparse.Namespace(socket="wl-vc"))
+    assert captured["path"] == str(exe)
+    assert captured["argv"] == [str(exe), "--socket", "wl-vc"]

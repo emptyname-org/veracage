@@ -27,11 +27,15 @@
   <!--
     Cleanup is the crash-safe teardown path (systemd scope ExecStopPost). That
     pkexec runs from the user systemd manager, which polkit may treat as an
-    *inactive* (not active) session, so allow_active=yes alone can silently
-    fail to authorize it. allow_inactive=yes covers that local case. This is
-    safe because the cleanup helper is strictly bounded: it only acts on a
-    validated /run/veracage/<16-hex>.lock and only closes a veracage-<12-hex>
-    dm device. allow_any stays auth_admin (no remote/sessionless access).
+    *inactive* (not active) session, so it MUST be passwordless (allow_active +
+    allow_inactive = yes) or the on-crash dismount silently fails.
+    Passwordless is made SAFE by the helper, not by the policy: cleanup.py
+    refuses unless PKEXEC_UID (the real caller pkexec vouches for) matches the
+    session's recorded owner uid — so a local user cannot aim it at another
+    user's session. It also only ever acts on a validated /run/veracage/<16-hex>
+    .lock, only closes a veracage-<12-hex> dm device, and only tears down the
+    session scratch/socket after a *successful* close. allow_any stays
+    auth_admin (no remote/sessionless access).
     VERIFY on the target compositor that ExecStopPost cleanup actually fires.
   -->
   <action id="org.veracage.cleanup">

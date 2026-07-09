@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Veracage system-sleep hook (installed copy) — root, run by systemd.
+
+Installed to /usr/lib/systemd/system-sleep/veracage. systemd runs this around
+every sleep transition (argv: pre|post suspend|hibernate|...) and blocks the
+transition until the `pre` run returns. The package location is baked in
+(@LIBDIR@) because systemd starts this with a minimal environment.
+See src/veracage/sleep_hook.py for the logic.
+"""
+import sys
+
+sys.path.insert(0, "@LIBDIR@")
+from veracage.sleep_hook import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

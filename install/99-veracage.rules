@@ -1,0 +1,11 @@
+# Veracage: hide the decrypted vault device-mapper volumes from UDisks and the
+# desktop drive menu.
+#
+# `cryptsetup open` creates a GLOBAL /dev/mapper/veracage-<hex> device (dm devices
+# are not mount-namespaced). Without this rule KDE/GNOME (via UDisks/Solid)
+# enumerate it and offer it in the drive menu; a click mounts the RAW device on
+# the host with its on-disk ownership, bypassing the sandbox entirely. A Veracage
+# vault must be reached only through the sandbox, so mark the device ignored.
+#
+# Runs late (99-) so the device-mapper rules have already set DM_NAME.
+ACTION=="add|change", ENV{DM_NAME}=="veracage-*", ENV{UDISKS_IGNORE}="1"

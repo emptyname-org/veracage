@@ -1,0 +1,39 @@
+[package]
+name = "veracage-compositor"
+version = "0.1.0"
+edition = "2024"
+description = "Veracage nested compositor — fixed-function, renders the sandbox apps, private clipboard channel to the leader."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Seeded from smithay's smallvil reference (MIT/Apache-2.0). smithay pinned to a
+# tested commit for reproducible builds (it's used from git, like niri/cosmic).
+[[bin]]
+name = "veracage-compositor"
+path = "src/main.rs"
+
+[dependencies]
+tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
+tracing = "0.1"
+bitflags = "2.2.1"
+libc = "0.2"                # poll()/geteuid() for bounded clipboard I/O + peer-cred check
+# The compositor owns the host clipboard via its OWN winit->host wl_display.
+smithay-clipboard = "0.7"
+raw-window-handle = "0.6"
+# Toolbar (Phase 3): egui painted into the compositor's OWN GL context via
+# egui_glow, which shares smithay's EGL context through egl::get_proc_address. No
+# egui-winit — we drive egui from the pointer events the compositor already decodes.
+egui = "0.29"
+egui_glow = "0.29"          # no default features -> pulls no winit
+glow = "0.14"               # must match egui_glow 0.29's glow so the context type unifies
+
+[dependencies.smithay]
+git = "https://github.com/Smithay/smithay"
+rev = "8eb4076cad8705c56f5e3bac8577b83576b6ce76"
+default-features = false
+features = ["backend_winit", "wayland_frontend", "desktop"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true

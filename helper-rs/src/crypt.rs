@@ -2,9 +2,9 @@
 //! We already shelled out to cryptsetup; this just adds LUKS alongside the
 //! existing VeraCrypt path and a detector.
 
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Backend {
@@ -27,7 +27,7 @@ impl Backend {
 /// `cryptsetup isLuks` recognises; a VeraCrypt header is encrypted and can't be
 /// probed without the password, so anything that isn't LUKS is treated as VC.
 pub fn detect(source: &Path) -> Backend {
-    let is_luks = Command::new("cryptsetup")
+    let is_luks = Command::new(crate::tool("cryptsetup"))
         .arg("isLuks")
         .arg(source)
         .status()
@@ -56,15 +56,43 @@ pub fn open_args(source: &Path, backend: Backend, dm_name: &str) -> Vec<String> 
     }
 }
 
-/// Run `cryptsetup open` (prompts for the passphrase on the tty).
-pub fn open(source: &Path, backend: Backend, dm_name: &str) -> io::Result<()> {
-    let st = Command::new("cryptsetup")
-        .args(open_args(source, backend, dm_name))
-        .status()?;
+/// Run `cryptsetup open`.
+///
+/// With `passphrase = Some(bytes)` the passphrase is fed on cryptsetup's **stdin**
+/// (NOT `--key-file=-`: for VeraCrypt/tcrypt `--key-file` is a *keyfile*, not the
+/// passphrase, so that would break GUI unlock of a VeraCrypt vault). When stdin
+/// isn't a tty cryptsetup reads the passphrase as a line — this works for both
+/// LUKS and tcrypt and tolerates a trailing newline. With `None`, cryptsetup
+/// prompts interactively on the tty — the terminal CLI path.
+pub fn open(
+    source: &Path,
+    backend: Backend,
+    dm_name: &str,
+    passphrase: Option<&[u8]>,
+) -> io::Result<()> {
+    let args = open_args(source, backend, dm_name);
+    let st = match passphrase {
+        Some(pass) => {
+            let mut child = Command::new(crate::tool("cryptsetup"))
+                .args(&args)
+                .stdin(Stdio::piped())
+                .spawn()?;
+            child
+                .stdin
+                .take()
+                .expect("piped stdin")
+                .write_all(pass)?; // drop -> EOF
+            child.wait()?
+        }
+        None => Command::new(crate::tool("cryptsetup")).args(&args).status()?,
+    };
     if !st.success() {
         return Err(io::Error::new(
             ErrorKind::Other,
-            format!("cryptsetup open failed: rc={}", st.code().unwrap_or(-1)),
+            format!(
+                "cryptsetup open failed (wrong passphrase?): rc={}",
+                st.code().unwrap_or(-1)
+            ),
         ));
     }
     Ok(())
@@ -72,7 +100,7 @@ pub fn open(source: &Path, backend: Backend, dm_name: &str) -> io::Result<()> {
 
 /// Run `cryptsetup close` (idempotent at the call site).
 pub fn close(dm_name: &str) -> io::Result<()> {
-    let st = Command::new("cryptsetup").args(["close", dm_name]).status()?;
+    let st = Command::new(crate::tool("cryptsetup")).args(["close", dm_name]).status()?;
     if !st.success() {
         return Err(io::Error::new(
             ErrorKind::Other,

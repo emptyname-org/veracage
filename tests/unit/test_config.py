@@ -13,8 +13,8 @@ def test_load_missing_returns_empty(tmp_xdg_config):
 def test_save_then_load_roundtrip(tmp_xdg_config):
     original = config.Config(
         apps={
-            "kate":   apps.KNOWN_APPS["kate"],
-            "okular": apps.KNOWN_APPS["okular"],
+            "kate":   apps.App("kate", "Kate", "kate", ["/vault"]),
+            "okular": apps.App("okular", "Okular", "okular"),
         },
         last_used_app="okular",
     )
@@ -22,31 +22,25 @@ def test_save_then_load_roundtrip(tmp_xdg_config):
 
     loaded = config.load()
     assert set(loaded.apps) == {"kate", "okular"}
-    assert loaded.apps["kate"].category == "text"
+    assert loaded.apps["kate"].exec == "kate"
     assert loaded.apps["okular"].args == []
     assert loaded.apps["kate"].args == ["/vault"]
     assert loaded.last_used_app == "okular"
 
 
-def test_save_preserves_note(tmp_xdg_config):
-    cfg = config.Config(apps={"lowriter": apps.KNOWN_APPS["lowriter"]})
-    config.save(cfg)
-    loaded = config.load()
-    assert loaded.apps["lowriter"].note != ""
-
-
 def test_load_skips_malformed_entry(tmp_xdg_config, capsys):
-    """An [apps.X] table missing a required key should be skipped, not crash."""
+    """An [apps.X] table missing a required key should be skipped, not crash.
+    A leftover `category` key (from an older config) is simply ignored."""
     p = config.config_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(
         '[apps.broken]\n'
-        '# missing name/category/exec\n'
+        '# missing name/exec\n'
         'args = []\n'
         '\n'
         '[apps.kate]\n'
         'name = "Kate"\n'
-        'category = "text"\n'
+        'category = "text"\n'   # legacy key — must be tolerated, not required
         'exec = "kate"\n'
         'args = ["/vault"]\n'
     )
@@ -61,7 +55,6 @@ def test_save_escapes_quotes_and_backslashes(tmp_xdg_config):
     weird = apps.App(
         key="weird",
         name='Has "quotes" and \\ slashes',
-        category="text",
         exec="weird",
         args=['arg with "quote"'],
     )
@@ -80,9 +73,18 @@ def test_default_gpu_off_and_suspend_dismount(tmp_xdg_config):
     assert cfg.suspend_action == "dismount"
 
 
+def test_exchange_default_on_and_roundtrips(tmp_xdg_config):
+    assert config.load().exchange is True  # default on
+    config.save(config.Config(
+        apps={"kate": apps.App("kate", "Kate", "kate", ["/vault"])},
+        exchange=False,
+    ))
+    assert config.load().exchange is False
+
+
 def test_roundtrip_gpu_and_suspend_action(tmp_xdg_config):
     config.save(config.Config(
-        apps={"kate": apps.KNOWN_APPS["kate"]},
+        apps={"kate": apps.App("kate", "Kate", "kate", ["/vault"])},
         gpu=True, suspend_action="ignore",
     ))
     loaded = config.load()
@@ -101,7 +103,7 @@ def test_invalid_suspend_action_falls_back(tmp_xdg_config, capsys):
 
 def test_per_volume_gpu_override(tmp_xdg_config):
     config.save(config.Config(
-        apps={"okular": apps.KNOWN_APPS["okular"]},
+        apps={"okular": apps.App("okular", "Okular", "okular")},
         gpu=False,
         volumes={config._norm_vault("/tmp/work.vc"): config.VolumeConfig(gpu=True)},
     ))
@@ -160,8 +162,7 @@ def test_per_volume_gpu_string_does_not_fail_open(tmp_xdg_config):
 def test_control_chars_roundtrip(tmp_xdg_config):
     """A name with a newline/tab must serialize to valid TOML (so the next
     load doesn't choke)."""
-    weird = apps.App(key="w", name="line1\nline2\ttab", category="text",
-                     exec="w", args=[])
+    weird = apps.App(key="w", name="line1\nline2\ttab", exec="w", args=[])
     config.save(config.Config(apps={"w": weird}))
     loaded = config.load()
     assert loaded.apps["w"].name == "line1\nline2\ttab"

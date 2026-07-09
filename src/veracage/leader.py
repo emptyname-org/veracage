@@ -1,32 +1,30 @@
 """Vault-side session leader — runs AS the vault uid (the helper dropped to it).
 
 The Rust helper has already opened the volume, idmap-mounted it at MOUNTPOINT as
-the vault uid (in a private mount NS), connected the host Wayland socket, created
-the control listening socket, and provisioned a vault-writable runtime dir. It
-passes those through the environment and execs us:
+the vault uid (in a private mount NS), created the control listening socket, and
+provisioned a vault-writable runtime dir. It passes those through the environment
+and execs us:
 
   VERACAGE_CONTROL_FD     inherited control *listening* socket (we accept on it)
-  VERACAGE_WAYLAND_FD     inherited connected fd to the host compositor (weston)
-  VERACAGE_VAULT_RUNTIME  our XDG_RUNTIME_DIR (weston socket, bwrap /run/user)
+  VERACAGE_VAULT_RUNTIME  our XDG_RUNTIME_DIR (bwrap /run/user)
 
-We run nested weston against the host fd and launch apps in bwrap. The leader is
-a plain executor: it runs the command the human hands it, sandboxed. The
+We launch apps in bwrap wired to the ONE persistent compositor's shared socket
+(/run/veracage/rt/wl-vc, brought up separately by the helper — we do not spawn
+it). The leader is a plain executor: it runs the command the human hands it,
+sandboxed, and outlives no compositor of its own. The
 security property — *external processes can't read the vault* — comes from the
 idmap (the vault is owned by a uid no one else has) + the mount NS (hidden) +
 bwrap (apps have no net/host-FS, so they can't exfiltrate). The app allowlist is
 UX on the human side (which apps to offer); it is NOT a vault-side restriction,
 so the leader does not load config or police what it's told to run.
-
-This is the deny-by-UID counterpart of session.py (the option-a leader). session
-.py stays until cli.py is rewired onto this module.
 """
 from __future__ import annotations
 
 import contextlib
+import html
 import json
 import os
 import selectors
-import shutil
 import signal
 import socket
 import subprocess
@@ -38,7 +36,7 @@ from pathlib import Path
 
 from .apps import App
 from .sandbox import bwrap_command
-from .wayland import WestonStartFailed, nested_weston
+from .wayland import COMPOSITOR_RUNTIME, COMPOSITOR_SOCKET, compositor_is_up
 
 _MAX_REQUEST_BYTES = 64 * 1024  # control requests are tiny; cap to bound memory
 
@@ -48,20 +46,22 @@ _MAX_REQUEST_BYTES = 64 * 1024  # control requests are tiny; cap to bound memory
 @dataclass
 class _LeaderState:
     mountpoint: str
-    weston_socket: Path | None = None   # set once weston is up
+    wl_socket: Path | None = None       # shared compositor socket, once verified
     gpu: bool = False
     children: dict[int, str] = field(default_factory=dict)  # pid -> label
     closing: bool = False
-    launched_any: bool = False          # gate close-on-empty until first launch
+    app_specs: list = field(default_factory=list)  # enabled apps, for the toolbar
+    places_file: Path | None = None  # seeded KDE Places (vault under its label)
+    volume_label: str = "Vault"      # volume label (window title + Places name)
+    exchange: str | None = None      # idmapped host<->vault shared dir -> /exchange
 
 
 # ------------------------------------------------------------- protocol ----
 #
-# One line of JSON per request, one per reply.
+# One line of JSON per request, one per reply. Status/lifecycle only — no launch
+# or file transfer (this socket is human-owned; any same-uid process can reach it).
 #   {"cmd": "ping"}                       -> {"ok": true, "uid": <vault uid>, ...}
 #   {"cmd": "list"}                       -> {"ok": true, "apps": [{"pid","app"}]}
-#   {"cmd": "exec", "app": {"exec","args","name"}}
-#                                         -> {"ok": true, "pid": N} | {"ok": false}
 #   {"cmd": "close"}                      -> {"ok": true}
 
 def _handle_request(state: _LeaderState, req: dict) -> dict:
@@ -80,24 +80,23 @@ def _handle_request(state: _LeaderState, req: dict) -> dict:
         state.closing = True
         return {"ok": True}
 
-    if cmd == "exec":
-        return _launch_app(state, req.get("app"))
-
-    if cmd == "clip-push":
-        return _do_clip_push(state, req)
-
-    if cmd == "clip-pull":
-        return _do_clip_pull(state)
-
+    # There is deliberately NO exec / import / export / outbox here. The control
+    # socket is human-owned, so ANY process running as the human uid can connect
+    # to it. If it could make the leader run a command in the vault (exec) or
+    # hand vault files back out (export), a same-uid attacker would have a full
+    # vault-exfiltration primitive (it did — see the pen test). Launching happens
+    # only over the veracage-owned app socket, by index into the human's own
+    # enabled list (`_accept_app_launch`), which other uids cannot reach.
     return {"ok": False, "error": f"unknown cmd: {cmd}"}
 
 
 def _launch_app(state: _LeaderState, spec) -> dict:
-    """Launch the command in `spec` (an {exec, args, name} dict the human side
-    resolved) in bwrap against the nested weston; track its pid. Shared by the
-    first-app launch and the `exec` command. The leader runs what it's given —
-    bwrap, not an allowlist, is what stops a launched app exfiltrating."""
-    if state.weston_socket is None:
+    """Launch the command in `spec` (an {exec, args, name} dict) in bwrap against
+    the compositor; track its pid. `spec` only ever comes from the leader's OWN
+    enabled list — `first_app` (set at open) or `state.app_specs[idx]` on a
+    toolbar click — never from a control-socket peer, so a same-uid caller can't
+    make it run an arbitrary command. bwrap is what confines whatever does run."""
+    if state.wl_socket is None:
         return {"ok": False, "error": "compositor not ready"}
     if not isinstance(spec, dict):
         return {"ok": False, "error": "missing app spec"}
@@ -110,118 +109,53 @@ def _launch_app(state: _LeaderState, spec) -> dict:
     name_val = spec.get("name")
     label = name_val if isinstance(name_val, str) else command
 
-    app = App(key=label, name=label, category="app",
-              exec=command, args=[str(a) for a in args])
+    app = App(key=label, name=label, exec=command, args=[str(a) for a in args])
+    # Open the seeded Places file and hand bwrap its fd: `--file` writes a
+    # WRITABLE copy into the sandbox tmpfs (Dolphin rewrites it on startup, so a
+    # read-only bind would error). None if there's no seed.
+    places_fd = None
+    if state.places_file is not None:
+        try:
+            places_fd = os.open(state.places_file, os.O_RDONLY)
+        except OSError:
+            places_fd = None
     try:
-        argv = bwrap_command(state.mountpoint, app, state.weston_socket, state.gpu)
-        proc = subprocess.Popen(argv)
+        argv = bwrap_command(state.mountpoint, app, state.wl_socket, state.gpu,
+                             places_fd, state.exchange)
+        # Detach the app's stdio. Inheriting the leader's stdin/out/err hands a
+        # chatty viewer the session's terminal/journal: Qt/KF apps print the paths
+        # of files they open on stderr, which would persist unencrypted in the
+        # user journal, readable by any same-uid process after the vault closes
+        # (an accidental-leak channel in the threat model) — and hands the app an
+        # fd to the human's pty. Nothing vault-side needs the app's stdio.
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(places_fd,) if places_fd is not None else (),
+        )
     except FileNotFoundError as e:
         return {"ok": False, "error": f"missing dependency: {e.filename}"}
+    finally:
+        if places_fd is not None:
+            os.close(places_fd)
     state.children[proc.pid] = label
-    state.launched_any = True
     return {"ok": True, "pid": proc.pid}
 
 
-# --------------------------------------------------------------- bridge ----
-#
-# The vault is owned by the vault uid, so the human can't read/write it
-# directly. Files cross via fd-passing over the control socket:
-#   import: the human sends a host-file fd; the leader writes it to the inbox.
-#   export: the human asks for an outbox file; the leader sends back its fd.
-# This is the user's own deliberate channel; the security property (external
-# processes can't read the *vault*) is unchanged — only the inbox/outbox cross.
-
-def _vault_subdir(state: _LeaderState, sub: str) -> Path:
-    d = Path(state.mountpoint) / ".veracage" / sub
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _safe_name(raw) -> str | None:
-    """A basename within the inbox/outbox — never a path that escapes them."""
-    name = os.path.basename(str(raw or "")).strip()
-    return name if name and name not in (".", "..") else None
-
-
-def _do_import(state: _LeaderState, req: dict, fds: list[int]) -> dict:
-    """Write a received host-file fd into the vault inbox (.veracage/in/)."""
-    if not fds:
-        return {"ok": False, "error": "import needs a file descriptor"}
-    name = _safe_name(req.get("name"))
-    if not name:
-        return {"ok": False, "error": "invalid import name"}
-    dest = _vault_subdir(state, "in") / name
-    try:
-        with os.fdopen(fds[0], "rb", closefd=False) as src, open(dest, "wb") as out:
-            shutil.copyfileobj(src, out)
-    except OSError as e:
-        return {"ok": False, "error": f"import failed: {e}"}
-    return {"ok": True, "path": str(dest)}
-
-
-def _do_export(state: _LeaderState, req: dict) -> tuple[dict, list[int]]:
-    """Open an outbox file (.veracage/out/) and hand its fd back to the human."""
-    name = _safe_name(req.get("name"))
-    if not name:
-        return {"ok": False, "error": "invalid export name"}, []
-    src = _vault_subdir(state, "out") / name
-    try:
-        fd = os.open(src, os.O_RDONLY)
-    except OSError as e:
-        return {"ok": False, "error": f"export failed: {e}"}, []
-    return {"ok": True, "name": name}, [fd]
-
-
-# ------------------------------------------------------------- clipboard ---
-#
-# The sandbox clipboard is the nested weston's, which the human side can't
-# reach. text-only: clip-push runs wl-copy against the nested compositor so
-# sandbox apps can paste it; clip-pull runs wl-paste to read it back. Images go
-# through the file bridge, not here.
-
-def _clip_env(state: _LeaderState) -> dict[str, str]:
-    env = {**os.environ}
-    if state.weston_socket is not None:
-        env["WAYLAND_DISPLAY"] = state.weston_socket.name
-    return env
-
-
-def _do_clip_push(state: _LeaderState, req: dict) -> dict:
-    if state.weston_socket is None:
-        return {"ok": False, "error": "compositor not ready"}
-    text = req.get("text")
-    if not isinstance(text, str):
-        return {"ok": False, "error": "clip-push needs 'text'"}
-    try:
-        subprocess.run(["wl-copy"], input=text.encode(), env=_clip_env(state),
-                       timeout=5, check=True)
-    except FileNotFoundError:
-        return {"ok": False, "error": "wl-clipboard not installed"}
-    except (subprocess.SubprocessError, OSError) as e:
-        return {"ok": False, "error": f"clip-push failed: {e}"}
-    return {"ok": True}
-
-
-def _do_clip_pull(state: _LeaderState) -> dict:
-    if state.weston_socket is None:
-        return {"ok": False, "error": "compositor not ready"}
-    try:
-        r = subprocess.run(["wl-paste", "--no-newline"], env=_clip_env(state),
-                           capture_output=True, timeout=5)
-    except FileNotFoundError:
-        return {"ok": False, "error": "wl-clipboard not installed"}
-    except (subprocess.SubprocessError, OSError) as e:
-        return {"ok": False, "error": f"clip-pull failed: {e}"}
-    # wl-paste exits non-zero on an empty selection; treat that as empty text.
-    text = r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
-    return {"ok": True, "text": text}
+# The vault file bridge (import/export/outbox over the control socket) was
+# removed. The control socket is human-owned, so any same-uid process could
+# drive it to read arbitrary vault files. Cross-boundary file transfer, when we
+# add it, must go through the human-driven compositor path (which other uid
+# processes cannot reach), never this socket.
 
 
 # ------------------------------------------------------------- reaping -----
 
 def _reap_children(state: _LeaderState) -> None:
     """Non-blocking reap of exited bwrap app children (only the pids we track,
-    so we don't race weston's own Popen)."""
+    so we don't race the compositor's own Popen)."""
     for pid in list(state.children):
         try:
             reaped, _status = os.waitpid(pid, os.WNOHANG)
@@ -238,31 +172,16 @@ def _accept_one(srv: socket.socket, state: _LeaderState) -> None:
     conn, _ = srv.accept()
     with conn:
         conn.settimeout(2.0)
-        in_fds: list[int] = []
-        out_fds: list[int] = []
         try:
-            data, in_fds, _flags, _addr = socket.recv_fds(conn, _MAX_REQUEST_BYTES, 1)
+            data = conn.recv(_MAX_REQUEST_BYTES)
             req = json.loads(data.decode().strip() or "{}")
-            cmd = req.get("cmd") if isinstance(req, dict) else None
-            if cmd == "import":
-                reply = _do_import(state, req, in_fds)
-            elif cmd == "export":
-                reply, out_fds = _do_export(state, req)
-            else:
-                reply = _handle_request(state, req)
+            reply = _handle_request(state, req)
         except (ValueError, OSError) as e:
             reply = {"ok": False, "error": str(e)}
         except Exception as e:  # a handler bug must not kill the serve loop
             reply = {"ok": False, "error": f"internal error: {e}"}
-        msg = (json.dumps(reply) + "\n").encode()
         with contextlib.suppress(OSError):
-            if out_fds:
-                socket.send_fds(conn, [msg], out_fds)
-            else:
-                conn.sendall(msg)
-        for fd in in_fds + out_fds:
-            with contextlib.suppress(OSError):
-                os.close(fd)
+            conn.sendall((json.dumps(reply) + "\n").encode())
 
 
 def _control_fd() -> int:
@@ -275,20 +194,177 @@ def _control_fd() -> int:
         raise RuntimeError(f"VERACAGE_CONTROL_FD not an integer: {raw!r}") from e
 
 
+# ----------------------------------------------- toolbar app channel -------
+#
+# The compositor toolbar (same veracage uid, different process) launches this
+# vault's apps. It can't reach the leader's human-owned control socket, so we
+# expose a SECOND, veracage-owned socket under /run/veracage/rt and advertise the
+# enabled app names in a sibling `.apps` file the compositor reads. A toolbar
+# click sends a bare app index and we launch that app. Only the veracage uid can
+# reach the socket, and a launch only runs an app the human already enabled —
+# nothing here widens what the human (or the vault) can already do.
+
+def _session_id(state: _LeaderState) -> str:
+    return Path(state.mountpoint).name
+
+
+def _app_socket_path(state: _LeaderState) -> Path:
+    return COMPOSITOR_RUNTIME / f"app-{_session_id(state)}.sock"
+
+
+def _apps_file_path(state: _LeaderState) -> Path:
+    return COMPOSITOR_RUNTIME / f"app-{_session_id(state)}.apps"
+
+
+def _publish_apps(state: _LeaderState) -> socket.socket | None:
+    """Create the veracage-owned app socket and advertise the app names so the
+    compositor toolbar can show launcher buttons. Returns the listening socket,
+    or None if the runtime dir isn't writable (the toolbar then just shows no
+    launchers for this vault)."""
+    sock_path = _app_socket_path(state)
+    try:
+        with contextlib.suppress(FileNotFoundError):
+            sock_path.unlink()
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(sock_path))
+        # 0700 explicitly, not whatever the inherited umask happened to be: only
+        # the veracage uid may connect (matching the compositor socket's umask
+        # hardening). A connect needs write on the socket inode, so this denies
+        # every other uid even if the 0711 rt dir is traversable.
+        os.chmod(sock_path, 0o700)
+        srv.listen(4)
+        srv.setblocking(False)
+        # Plain, dependency-free format the Rust compositor parses:
+        #   <sock filename>\n<volume label>\n<app name>\n<app name>\n...
+        # Sanitize names the same way as the label: config is human-owned, but a
+        # newline in a name would desync this newline-delimited protocol.
+        names = [_sanitize_label(str(a.get("name") or a.get("exec") or "app"))
+                 for a in state.app_specs]
+        body = [sock_path.name, state.volume_label or "Vault", *names]
+        _apps_file_path(state).write_text("\n".join(body) + "\n")
+        return srv
+    except OSError as e:
+        print(f"veracage: could not publish toolbar apps: {e}", file=sys.stderr)
+        return None
+
+
+def _unpublish_apps(state: _LeaderState) -> None:
+    for p in (_app_socket_path(state), _apps_file_path(state)):
+        with contextlib.suppress(OSError):
+            p.unlink()
+
+
+def _accept_app_launch(app_srv: socket.socket, state: _LeaderState) -> None:
+    """A toolbar click: read a bare app index and launch that enabled app."""
+    conn, _ = app_srv.accept()
+    with conn:
+        conn.settimeout(2.0)
+        try:
+            idx = int(conn.recv(64).decode().strip())
+        except (ValueError, OSError):
+            return
+        if 0 <= idx < len(state.app_specs):
+            r = _launch_app(state, state.app_specs[idx])
+            if not r["ok"]:
+                print(f"veracage: toolbar launch: {r['error']}", file=sys.stderr)
+
+
+# ------------------------------------------------------------- places ------
+#
+# Seed the sandbox file manager's Places so the vault appears as a named volume
+# (KDE/Dolphin reads $XDG_DATA_HOME/user-places.xbel). The label is the volume's
+# own filesystem label (the helper reads it via blkid); the entry points at /vault.
+
+def _sanitize_label(raw: str) -> str:
+    """A safe volume label: no newlines (they'd desync the newline-delimited
+    `.apps` protocol) and no control chars (they'd break the KDE XBEL / window
+    title); length-capped. Falls back to 'Vault' if nothing printable remains.
+    Defends against a crafted filesystem label on an attacker-supplied volume."""
+    cleaned = "".join(c if c.isprintable() else " " for c in raw).strip()
+    return cleaned[:64] or "Vault"
+
+
+def _bookmark(href: str, title: str, icon: str, ident: str) -> str:
+    return (
+        f' <bookmark href="{href}">\n'
+        f'  <title>{html.escape(title)}</title>\n'
+        '  <info>\n'
+        '   <metadata owner="http://freedesktop.org">\n'
+        f'    <bookmark:icon name="{icon}"/>\n'
+        '   </metadata>\n'
+        '   <metadata owner="http://www.kde.org">\n'
+        f'    <ID>{ident}</ID>\n'
+        '    <isSystemItem>false</isSystemItem>\n'
+        '   </metadata>\n'
+        '  </info>\n'
+        ' </bookmark>\n'
+    )
+
+
+def _places_xbel(label: str, with_exchange: bool) -> str:
+    body = _bookmark("file:///vault", label, "drive-harddisk-encrypted", "veracage-vault")
+    if with_exchange:
+        # The shared host<->vault folder, mounted at /exchange in the sandbox.
+        body += _bookmark("file:///exchange", "Exchange (host-shared)",
+                          "folder-publicshare", "veracage-exchange")
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE xbel>\n'
+        '<xbel xmlns:bookmark="http://www.freedesktop.org/standards/desktop-bookmarks"'
+        ' xmlns:kdepriv="http://www.kde.org/kdepriv"'
+        ' xmlns:mime="http://www.freedesktop.org/standards/shared-mime-info">\n'
+        f'{body}'
+        '</xbel>\n'
+    )
+
+
+def _write_places_file(label: str, with_exchange: bool = False) -> Path | None:
+    """Write the seeded Places file to the vault runtime dir and return its path,
+    or None if it can't be written (the sandbox then just has no Places entry)."""
+    try:
+        path = Path(os.environ["XDG_RUNTIME_DIR"]) / "user-places.xbel"
+        path.write_text(_places_xbel(label, with_exchange))
+        return path
+    except (OSError, KeyError) as e:
+        print(f"veracage: could not seed Places: {e}", file=sys.stderr)
+        return None
+
+
 # --------------------------------------------------------- leader run ------
 
-def run_leader(mountpoint: str, gpu: bool, first_app: dict | None) -> int:
+def run_leader(mountpoint: str, gpu: bool, app_specs: list, first_app: dict | None) -> int:
     """Become the vault-side session leader. Returns the exit code.
 
-    Starts nested weston (against the host fd in VERACAGE_WAYLAND_FD), launches
-    `first_app` if given, then serves the control socket (ping/list/exec/close)
-    until 'close', a signal, or — once an app has launched — all apps exit.
+    Attaches to the ONE persistent compositor's shared socket (brought up
+    separately by the helper), publishes `app_specs` to the compositor toolbar,
+    optionally launches `first_app`, then serves the control socket
+    (ping/list/close) and the toolbar app socket until 'close', a signal, or
+    the compositor going away. The leader does NOT own the compositor — it
+    survives every app opening and closing — but when the compositor itself exits
+    (the user closed the vault window) the leader exits too, so the session tears
+    down cleanly (unit stop → ExecStopPost → dm close + unmount) instead of
+    leaving the vault mounted and blocking the next open.
     """
     vr = os.environ.get("VERACAGE_VAULT_RUNTIME")
     if vr:
         os.environ["XDG_RUNTIME_DIR"] = vr
 
-    state = _LeaderState(mountpoint=mountpoint, gpu=gpu)
+    state = _LeaderState(mountpoint=mountpoint, gpu=gpu, app_specs=app_specs or [])
+
+    # The shared compositor must already be up (cli.py brings it up before the
+    # mount). We only observe its socket — we never spawn it.
+    if not COMPOSITOR_SOCKET.exists():
+        print(f"veracage: compositor socket {COMPOSITOR_SOCKET} not found; "
+              "the persistent compositor is not running.", file=sys.stderr)
+        return 1
+    state.wl_socket = COMPOSITOR_SOCKET
+
+    # The volume's label (the helper passes it in VERACAGE_VOLUME_LABEL; fall back
+    # to the mount name). Used for the compositor window title + the Places name.
+    raw_label = os.environ.get("VERACAGE_VOLUME_LABEL") or Path(mountpoint).name or "Vault"
+    state.volume_label = _sanitize_label(raw_label)
+    state.exchange = os.environ.get("VERACAGE_EXCHANGE") or None
+    state.places_file = _write_places_file(state.volume_label, state.exchange is not None)
 
     stop = threading.Event()
 
@@ -300,37 +376,55 @@ def run_leader(mountpoint: str, gpu: bool, first_app: dict | None) -> int:
 
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno=_control_fd())
     srv.setblocking(False)
-
-    wl_raw = os.environ.get("VERACAGE_WAYLAND_FD")
-    upstream = int(wl_raw) if wl_raw else None
+    app_srv = _publish_apps(state)
 
     try:
-        with nested_weston(upstream_fd=upstream) as wl_socket:
-            state.weston_socket = wl_socket
-            if first_app:
-                r = _launch_app(state, first_app)
-                if not r["ok"]:
-                    print(f"veracage: first app: {r['error']}", file=sys.stderr)
+        if first_app:
+            r = _launch_app(state, first_app)
+            if not r["ok"]:
+                print(f"veracage: first app: {r['error']}", file=sys.stderr)
 
-            sel = selectors.DefaultSelector()
-            sel.register(srv, selectors.EVENT_READ)
-            try:
-                while not stop.is_set():
-                    _reap_children(state)
-                    if state.closing or (state.launched_any and not state.children):
-                        break
-                    for key, _ in sel.select(timeout=1.0):
+        sel = selectors.DefaultSelector()
+        sel.register(srv, selectors.EVENT_READ)
+        if app_srv is not None:
+            sel.register(app_srv, selectors.EVENT_READ)
+        # Tie our lifetime to the compositor's: once it has been seen up, its
+        # disappearance (the user closed the vault window → the compositor exits)
+        # means the session is over. Exiting here lets the systemd unit stop and
+        # its ExecStopPost cleanup close the dm device + unmount — otherwise the
+        # leader would keep the vault mounted forever and block the next open.
+        comp_seen = False
+        try:
+            while not stop.is_set():
+                _reap_children(state)
+                if state.closing:
+                    break
+                if compositor_is_up():
+                    comp_seen = True
+                elif comp_seen:
+                    print("veracage: compositor gone (window closed) — "
+                          "unmounting and exiting.", file=sys.stderr)
+                    break
+                for key, _ in sel.select(timeout=1.0):
+                    # A transient accept() error (ECONNABORTED/EAGAIN from a peer
+                    # that aborts a queued connection) or an unexpected launch
+                    # failure must NOT unwind into the finally and SIGKILL every
+                    # running app — log and keep serving.
+                    try:
                         if key.fileobj is srv:
                             _accept_one(srv, state)
-            finally:
-                sel.close()
-                _terminate_children(state)
+                        elif key.fileobj is app_srv:
+                            _accept_app_launch(app_srv, state)
+                    except Exception as e:  # noqa: BLE001 - serve loop must survive
+                        print(f"veracage: serve error (continuing): {e}", file=sys.stderr)
+        finally:
+            sel.close()
+            _terminate_children(state)
         return 0
-    except WestonStartFailed as e:
-        print(f"veracage: weston failed to start: {e}", file=sys.stderr)
-        print("(install with: apt install weston)", file=sys.stderr)
-        return 1
     finally:
+        _unpublish_apps(state)
+        if app_srv is not None:
+            app_srv.close()
         srv.close()
 
 
@@ -388,58 +482,3 @@ def send_request(vault: str, request: dict) -> dict:
         s.close()
 
 
-def _connect(vault: str) -> socket.socket:
-    sock_path = session_socket_path(vault)
-    if not sock_path.exists():
-        raise FileNotFoundError(f"no active session for {vault}")
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(5.0)
-    s.connect(str(sock_path))
-    return s
-
-
-def import_file(vault: str, host_path: str) -> dict:
-    """Pass a host file's fd to the leader, which writes it to the vault inbox.
-    The leader reads the data as the vault uid; the human never touches the vault."""
-    name = os.path.basename(host_path)
-    fd = os.open(host_path, os.O_RDONLY)
-    s = _connect(vault)
-    try:
-        req = json.dumps({"cmd": "import", "name": name}).encode() + b"\n"
-        socket.send_fds(s, [req], [fd])
-        data, _fds, _f, _a = socket.recv_fds(s, 65536, 0)
-        return json.loads(data.decode().strip() or "{}")
-    finally:
-        os.close(fd)
-        s.close()
-
-
-def export_file(vault: str, name: str, dest_path: str) -> dict:
-    """Ask the leader for an outbox file; it sends the fd, we write it host-side."""
-    s = _connect(vault)
-    try:
-        req = json.dumps({"cmd": "export", "name": name}).encode() + b"\n"
-        s.sendall(req)
-        data, fds, _f, _a = socket.recv_fds(s, 65536, 1)
-        reply = json.loads(data.decode().strip() or "{}")
-        try:
-            if reply.get("ok") and fds:
-                with os.fdopen(fds[0], "rb", closefd=False) as src, open(dest_path, "wb") as out:
-                    shutil.copyfileobj(src, out)
-        finally:
-            for fd in fds:
-                with contextlib.suppress(OSError):
-                    os.close(fd)
-        return reply
-    finally:
-        s.close()
-
-
-def clip_push(vault: str, text: str) -> dict:
-    """Set the sandbox clipboard (text) from the host side."""
-    return send_request(vault, {"cmd": "clip-push", "text": text})
-
-
-def clip_pull(vault: str) -> dict:
-    """Read the sandbox clipboard (text) to the host side."""
-    return send_request(vault, {"cmd": "clip-pull"})

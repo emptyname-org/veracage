@@ -1,9 +1,10 @@
 # Mode A — `wp_security_context_v1` (deferred implementation spec)
 
-**Status: not implemented, intentionally.** Veracage ships Mode B (nested
-`weston`) only. This document preserves the full, verified implementation
-plan in case the trade-off ever changes. See `veracage-design.md` §5 for the
-decision rationale.
+**Status: not implemented, intentionally.** Veracage runs its own compositor
+(`veracage-compositor`) as a separate instance — which already delivers the
+clipboard isolation Mode A would not. This document preserves the full, verified
+implementation plan in case the trade-off ever changes. See `veracage-design.md`
+§5 for the decision rationale.
 
 ## Why deferred (the security finding)
 
@@ -13,7 +14,7 @@ virtual-keyboard/pointer, layer-shell, ext-session-lock, …). It does **NOT**,
 by protocol, partition the `wl_data_device` selection — so it does **not**
 make the sandbox and host clipboards independent. Veracage's core clipboard
 goal (req 1.1.2 — a copy in the sandbox must not reach the host clipboard /
-Klipper) is delivered by Mode B's **separate compositor instance**, not by
+Klipper) is delivered by our **separate compositor instance**, not by
 Mode A. Adopting Mode A as default would *weaken* clipboard isolation.
 
 Also: **GNOME/Mutter does not implement the protocol** (the implementation MR

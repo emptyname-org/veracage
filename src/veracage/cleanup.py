@@ -80,6 +80,18 @@ def cleanup_one(p: Path) -> int:
         print(f"veracage-cleanup: cannot read {p}: {e}", file=sys.stderr)
         return 1
 
+    # Ownership check. The cleanup polkit action is passwordless, so without this
+    # any local user could `pkexec veracage-cleanup --vault-hash <someone-else's>`
+    # and disrupt another session. PKEXEC_UID is the real caller pkexec vouches
+    # for (absent only when the already-root helper invokes us directly — same
+    # trust domain). Refuse when it's set and doesn't match the recorded owner.
+    caller = os.environ.get("PKEXEC_UID", "")
+    owner = fields.get("user_uid", "")
+    if caller and owner and caller != owner:
+        print(f"veracage-cleanup: uid {caller} does not own session {p.stem} "
+              f"(owner uid {owner}); refusing", file=sys.stderr)
+        return 2
+
     rc = 0
     dm_name = fields.get("dm_name", "")
     if DM_NAME_RE.match(dm_name):
@@ -98,35 +110,29 @@ def cleanup_one(p: Path) -> int:
               f"(does not match veracage-<12-hex>)", file=sys.stderr)
         rc = 2
 
-    # Best-effort: remove the (now-orphan) mountpoint dir and the B2 helper's
-    # sibling scratch (the idmap staging `.raw` and the vault runtime `.run`).
-    # The helper's own teardown clears these on a clean exit; this path only
-    # matters on a crash. None hold plaintext (the key is in the dm device we
-    # just closed; the idmap mount died with the leader's namespace).
-    mp = fields.get("mountpoint", "")
-    if mp.startswith("/run/veracage/") and not Path(mp).is_symlink():
-        with contextlib.suppress(OSError):
-            Path(mp).rmdir()
-        with contextlib.suppress(OSError):
-            Path(mp + ".raw").rmdir()
-        run_dir = Path(mp + ".run")
-        if not run_dir.is_symlink():
-            shutil.rmtree(run_dir, ignore_errors=True)
-
-    # Remove the (now-orphan) control socket in the human's runtime dir.
-    uid = fields.get("user_uid", "")
-    if uid.isdigit():
-        with contextlib.suppress(OSError):
-            (Path(f"/run/user/{uid}/veracage/sessions") / f"{p.stem}.sock").unlink()
-
-    # Only remove the lock once the device is actually gone. A failed close
-    # (e.g. EBUSY) must leave the lock as a recovery trail, not orphan the
-    # dm-crypt device + key with no way back.
+    # Tear down the session's scratch (orphan mountpoint dir, the idmap staging
+    # `.raw` and vault runtime `.run`) + control socket, and drop the lock, ONLY
+    # once the device is actually closed. A failed close (e.g. EBUSY) means the
+    # session is still LIVE — deleting its runtime dir / socket then would
+    # sabotage a running session (and, via the passwordless action, be a
+    # cross-user DoS lever); leave the lock as a recovery trail instead. None of
+    # this holds plaintext — the key left with the closed dm device.
     if rc == 0:
-        try:
+        mp = fields.get("mountpoint", "")
+        if mp.startswith("/run/veracage/") and not Path(mp).is_symlink():
+            with contextlib.suppress(OSError):
+                Path(mp).rmdir()
+            with contextlib.suppress(OSError):
+                Path(mp + ".raw").rmdir()
+            run_dir = Path(mp + ".run")
+            if not run_dir.is_symlink():
+                shutil.rmtree(run_dir, ignore_errors=True)
+        uid = fields.get("user_uid", "")
+        if uid.isdigit():
+            with contextlib.suppress(OSError):
+                (Path(f"/run/user/{uid}/veracage/sessions") / f"{p.stem}.sock").unlink()
+        with contextlib.suppress(FileNotFoundError):
             p.unlink()
-        except FileNotFoundError:
-            pass
     return rc
 
 

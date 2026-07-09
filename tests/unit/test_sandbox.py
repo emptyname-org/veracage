@@ -7,13 +7,35 @@ from pathlib import Path
 import pytest
 
 from veracage import sandbox
-from veracage.apps import KNOWN_APPS
+from veracage.apps import App
+
+_KATE = App("kate", "Kate", "kate", ["/vault"])
+_OKULAR = App("okular", "Okular", "okular")
 
 
 @pytest.fixture
 def argv():
     sock = Path("/tmp/veracage-test.sock")
-    return sandbox.bwrap_command("/run/veracage/abc", KNOWN_APPS["kate"], sock)
+    return sandbox.bwrap_command("/run/veracage/abc", _KATE, sock)
+
+
+def _adjacent(argv, flag, value):
+    """True if `flag value` appears consecutively in argv."""
+    return any(argv[i] == flag and argv[i + 1] == value
+               for i in range(len(argv) - 1))
+
+
+def test_exchange_bound_at_slash_exchange_when_given():
+    sock = Path("/tmp/veracage-test.sock")
+    argv = sandbox.bwrap_command("/run/veracage/abc", _KATE, sock,
+                                 exchange="/run/veracage/abc.x")
+    # bound at a TOP-LEVEL /exchange, never under /vault (encrypted-at-rest invariant)
+    assert _adjacent(argv, "/run/veracage/abc.x", "/exchange")
+    assert "/vault/exchange" not in argv
+
+
+def test_no_exchange_bind_by_default(argv):
+    assert "/exchange" not in argv
 
 
 REQUIRED_FLAGS = [
@@ -62,6 +84,11 @@ def test_runtime_dir_is_tmpfs(argv):
 
     assert ("--tmpfs", rt) in pairs, "runtime dir is not a tmpfs"
 
+    # ...and it must be private (0700): Qt refuses a group/world-readable
+    # XDG_RUNTIME_DIR, and the nested wayland socket lives inside it.
+    ti = next(i for i, (a, b) in enumerate(pairs) if a == "--tmpfs" and b == rt)
+    assert argv[ti - 2:ti] == ["--perms", "0700"], "runtime tmpfs is not 0700"
+
     # Forbid any --bind / --ro-bind of the entire runtime dir
     forbidden = [
         i for i, (a, b) in enumerate(pairs)
@@ -87,9 +114,23 @@ def test_wayland_display_is_wayland_0(argv):
     assert ("--setenv", "WAYLAND_DISPLAY", "wayland-0") in triples
 
 
-def test_home_is_vault(argv):
+def test_home_is_vault_xdg_is_ephemeral_off_vault(argv):
+    """HOME is the vault so open/save dialogs default to the user's documents,
+    while XDG config/cache/data live on an ephemeral tmpfs OUTSIDE the vault —
+    so nothing app-generated (not even an empty dotdir) is written into it."""
     triples = list(zip(argv, argv[1:], argv[2:]))
+    pairs = list(zip(argv, argv[1:]))
     assert ("--setenv", "HOME", "/vault") in triples
+    # XDG dirs are on the ephemeral /xdg tmpfs, never inside the vault.
+    assert ("--tmpfs", "/xdg") in pairs, "/xdg is not an ephemeral tmpfs"
+    assert ("--setenv", "XDG_CONFIG_HOME", "/xdg/config") in triples
+    assert ("--setenv", "XDG_CACHE_HOME", "/xdg/cache") in triples
+    assert ("--setenv", "XDG_DATA_HOME", "/xdg/data") in triples
+    # No XDG_* points into the vault.
+    assert not any(
+        k.startswith("XDG_") and str(v).startswith("/vault")
+        for a, k, v in triples if a == "--setenv"
+    ), "an XDG dir points into the vault"
 
 
 def test_no_share_user_no_share_net_no_network(argv):
@@ -131,9 +172,24 @@ def test_gpu_off_by_default_no_dri(argv):
 
 def test_gpu_opt_in_binds_dev_dri():
     sock = Path("/tmp/veracage-test.sock")
-    argv = sandbox.bwrap_command("/run/veracage/abc", KNOWN_APPS["okular"],
+    argv = sandbox.bwrap_command("/run/veracage/abc", _OKULAR,
                                  sock, gpu=True)
     triples = list(zip(argv, argv[1:], argv[2:]))
     assert ("--dev-bind-try", "/dev/dri", "/dev/dri") in triples
     # Must come after `--dev /dev` so it binds into the fresh devtmpfs.
     assert argv.index("/dev/dri") > argv.index("/dev")
+
+
+def test_no_places_file_by_default(argv):
+    assert "/xdg/data/user-places.xbel" not in argv
+
+
+def test_places_fd_written_as_writable_file_after_xdg_tmpfs():
+    sock = Path("/tmp/veracage-test.sock")
+    argv = sandbox.bwrap_command("/run/veracage/abc", _KATE,
+                                 sock, places_fd=7)
+    triples = list(zip(argv, argv[1:], argv[2:]))
+    # --file (not --ro-bind): a WRITABLE tmpfs file, so Dolphin can rewrite it
+    # (it merges its default places on startup) instead of erroring "not writable".
+    assert ("--file", "7", "/xdg/data/user-places.xbel") in triples
+    assert argv.index("/xdg/data/user-places.xbel") > argv.index("/xdg")

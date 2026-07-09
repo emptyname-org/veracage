@@ -62,13 +62,11 @@ There are three uids in play:
 
 ## The display (cross-uid GUI)
 
-- **nested weston** — a `weston` compositor that runs as a **client of your real
-  compositor**. The sandboxed app connects to *it*, not to your session — so the
-  sandbox clipboard / screencopy are separate from your desktop.
-- **the passed fd** / **`WAYLAND_SOCKET`** — the vault uid can't reach your
-  compositor's socket *by path* (it is in your 0700 runtime dir). So the helper
-  (as root) opens that connection and passes the **open file descriptor** down;
-  `WAYLAND_SOCKET=<fd>` tells weston "use this already-open connection."
+- **the veracage compositor** — our own `veracage-compositor`, a **separate**
+  compositor instance (one per session, on `/run/veracage/rt/wl-vc`) that runs as
+  the vault uid. The sandboxed apps connect to *it*, not to your desktop session —
+  so the sandbox clipboard / screencopy are separate from your desktop. It renders
+  into a single window on your real compositor.
 
 ## Talking across the boundary
 
@@ -109,7 +107,7 @@ There are three uids in play:
 - **mountpoint** — `/run/veracage/<rand>`, where the idmapped vault appears.
 - **`.raw`** (staging) / **`.run`** (vault runtime) — sibling dirs the helper
   provisions: `.raw` is the plain mount it reads to set up the idmap; `.run` is
-  the vault uid's writable scratch (weston socket, bwrap's `/run/user`).
+  the vault uid's writable scratch (compositor socket, bwrap's `/run/user`).
 
 ## Project shorthand
 

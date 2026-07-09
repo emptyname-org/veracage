@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Veracage
+GenericName=Encrypted Vault Sandbox
+Comment=Open encrypted vaults (LUKS/VeraCrypt) in an isolated sandbox
+Exec=@AGENT@
+Icon=veracage
+Terminal=false
+Categories=Utility;Security;
+Keywords=vault;encryption;luks;veracrypt;sandbox;privacy;
+StartupNotify=true
+StartupWMClass=veracage

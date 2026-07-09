@@ -12,6 +12,8 @@ import sys
 sys.path.insert(0, "@LIBDIR@")
 os.environ.setdefault("VERACAGE_HELPER", "@LIBEXEC@/veracage-helper")
 os.environ.setdefault("VERACAGE_CLEANUP_HELPER", "@LIBEXEC@/veracage-cleanup")
+os.environ.setdefault("VERACAGE_AGENT", "@AGENT@")
+os.environ.setdefault("VERACAGE_COMPOSITOR", "@COMPOSITOR@")
 
 from veracage.cli import main  # noqa: E402
 

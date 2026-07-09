@@ -1,0 +1,32 @@
+[package]
+name = "veracage-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Veracage human-side agent — control window + config picker (no vault access)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The agent is the OPTIONAL GUI. Unlike helper-rs (pinned to Debian 12's stock
+# rustc 1.63), it needs a modern toolchain (rustup) to build — but produces a
+# single static binary the END USER installs nothing extra to run: it links only
+# what every desktop session already has (Mesa GL, Wayland/X11, D-Bus). No Qt.
+
+[[bin]]
+name = "veracage-agent"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"          # config.toml read/write (round-trips config.py's schema)
+sha2 = "0.10"
+zeroize = "1"         # wipe the vault passphrase from launcher memory after use
+eframe = "0.29"       # egui control window — static-linked; runtime needs only
+                      # what the desktop already has (Mesa GL, Wayland/X11).
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+                      # native file dialogs via the XDG portal (no GTK link).
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true

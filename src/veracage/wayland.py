@@ -1,121 +1,81 @@
-"""Wayland isolation for the sandbox.
+"""Lifecycle of the ONE persistent nested compositor (Phase 2).
 
-Slice 2: Mode B only — a nested `weston` running as a Wayland client of the
-host compositor. Weston creates its own Wayland socket; the sandboxed app
-connects to that socket instead of the host's, so:
+A single `veracage`-uid compositor renders every vault's apps into one host
+window, owns the clipboard, and (Phase 3) hosts the toolbar. It is brought up by
+the privileged helper (`veracage-helper --spawn-compositor`) on a fixed socket
+under `/run/veracage`; the CLI and each vault leader here only *observe* its
+liveness and wait for it to appear. There is no longer a per-vault compositor to
+spawn — the old `nested_compositor` context manager is gone.
 
-  * sandbox clipboard ≠ host clipboard
+  * sandbox clipboard ≠ host clipboard  (the compositor bridges them in-process)
   * host clipboard managers (Klipper, GPaste) cannot scrape the sandbox
   * screencopy / virtual-input from the sandbox cannot affect the host
 
-Mode A (`wp-security-context-v1`) is deferred until the dev box runs a
-compositor that supports it (KWin ≥ 6, Mutter ≥ 47, sway ≥ 1.10).
+We spawn our own compositor rather than a third-party one (weston/sway/…) so the
+component facing the possibly-hostile app is ours, pinned and known, and carries
+zero extra runtime dependency for the end user.
 """
 from __future__ import annotations
 
-import contextlib
-import ctypes
-import os
-import secrets
-import signal
-import subprocess
 import time
 from pathlib import Path
 
-WESTON_STARTUP_TIMEOUT_S = 5.0
+COMPOSITOR_STARTUP_TIMEOUT_S = 5.0
+
+# The ONE persistent compositor's runtime dir + fixed paths. MUST match
+# COMPOSITOR_RUNTIME in helper-rs/src/main.rs. `rt` is veracage-owned mode 0711:
+# the human can traverse it to stat the socket/pidfile for a liveness check, but
+# only veracage-uid apps can connect to the socket.
+COMPOSITOR_RUNTIME = Path("/run/veracage/rt")
+COMPOSITOR_SOCKET = COMPOSITOR_RUNTIME / "wl-vc"
+COMPOSITOR_PIDFILE = COMPOSITOR_RUNTIME / "compositor.pid"
 
 
-class WestonStartFailed(RuntimeError):
+class CompositorStartFailed(RuntimeError):
     pass
 
 
-def _weston_preexec() -> None:  # pragma: no cover - runs post-fork in the child
-    """New session (so the launcher's Ctrl+C doesn't hit weston directly), plus
-    PR_SET_PDEATHSIG=SIGKILL so weston dies if the session leader is killed —
-    otherwise an orphaned weston keeps the scope cgroup alive and blocks the
-    crash-safe ExecStopPost cleanup."""
-    os.setsid()
-    ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0)
-    if os.getppid() == 1:  # leader already died before prctl took effect
-        os._exit(0)
-
-
-def _weston_invocation(socket_name: str, upstream_fd: int | None,
-                       runtime: Path) -> tuple[list[str], dict[str, str], tuple[int, ...]]:
-    """Build (argv, env, pass_fds) for a nested weston. Pure, so it's testable.
-
-    With `upstream_fd` set, weston connects to the host compositor via the
-    inherited fd (WAYLAND_SOCKET) and the wayland backend — the deny-by-UID
-    leader uses this because the vault uid can't reach the host's runtime dir by
-    path. Without it, weston auto-detects via WAYLAND_DISPLAY (option-a).
-    """
-    env = {**os.environ, "XDG_RUNTIME_DIR": str(runtime)}
-    # Run a no-op shell so weston doesn't auto-launch a terminal; our bwrap'd
-    # app connects to the socket directly.
-    argv = ["weston", f"--socket={socket_name}", "--shell=desktop-shell.so"]
-    pass_fds: tuple[int, ...] = ()
-    if upstream_fd is not None:
-        argv.insert(1, "--backend=wayland-backend.so")
-        env["WAYLAND_SOCKET"] = str(upstream_fd)
-        env.pop("WAYLAND_DISPLAY", None)  # force the fd, not a path lookup
-        pass_fds = (upstream_fd,)
-    return argv, env, pass_fds
-
-
-@contextlib.contextmanager
-def nested_weston(upstream_fd: int | None = None):
-    """Spawn a nested Weston, yield the host-visible socket path, kill on exit.
-
-    `upstream_fd` (the leader's inherited connection to the host compositor) is
-    passed to weston as WAYLAND_SOCKET; without it weston auto-detects via
-    WAYLAND_DISPLAY.
-    """
-    runtime = Path(os.environ["XDG_RUNTIME_DIR"])
-    socket_name = f"veracage-{secrets.token_hex(4)}"
-    socket_path = runtime / socket_name
-
-    argv, env, pass_fds = _weston_invocation(socket_name, upstream_fd, runtime)
-    proc = subprocess.Popen(
-        argv,
-        env=env,
-        pass_fds=pass_fds,
-        # New session (Ctrl+C in the launcher doesn't hit weston directly) +
-        # die-with-leader via PR_SET_PDEATHSIG (see _weston_preexec).
-        preexec_fn=_weston_preexec,
-        # Close stdin so weston doesn't read from the user's terminal.
-        stdin=subprocess.DEVNULL,
-    )
-
+def compositor_pid() -> int | None:
+    """The pid the helper recorded when it brought the compositor up (the
+    compositor's own pid — the helper execs it, so the pid survives), or None if
+    there is no readable pidfile."""
     try:
-        deadline = time.monotonic() + WESTON_STARTUP_TIMEOUT_S
-        while time.monotonic() < deadline:
-            if socket_path.exists():
-                break
-            if proc.poll() is not None:
-                raise WestonStartFailed(
-                    f"weston exited early with rc={proc.returncode}"
-                )
-            time.sleep(0.05)
-        else:
-            raise WestonStartFailed(
-                f"weston socket {socket_path} did not appear within "
-                f"{WESTON_STARTUP_TIMEOUT_S}s"
-            )
+        return int(COMPOSITOR_PIDFILE.read_text().strip())
+    except (OSError, ValueError):
+        return None
 
-        yield socket_path
 
-    finally:
-        if proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
-        # Socket file is removed by weston on clean exit; if not, tidy up.
-        with contextlib.suppress(FileNotFoundError):
-            socket_path.unlink()
+def _pid_alive(pid: int) -> bool:
+    """True iff pid exists and is not a zombie. A compositor that exited (e.g. its
+    window was closed) but has not yet been reaped by its parent keeps a /proc
+    entry in state Z — functionally dead, so treat it as down."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    # "pid (comm) STATE ..." — comm may contain ')', so scan past the last one.
+    try:
+        state = stat[stat.rindex(")") + 1:].split()[0]
+    except (ValueError, IndexError):
+        return False
+    return state != "Z"
+
+
+def compositor_is_up() -> bool:
+    """True iff the persistent compositor is running AND its socket is present.
+    Both are required so a stale pidfile (a recycled pid) or a half-started
+    compositor reads as *down* and triggers a clean respawn."""
+    pid = compositor_pid()
+    return pid is not None and _pid_alive(pid) and COMPOSITOR_SOCKET.exists()
+
+
+def wait_for_compositor(timeout: float = COMPOSITOR_STARTUP_TIMEOUT_S) -> None:
+    """Block until the compositor is up, else raise CompositorStartFailed."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if compositor_is_up():
+            return
+        time.sleep(0.05)
+    raise CompositorStartFailed(
+        f"compositor socket {COMPOSITOR_SOCKET} did not appear within {timeout}s"
+    )

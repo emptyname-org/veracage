@@ -40,7 +40,7 @@ def _run(args, env=None):
 def test_rejects_user_argument():
     """The LPE vector: --user must not be accepted (regression)."""
     r = _run(["--vault", "/etc/hostname", "--mountpoint", "/run/veracage/x",
-              "--user", "0", "--", "_continue"])
+              "--user", "0", "--", "_leader"])
     assert r.returncode != 0
     assert "unexpected argument" in r.stderr.lower()
 
@@ -66,7 +66,7 @@ def test_does_not_proceed_without_pkexec_uid():
     root — the PKEXEC_UID check). Either way: non-zero, no mount."""
     env = {k: v for k, v in os.environ.items() if k != "PKEXEC_UID"}
     r = _run(["--vault", "/etc/hostname", "--mountpoint", "/run/veracage/x",
-              "--", "_continue"], env=env)
+              "--", "_leader"], env=env)
     assert r.returncode != 0
 
 
@@ -76,5 +76,5 @@ def test_mountpoint_must_be_under_run_veracage():
     (non-root) or the path check fires first — never a mount at the bad path."""
     env = dict(os.environ, PKEXEC_UID="1000")
     r = _run(["--vault", "/etc/hostname", "--mountpoint", "/tmp/evil",
-              "--", "_continue"], env=env)
+              "--", "_leader"], env=env)
     assert r.returncode != 0
