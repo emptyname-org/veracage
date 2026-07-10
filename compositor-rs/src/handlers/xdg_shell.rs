@@ -47,22 +47,35 @@ impl XdgShellHandler for State {
             .next()
             .and_then(|o| self.space.output_geometry(o));
 
+        // Reserve the toolbar strip; fill the rest. This is a single-workspace
+        // compositor (one vault's apps at a time in view), so a main app window
+        // opens MAXIMIZED to the work area rather than as a small float on the
+        // dark backdrop. Transient toplevels (dialogs) keep their own size and
+        // just cascade, so an open/save dialog isn't blown up to fullscreen.
+        let top = crate::toolbar::TOOLBAR_HEIGHT;
+        let is_dialog = surface.parent().is_some();
         let loc = if let Some(geo) = output_geo {
-            // Reserve the toolbar strip: the work area is the output minus the top
-            // strip, and windows are placed inside it so their titlebars aren't
-            // hidden under the overlay.
-            let top = crate::toolbar::TOOLBAR_HEIGHT;
             let work_h = (geo.size.h - top).max(1);
-            surface.with_pending_state(|state| {
-                state.bounds = Some((geo.size.w, work_h).into());
-            });
-            let n = self.space.elements().count() as i32;
-            let step = 32 * (n % 8);
-            let x = step.min((geo.size.w - 200).max(0));
-            let y = top + step.min((work_h - 200).max(0));
-            (x, y)
+            if is_dialog {
+                surface.with_pending_state(|state| {
+                    state.bounds = Some((geo.size.w, work_h).into());
+                });
+                let n = self.space.elements().count() as i32;
+                let step = 32 * (n % 8);
+                let x = step.min((geo.size.w - 200).max(0));
+                let y = top + step.min((work_h - 200).max(0));
+                (x, y)
+            } else {
+                surface.with_pending_state(|state| {
+                    state.bounds = Some((geo.size.w, work_h).into());
+                    state.size = Some((geo.size.w, work_h).into());
+                    state.states.set(xdg_toplevel::State::Maximized);
+                });
+                surface.send_configure();
+                (0, top)
+            }
         } else {
-            (0, crate::toolbar::TOOLBAR_HEIGHT)
+            (0, top)
         };
 
         self.space.map_element(window, loc, true);

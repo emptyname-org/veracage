@@ -77,6 +77,15 @@ pub fn init_winit(
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
 
+    // Backdrop shown behind app windows (and briefly before one commits). Match
+    // the toolbar/desktop theme so opening a vault doesn't flash a dark void —
+    // light-gray under the light theme, near-black under dark.
+    let clear_color: [f32; 4] = if std::env::var("VERACAGE_THEME").as_deref() == Ok("dark") {
+        [0.10, 0.10, 0.10, 1.0]
+    } else {
+        [0.85, 0.85, 0.87, 1.0]
+    };
+
     event_loop.handle().insert_source(winit, move |event, _, state| {
         match event {
             WinitEvent::Resized { size, scale_factor } => {
@@ -89,6 +98,25 @@ pub fn init_winit(
                     Some(Scale::Fractional(scale_factor)),
                     None,
                 );
+                // Re-fill maximized app windows so they track the new window size
+                // (they were sized to the work area at map time in new_toplevel).
+                let top = crate::toolbar::TOOLBAR_HEIGHT;
+                let work = (size.w, (size.h - top).max(1));
+                // Main windows (no xdg parent) were maximized to the work area at
+                // map time; dialogs float. Re-fill the former on resize.
+                let maximized: Vec<_> = state
+                    .space
+                    .elements()
+                    .filter(|w| w.toplevel().map(|t| t.parent().is_none()).unwrap_or(false))
+                    .cloned()
+                    .collect();
+                for w in maximized {
+                    if let Some(t) = w.toplevel() {
+                        t.with_pending_state(|s| s.size = Some(work.into()));
+                        t.send_configure();
+                    }
+                    state.space.map_element(w, (0, top), false);
+                }
             }
             WinitEvent::Input(event) => state.process_input_event(event),
             WinitEvent::Redraw => {
@@ -142,7 +170,7 @@ pub fn init_winit(
                             [&state.space],
                             &dnd,
                             &mut damage_tracker,
-                            [0.1, 0.1, 0.1, 1.0],
+                            clear_color,
                         )
                         .err()
                         .map(|e| e.to_string())
