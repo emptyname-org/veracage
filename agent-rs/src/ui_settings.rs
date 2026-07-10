@@ -14,8 +14,8 @@ pub fn run() -> Result<(), eframe::Error> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Veracage — settings")
             .with_app_id("veracage")
-            .with_inner_size([440.0, 300.0])
-            .with_resizable(false),
+            .with_inner_size([560.0, 440.0])
+            .with_min_inner_size([460.0, 360.0]),
         ..Default::default()
     };
     eframe::run_native(

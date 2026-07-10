@@ -11,6 +11,7 @@
 mod apps;
 mod broker;
 mod config;
+mod detect;
 mod proto;
 mod theme;
 mod ui_about;

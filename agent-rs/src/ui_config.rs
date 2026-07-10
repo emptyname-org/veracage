@@ -10,31 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use crate::{apps, config};
-
-/// Curated one-click suggestions: (display name, `exec`, category). Only the ones
-/// actually installed are shown as tick-boxes; anything else goes through "Add
-/// another app…". Keep file managers first — one is what opens the vault on load.
-const SUGGESTED: &[(&str, &str, &str)] = &[
-    ("Dolphin", "dolphin", "File manager"),
-    ("Files (Nautilus)", "nautilus", "File manager"),
-    ("Nemo", "nemo", "File manager"),
-    ("Thunar", "thunar", "File manager"),
-    ("PCManFM", "pcmanfm", "File manager"),
-    ("Kate", "kate", "Editor"),
-    ("gedit", "gedit", "Editor"),
-    ("Text Editor", "gnome-text-editor", "Editor"),
-    ("Mousepad", "mousepad", "Editor"),
-    ("Okular", "okular", "PDF / viewer"),
-    ("Document Viewer (Evince)", "evince", "PDF / viewer"),
-    ("Gwenview", "gwenview", "Images"),
-    ("Image Viewer (eog)", "eog", "Images"),
-    ("LibreOffice", "libreoffice", "Office"),
-];
-
-fn is_suggested(exec: &str) -> bool {
-    SUGGESTED.iter().any(|(_, e, _)| *e == exec)
-}
+use crate::{apps, config, detect};
 
 #[derive(Default)]
 pub struct Outcome {
@@ -68,6 +44,9 @@ pub fn run_configure() -> Result<Outcome, eframe::Error> {
 struct ConfigApp {
     cfg: config::Config, // existing config — non-apps fields preserved on save
     apps: Vec<apps::App>,
+    /// The host's DEFAULT apps (file manager / editor / viewer…), sensed via
+    /// xdg-mime — the one-click tick-boxes. Not a catalog we hardcode.
+    suggested: Vec<detect::Suggestion>,
     show_custom: bool,
     new_exec: String,
     new_name: String,
@@ -83,6 +62,7 @@ impl ConfigApp {
         ConfigApp {
             cfg,
             apps,
+            suggested: detect::detected_defaults(),
             show_custom: false,
             new_exec: String::new(),
             new_name: String::new(),
@@ -237,13 +217,19 @@ impl eframe::App for ConfigApp {
             ui.separator();
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                // Curated suggestions as tick-boxes (only the installed ones).
-                let installed: Vec<&(&str, &str, &str)> =
-                    SUGGESTED.iter().filter(|(_, e, _)| apps::is_installed(e)).collect();
-                if installed.is_empty() {
-                    ui.weak("(None of the common apps were found on $PATH — add one below.)");
+                // The host's default apps (sensed via xdg-mime) as tick-boxes.
+                // Cloned into locals so the loop can call &mut self (set_enabled).
+                let suggested: Vec<(String, String, &str)> = self
+                    .suggested
+                    .iter()
+                    .map(|s| (s.name.clone(), s.exec.clone(), s.category))
+                    .collect();
+                if suggested.is_empty() {
+                    ui.weak("(No host default apps detected — add one below.)");
+                } else {
+                    ui.label(egui::RichText::new("Your default apps").weak());
                 }
-                for (name, exec, cat) in installed {
+                for (name, exec, cat) in &suggested {
                     let mut on = self.enabled(exec);
                     let tag = if is_file_manager(exec) { "\u{1F4C1} " } else { "" };
                     if ui.checkbox(&mut on, format!("{tag}{name}  \u{2014}  {cat}")).changed() {
@@ -288,7 +274,7 @@ impl eframe::App for ConfigApp {
                 // Custom (non-suggested) apps, with remove — the tick-boxes above
                 // already manage the suggested ones.
                 let custom: Vec<usize> = self.apps.iter().enumerate()
-                    .filter(|(_, a)| !is_suggested(&a.exec))
+                    .filter(|(_, a)| !self.suggested.iter().any(|s| s.exec == a.exec))
                     .map(|(i, _)| i)
                     .collect();
                 if !custom.is_empty() {

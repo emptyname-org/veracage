@@ -22,7 +22,7 @@ pub fn run() -> Result<(), eframe::Error> {
     let mut vp = egui::ViewportBuilder::default()
         .with_title("About Veracage")
         .with_app_id("veracage")
-        .with_inner_size([340.0, 300.0])
+        .with_inner_size([440.0, 380.0])
         .with_resizable(false);
     if let Some(i) = icon {
         vp = vp.with_icon(i);

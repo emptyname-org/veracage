@@ -20,7 +20,7 @@ pub fn run(vault_name: String) -> Result<(), eframe::Error> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Veracage — passphrase")
             .with_app_id("veracage")
-            .with_inner_size([360.0, 150.0])
+            .with_inner_size([460.0, 200.0])
             .with_resizable(false),
         ..Default::default()
     };
