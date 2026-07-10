@@ -1,9 +1,9 @@
-//! egui config picker — manage which apps are enabled in the sandbox (replaces
-//! `configure.py`'s Qt window). Shows a curated list of common apps as tick-boxes
-//! for one-click enabling, plus an "Add another app…" form for ANY installed
-//! binary (a name on `$PATH`, or an absolute path). Save writes `config.toml`,
-//! preserving `[default]`/`[volumes]` (only the app list changes). Closing the
-//! window SAVES (the state is the config; there is nothing to "cancel").
+//! egui config picker — manage which apps are enabled against the vault (replaces
+//! `configure.py`'s Qt window). Host-sensed default apps appear as tick-boxes to
+//! enable; every enabled app is listed with an ✖ to remove; "Add another app…"
+//! takes ANY installed binary (a name on `$PATH`, or an absolute path). Closing
+//! the window (titlebar or Save) SAVES; Cancel discards. Layout follows the user's
+//! design: wide margins, Save/Cancel bottom-right (same house style as settings).
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -25,8 +25,8 @@ pub fn run_configure() -> Result<Outcome, eframe::Error> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Veracage — apps")
             .with_app_id("veracage")
-            .with_inner_size([560.0, 600.0])
-            .with_min_inner_size([420.0, 360.0]),
+            .with_inner_size([620.0, 640.0])
+            .with_min_inner_size([500.0, 420.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -44,14 +44,10 @@ pub fn run_configure() -> Result<Outcome, eframe::Error> {
 struct ConfigApp {
     cfg: config::Config, // existing config — non-apps fields preserved on save
     apps: Vec<apps::App>,
-    /// The host's DEFAULT apps (file manager / editor / viewer…), sensed via
-    /// xdg-mime — the one-click tick-boxes. Not a catalog we hardcode.
-    suggested: Vec<detect::Suggestion>,
-    show_custom: bool,
+    suggested: Vec<detect::Suggestion>, // host defaults (xdg-mime) — quick tick-boxes
     new_exec: String,
-    new_name: String,
-    new_args: String,
     error: String,
+    cancelled: bool,
     outcome: Arc<Mutex<Outcome>>,
 }
 
@@ -63,11 +59,9 @@ impl ConfigApp {
             cfg,
             apps,
             suggested: detect::detected_defaults(),
-            show_custom: false,
             new_exec: String::new(),
-            new_name: String::new(),
-            new_args: "/vault".into(),
             error: String::new(),
+            cancelled: false,
             outcome,
         }
     }
@@ -76,24 +70,22 @@ impl ConfigApp {
         self.apps.iter().any(|a| a.exec == exec)
     }
 
-    /// Enable/disable a suggested app by its exec (tick-box).
-    fn set_enabled(&mut self, name: &str, exec: &str, on: bool) {
-        if on {
-            if self.enabled(exec) {
-                return;
-            }
-            let taken: HashSet<String> = self.apps.iter().map(|a| a.key.clone()).collect();
-            self.apps.push(apps::App {
-                key: key_for(exec, &taken),
-                name: name.to_string(),
-                exec: exec.to_string(),
-                args: vec!["/vault".to_string()],
-            });
-        } else {
-            self.apps.retain(|a| a.exec != exec);
+    /// Enable a suggested app (tick-box) — it then leaves the suggestions and
+    /// appears in the enabled list below.
+    fn enable(&mut self, name: &str, exec: &str) {
+        if self.enabled(exec) {
+            return;
         }
+        let taken: HashSet<String> = self.apps.iter().map(|a| a.key.clone()).collect();
+        self.apps.push(apps::App {
+            key: key_for(exec, &taken),
+            name: name.to_string(),
+            exec: exec.to_string(),
+            args: vec!["/vault".to_string()],
+        });
     }
 
+    /// Add ANY installed binary (name defaults to its basename, opened at /vault).
     fn add_custom(&mut self) {
         let exec = self.new_exec.trim().to_string();
         if exec.is_empty() {
@@ -111,16 +103,9 @@ impl ConfigApp {
             .find(|a| a.exec == exec)
             .map(|a| a.key.clone())
             .unwrap_or_else(|| key_for(&exec, &taken));
-        let name = if self.new_name.trim().is_empty() {
-            basename(&exec)
-        } else {
-            self.new_name.trim().to_string()
-        };
-        let args = self.new_args.split_whitespace().map(str::to_string).collect();
-        self.apps.retain(|a| a.key != key);
-        self.apps.push(apps::App { key, name, exec, args });
+        self.apps.retain(|a| a.exec != exec);
+        self.apps.push(apps::App { key, name: basename(&exec), exec, args: vec!["/vault".into()] });
         self.new_exec.clear();
-        self.new_name.clear();
         self.error.clear();
     }
 
@@ -147,7 +132,7 @@ fn basename(s: &str) -> String {
 }
 
 /// Known file-manager binaries (keep in sync with FILE_MANAGERS in cli.py). Used
-/// to nudge the user to enable one — it's what opens the vault on load.
+/// to tag them with a folder glyph — a file manager is what opens the vault.
 const FILE_MANAGERS: &[&str] = &[
     "dolphin", "nautilus", "nemo", "thunar", "pcmanfm", "pcmanfm-qt",
     "caja", "konqueror", "krusader", "nnn", "ranger",
@@ -173,117 +158,60 @@ fn key_for(exec: &str, taken: &HashSet<String>) -> String {
 
 impl eframe::App for ConfigApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Closing the window IS the save (the config is the state — there is no
-        // separate "cancel"): intercept the close request, persist, then let it go.
-        if ctx.input(|i| i.viewport().close_requested()) {
+        // Closing the window (titlebar) SAVES; Cancel sets `cancelled` first so it
+        // discards. The config IS the state — there is no separate confirm step.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.cancelled {
             self.save();
         }
 
-        let mut do_close = false;
+        let mut do_save = false;
+        let mut do_cancel = false;
 
-        egui::TopBottomPanel::bottom("buttons").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.button("Save & Close").clicked() {
-                    do_close = true;
-                }
-                ui.label(
-                    egui::RichText::new(format!("{} app(s) enabled", self.apps.len())).weak(),
-                );
+        egui::TopBottomPanel::bottom("actions")
+            .frame(crate::theme::content_frame(ctx))
+            .show(ctx, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    crate::theme::pad_buttons(ui);
+                    if ui.button("Cancel").clicked() {
+                        do_cancel = true;
+                    }
+                    if ui.button("Save").clicked() {
+                        do_save = true;
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{} enabled", self.apps.len())).weak(),
+                    );
+                });
             });
-            ui.add_space(4.0);
-        });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Veracage apps");
-            ui.label(
-                "Tick the apps you want available against the vault. They run\n\
-                 confined by Veracage (no host files, no network).",
-            );
+        egui::CentralPanel::default()
+            .frame(crate::theme::content_frame(ctx))
+            .show(ctx, |ui| {
+                ui.heading("Pick the apps you want to use in Veracage");
+                ui.add_space(12.0);
 
-            // File-manager nudge — a file manager opens the vault on load.
-            let have_fm = self.apps.iter().any(|a| is_file_manager(&a.exec));
-            if have_fm {
-                ui.label(egui::RichText::new(
-                    "\u{1F4C1} A file manager is enabled — it opens the vault on load.",
-                ).weak());
-            } else {
-                ui.colored_label(
-                    egui::Color32::from_rgb(180, 130, 40),
-                    "\u{1F4C1} Tick a file manager (e.g. Dolphin) to browse the vault \
-                     — it opens automatically when a vault loads.",
-                );
-            }
-            ui.separator();
-
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                // The host's default apps (sensed via xdg-mime) as tick-boxes.
-                // Cloned into locals so the loop can call &mut self (set_enabled).
-                let suggested: Vec<(String, String, &str)> = self
-                    .suggested
-                    .iter()
-                    .map(|s| (s.name.clone(), s.exec.clone(), s.category))
-                    .collect();
-                if suggested.is_empty() {
-                    ui.weak("(No host default apps detected — add one below.)");
-                } else {
-                    ui.label(egui::RichText::new("Your default apps").weak());
-                }
-                for (name, exec, cat) in &suggested {
-                    let mut on = self.enabled(exec);
-                    let tag = if is_file_manager(exec) { "\u{1F4C1} " } else { "" };
-                    if ui.checkbox(&mut on, format!("{tag}{name}  \u{2014}  {cat}")).changed() {
-                        self.set_enabled(name, exec, on);
-                    }
-                }
-
-                ui.add_space(6.0);
-                ui.separator();
-
-                // Add-another-app form (any installed binary). Collapsed by default.
-                let hdr = if self.show_custom { "\u{25BE} Add another app\u{2026}" }
-                          else { "\u{25B8} Add another app\u{2026}" };
-                if ui.selectable_label(false, hdr).clicked() {
-                    self.show_custom = !self.show_custom;
-                }
-                if self.show_custom {
-                    ui.horizontal(|ui| {
-                        ui.label("Binary:");
-                        ui.add(egui::TextEdit::singleline(&mut self.new_exec)
-                            .desired_width(150.0)
-                            .hint_text("e.g. gimp or /opt/app/bin/app"));
-                        ui.label("Name:");
-                        ui.add(egui::TextEdit::singleline(&mut self.new_name)
-                            .desired_width(90.0)
-                            .hint_text("optional"));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Args:").on_hover_text(
-                            "Passed to the app on launch — /vault is the mounted vault, \
-                             so the app opens there.");
-                        ui.add(egui::TextEdit::singleline(&mut self.new_args).desired_width(120.0));
-                        if ui.button("Add").clicked() {
-                            self.add_custom();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    // Host-sensed suggestions not yet enabled — tick to enable.
+                    // Collect the click and apply after the loop (can't call
+                    // &mut self.enable while iterating self.suggested).
+                    let mut enable_now: Option<(String, String)> = None;
+                    for s in self.suggested.iter().filter(|s| !self.enabled(&s.exec)) {
+                        let tag = if is_file_manager(&s.exec) { "\u{1F4C1} " } else { "" };
+                        let mut on = false;
+                        if ui
+                            .checkbox(&mut on, format!("{tag}{}  \u{2014}  {}", s.name, s.category))
+                            .changed()
+                        {
+                            enable_now = Some((s.name.clone(), s.exec.clone()));
                         }
-                    });
-                    if !self.error.is_empty() {
-                        ui.colored_label(egui::Color32::from_rgb(200, 80, 80), &self.error);
                     }
-                }
+                    if let Some((name, exec)) = enable_now {
+                        self.enable(&name, &exec);
+                    }
 
-                // Custom (non-suggested) apps, with remove — the tick-boxes above
-                // already manage the suggested ones.
-                let custom: Vec<usize> = self.apps.iter().enumerate()
-                    .filter(|(_, a)| !self.suggested.iter().any(|s| s.exec == a.exec))
-                    .map(|(i, _)| i)
-                    .collect();
-                if !custom.is_empty() {
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.label(egui::RichText::new("Custom apps").weak());
+                    // Every enabled app, with an ✖ to remove.
                     let mut remove: Option<usize> = None;
-                    for i in custom {
-                        let a = &self.apps[i];
+                    for (i, a) in self.apps.iter().enumerate() {
                         ui.horizontal(|ui| {
                             if ui.button("\u{2716}").on_hover_text("Remove").clicked() {
                                 remove = Some(i);
@@ -299,13 +227,36 @@ impl eframe::App for ConfigApp {
                     if let Some(i) = remove {
                         self.apps.remove(i);
                     }
-                }
-            });
-        });
 
-        if do_close {
-            self.save();
+                    ui.add_space(14.0);
+                    ui.strong("Add another app\u{2026}");
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let add_w = 64.0;
+                        let field_w = (ui.available_width() - add_w - 8.0).max(120.0);
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.new_exec)
+                                .desired_width(field_w)
+                                .hint_text("e.g. gimp or /opt/app/bin/app"),
+                        );
+                        let enter =
+                            resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if ui.button("Add").clicked() || enter {
+                            self.add_custom();
+                        }
+                    });
+                    if !self.error.is_empty() {
+                        ui.colored_label(egui::Color32::from_rgb(200, 80, 80), &self.error);
+                    }
+                });
+            });
+
+        if do_cancel {
+            self.cancelled = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if do_save {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close); // close_requested saves
         }
     }
 }

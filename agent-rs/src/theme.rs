@@ -14,6 +14,20 @@ pub fn apply(ctx: &egui::Context, theme: &str) {
     bump_fonts(ctx);
 }
 
+/// The house style for a dialog's panels: wide left/right margins (matches the
+/// settings design). Use for BOTH the central panel and the bottom button bar so
+/// content and buttons share the same side margins.
+pub fn content_frame(ctx: &egui::Context) -> egui::Frame {
+    egui::Frame::central_panel(&ctx.style())
+        .inner_margin(egui::Margin::symmetric(36.0, 18.0))
+}
+
+/// Roomier internal padding for the Save/Cancel buttons (left/right breathing
+/// room). Call inside the button row: `theme::pad_buttons(ui)`.
+pub fn pad_buttons(ui: &mut egui::Ui) {
+    ui.spacing_mut().button_padding = egui::vec2(16.0, 6.0);
+}
+
 /// Enlarge every text style ~50% (egui's defaults are ~9/12.5/18; a 12 becomes an
 /// 18). Absolute sizes, so it is safe to call every frame (multiplying would
 /// compound). Applied everywhere `apply` runs, so no window is left small.

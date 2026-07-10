@@ -59,6 +59,10 @@ pub struct Toolbar {
     /// Dark vs light egui visuals. Default LIGHT; the human side passes
     /// `VERACAGE_THEME=dark` (from config) when it spawns the compositor.
     dark: bool,
+    /// When true, draw the desktop (mounted-vault tiles) as an OVERLAY on top of
+    /// the app windows — the ⌂ Home button toggles it, so the desktop is reachable
+    /// even with a maximized app up (it's normally only shown when no window maps).
+    show_desktop: bool,
 }
 
 impl Toolbar {
@@ -85,6 +89,7 @@ impl Toolbar {
             pointer: egui::Pos2::ZERO,
             height: TOOLBAR_HEIGHT as f32,
             dark: std::env::var("VERACAGE_THEME").as_deref() == Ok("dark"),
+            show_desktop: false,
         })
     }
 
@@ -123,7 +128,9 @@ impl Toolbar {
     /// withholds pointer events from the sandbox while this holds, so a click on a
     /// dropdown item reaches egui rather than the app underneath.
     pub fn wants_pointer(&self) -> bool {
-        self.ctx.wants_pointer_input()
+        // While the desktop overlay is up it covers the app: gate ALL pointer
+        // events to egui so clicks hit the tiles, not the app underneath.
+        self.ctx.wants_pointer_input() || self.show_desktop
     }
 
     /// Run the UI and paint it into the currently-bound framebuffer. `size_px` is
@@ -167,11 +174,22 @@ impl Toolbar {
 
         let mut action = ToolbarAction::None;
         let height = self.height;
+        // Local copy the closure can mutate (can't touch &mut self inside ctx.run).
+        let mut show_desktop = self.show_desktop;
         let full = self.ctx.run(raw, |ctx| {
             egui::TopBottomPanel::top("veracage_menu")
                 .exact_height(height)
                 .show(ctx, |ui| {
                     egui::menu::bar(ui, |ui| {
+                        // ⌂ Home: toggle the desktop (mounted-vault tiles) as an
+                        // overlay, so it's reachable even with a maximized app up.
+                        if ui
+                            .selectable_label(show_desktop, "\u{2302}")
+                            .on_hover_text("Show the Veracage desktop")
+                            .clicked()
+                        {
+                            show_desktop = !show_desktop;
+                        }
                         ui.menu_button("File", |ui| {
                             if ui.button("Open vault\u{2026}").clicked() {
                                 action = ToolbarAction::Command("open");
@@ -244,13 +262,13 @@ impl Toolbar {
                     });
                 });
 
-            // Desktop — shown ONLY when no sandbox window is mapped (otherwise the
-            // filled CentralPanel would paint over the app windows, since egui is
-            // composited AFTER the sandbox surfaces into the same framebuffer). It
-            // is the mounted-volume indicator: with no vault it prompts to open one;
-            // with vaults mounted it shows a clickable tile per vault that launches
-            // the vault's opener (its file manager) so the vault is never invisible.
-            if !has_windows {
+            // Desktop — the mounted-volume "home": shown when no window is mapped,
+            // OR on demand as an overlay via the ⌂ Home button (so it's reachable
+            // with a maximized app up). The filled CentralPanel is composited AFTER
+            // the sandbox surfaces, so as an overlay it naturally covers the app.
+            // With no vault it prompts to open one; with vaults mounted it shows a
+            // clickable tile per vault that launches the vault's opener.
+            if !has_windows || show_desktop {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     if leaders.is_empty() {
                         ui.vertical_centered(|ui| {
@@ -287,6 +305,7 @@ impl Toolbar {
                                             sock: l.sock.clone(),
                                             index: idx,
                                         };
+                                        show_desktop = false; // launched → back to the app
                                     }
                                 }
                             }
@@ -295,6 +314,7 @@ impl Toolbar {
                 });
             }
         });
+        self.show_desktop = show_desktop;
 
         let clipped = self.ctx.tessellate(full.shapes, full.pixels_per_point);
         self.painter.paint_and_update_textures(

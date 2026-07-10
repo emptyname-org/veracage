@@ -56,25 +56,28 @@ impl eframe::App for Settings {
         let mut do_save = false;
         let mut do_cancel = false;
 
-        // Save / Cancel pinned bottom-right (design).
-        egui::TopBottomPanel::bottom("actions").show(ctx, |ui| {
-            ui.add_space(8.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Cancel").clicked() {
-                    do_cancel = true;
-                }
-                if ui.button("Save").clicked() {
-                    do_save = true;
-                }
-                if !self.status.is_empty() {
-                    ui.colored_label(egui::Color32::from_rgb(200, 80, 80), &self.status);
-                }
+        // Save / Cancel pinned bottom-right (design), same side margins as body.
+        egui::TopBottomPanel::bottom("actions")
+            .frame(crate::theme::content_frame(ctx))
+            .show(ctx, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    crate::theme::pad_buttons(ui);
+                    if ui.button("Cancel").clicked() {
+                        do_cancel = true;
+                    }
+                    if ui.button("Save").clicked() {
+                        do_save = true;
+                    }
+                    if !self.status.is_empty() {
+                        ui.colored_label(egui::Color32::from_rgb(200, 80, 80), &self.status);
+                    }
+                });
             });
-            ui.add_space(8.0);
-        });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(16.0);
+        egui::CentralPanel::default()
+            .frame(crate::theme::content_frame(ctx))
+            .show(ctx, |ui| {
+            ui.add_space(6.0);
 
             // Theme
             ui.horizontal(|ui| {
