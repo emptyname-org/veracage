@@ -1,9 +1,10 @@
 //! One-shot settings dialog: `veracage-agent _settings`.
 //!
 //! A fresh process (winit can't reopen an EventLoop) that edits the general
-//! settings in `~/.config/veracage/config.toml` — theme, GPU passthrough, the
-//! suspend action, and the shared Exchange folder. Spawned by the broker when the
-//! compositor's Settings menu is used.
+//! settings in `~/.config/veracage/config.toml` — theme, the shared Exchange
+//! folder, the suspend action, and GPU passthrough. Spawned by the broker when
+//! the compositor's Settings menu is used. Layout follows the user's design:
+//! Theme, Exchange, Suspend, GPU (top→bottom), Save/Cancel bottom-right.
 
 use eframe::egui;
 
@@ -14,8 +15,8 @@ pub fn run() -> Result<(), eframe::Error> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Veracage — settings")
             .with_app_id("veracage")
-            .with_inner_size([560.0, 440.0])
-            .with_min_inner_size([460.0, 360.0]),
+            .with_inner_size([620.0, 460.0])
+            .with_min_inner_size([500.0, 380.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -52,11 +53,30 @@ impl eframe::App for Settings {
         // Apply the (possibly just-changed) theme every frame so the picker is live.
         crate::theme::apply(ctx, &self.cfg.theme);
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.strong("Settings");
-            ui.add_space(10.0);
+        let mut do_save = false;
+        let mut do_cancel = false;
 
+        // Save / Cancel pinned bottom-right (design).
+        egui::TopBottomPanel::bottom("actions").show(ctx, |ui| {
+            ui.add_space(8.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Cancel").clicked() {
+                    do_cancel = true;
+                }
+                if ui.button("Save").clicked() {
+                    do_save = true;
+                }
+                if !self.status.is_empty() {
+                    ui.colored_label(egui::Color32::from_rgb(200, 80, 80), &self.status);
+                }
+            });
+            ui.add_space(8.0);
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(16.0);
+
+            // Theme
             ui.horizontal(|ui| {
                 ui.label("Theme:");
                 egui::ComboBox::from_id_salt("theme")
@@ -69,14 +89,22 @@ impl eframe::App for Settings {
                         ui.selectable_value(&mut self.cfg.theme, "dark".into(), "Dark");
                     });
             });
-            ui.add_space(8.0);
+            ui.add_space(20.0);
 
-            ui.checkbox(
-                &mut self.cfg.gpu,
-                "GPU passthrough for apps (faster, but a shared-GPU side channel)",
-            );
-            ui.add_space(8.0);
+            // Exchange folder — checkbox, then an indented full-width path field.
+            ui.checkbox(&mut self.cfg.exchange, "Exchange folder (host \u{2194} vault)");
+            ui.add_enabled_ui(self.cfg.exchange, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(24.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.exchange_dir)
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+            });
+            ui.add_space(20.0);
 
+            // Suspend
             ui.horizontal(|ui| {
                 ui.label("On system suspend:");
                 egui::ComboBox::from_id_salt("suspend")
@@ -97,35 +125,25 @@ impl eframe::App for Settings {
                         );
                     });
             });
-            ui.add_space(8.0);
+            ui.add_space(20.0);
 
-            ui.checkbox(&mut self.cfg.exchange, "Shared Exchange folder (host \u{2194} vault)");
-            ui.add_enabled_ui(self.cfg.exchange, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Exchange folder:");
-                    ui.add(egui::TextEdit::singleline(&mut self.exchange_dir)
-                        .desired_width(f32::INFINITY));
-                });
-            });
-
-            ui.add_space(14.0);
-            ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    let d = self.exchange_dir.trim();
-                    self.cfg.exchange_dir = (!d.is_empty()).then(|| d.to_string());
-                    match config::save(&self.cfg) {
-                        Ok(_) => std::process::exit(0),
-                        Err(e) => self.status = format!("Save failed: {e}"),
-                    }
-                }
-                if ui.button("Cancel").clicked() {
-                    std::process::exit(0);
-                }
-            });
-            if !self.status.is_empty() {
-                ui.add_space(6.0);
-                ui.colored_label(egui::Color32::from_rgb(200, 80, 80), &self.status);
-            }
+            // GPU passthrough (advanced; last)
+            ui.checkbox(
+                &mut self.cfg.gpu,
+                "GPU passthrough for apps (faster, but a shared-GPU side channel)",
+            );
         });
+
+        if do_cancel {
+            std::process::exit(0);
+        }
+        if do_save {
+            let d = self.exchange_dir.trim();
+            self.cfg.exchange_dir = (!d.is_empty()).then(|| d.to_string());
+            match config::save(&self.cfg) {
+                Ok(_) => std::process::exit(0),
+                Err(e) => self.status = format!("Save failed: {e}"),
+            }
+        }
     }
 }

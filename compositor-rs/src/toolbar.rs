@@ -196,7 +196,7 @@ impl Toolbar {
                             }
                         });
                         ui.menu_button("Edit", |ui| {
-                            if ui.button("Paste \u{2192} sandbox").clicked() {
+                            if ui.button("Paste \u{2192} Veracage").clicked() {
                                 action = ToolbarAction::ClipPush;
                                 ui.close_menu();
                             }

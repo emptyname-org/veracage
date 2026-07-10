@@ -37,7 +37,48 @@ pub fn detected_defaults() -> Vec<Suggestion> {
         }
         out.push(Suggestion { name, exec, category: cat });
     }
+    // A GUI text editor and a terminal are useful against a vault but aren't a
+    // mime default (there is no mimetype for "terminal", and text/plain may
+    // resolve to something odd), so fill them from a small installed-app probe.
+    if !out.iter().any(|s| s.category == "Text editor") {
+        if let Some(s) = first_installed(EDITORS, "Text editor") {
+            out.push(s);
+        }
+    }
+    if let Some(term) = first_installed(TERMINALS, "Terminal") {
+        if !out.iter().any(|e| e.exec == term.exec) {
+            out.push(term);
+        }
+    }
     out
+}
+
+/// Common GUI text editors, best-known first (fallback when `text/plain` didn't
+/// resolve to one).
+const EDITORS: &[(&str, &str)] = &[
+    ("Kate", "kate"),
+    ("Text Editor", "gnome-text-editor"),
+    ("gedit", "gedit"),
+    ("Mousepad", "mousepad"),
+    ("KWrite", "kwrite"),
+];
+
+/// Terminal emulators. `x-terminal-emulator` is Debian's update-alternatives
+/// default (a symlink to the user's chosen terminal), so it comes first.
+const TERMINALS: &[(&str, &str)] = &[
+    ("Terminal", "x-terminal-emulator"),
+    ("Konsole", "konsole"),
+    ("GNOME Terminal", "gnome-terminal"),
+    ("Alacritty", "alacritty"),
+    ("kitty", "kitty"),
+    ("xterm", "xterm"),
+];
+
+/// First installed (name, exec) from `list`, as a Suggestion in `category`.
+fn first_installed(list: &[(&str, &str)], category: &'static str) -> Option<Suggestion> {
+    list.iter().find(|(_, exec)| crate::apps::is_installed(exec)).map(|(name, exec)| {
+        Suggestion { name: name.to_string(), exec: exec.to_string(), category }
+    })
 }
 
 /// `xdg-mime query default <mime>` -> a `.desktop` id (e.g. `org.kde.dolphin.desktop`).

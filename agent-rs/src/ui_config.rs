@@ -23,7 +23,7 @@ pub fn run_configure() -> Result<Outcome, eframe::Error> {
     let app = ConfigApp::new(outcome.clone());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Veracage — sandbox apps")
+            .with_title("Veracage — apps")
             .with_app_id("veracage")
             .with_inner_size([560.0, 600.0])
             .with_min_inner_size([420.0, 360.0]),
@@ -195,10 +195,10 @@ impl eframe::App for ConfigApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Sandbox apps");
+            ui.heading("Veracage apps");
             ui.label(
                 "Tick the apps you want available against the vault. They run\n\
-                 confined by the sandbox (no host files, no network).",
+                 confined by Veracage (no host files, no network).",
             );
 
             // File-manager nudge — a file manager opens the vault on load.

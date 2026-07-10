@@ -102,7 +102,7 @@ def main(args: argparse.Namespace) -> int:
 
 
 def add_subparser(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("configure", help="manage the enabled sandbox apps")
+    p = sub.add_parser("configure", help="manage the enabled Veracage apps")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--add", metavar="BINARY",
                    help="enable an installed binary (name on $PATH, or a path)")

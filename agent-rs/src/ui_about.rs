@@ -59,7 +59,7 @@ impl eframe::App for About {
                 }
                 ui.add_space(6.0);
                 ui.heading("Veracage");
-                ui.label("Encrypted vaults, sandboxed.");
+                ui.label("Encrypted vaults, isolated.");
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(format!("version {}", env!("CARGO_PKG_VERSION"))).weak());
                 ui.add_space(14.0);
