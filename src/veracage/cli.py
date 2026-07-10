@@ -171,7 +171,11 @@ def cmd_open(args: argparse.Namespace) -> int:
         cfg.last_used_app = args.app
         config.save(cfg)
 
-    mountpoint = Path(f"/run/veracage/{secrets.token_hex(8)}")
+    # Shared-workspace session id: one session per human uid. The helper mounts
+    # the volume into that session's tmpfs workspace at /vaults/<label> and injects
+    # the (label-derived) mountpoint into the leader argv — so the CLI no longer
+    # picks a mountpoint. (docs/shared-workspace-redesign.md, Phase 2.)
+    sid = str(os.getuid())
     gpu = cfg.gpu_for(str(vault))
     backend = cfg.backend_for(str(vault))
 
@@ -210,8 +214,9 @@ def cmd_open(args: argparse.Namespace) -> int:
     # passphrase). The leader publishes them to the compositor toolbar and only
     # ever launches from THIS list (by index on a toolbar click), never a command
     # a control-socket peer supplies. bwrap confines whatever runs.
-    leader_args = ["_leader", "--mountpoint", str(mountpoint),
-                   "--apps", json.dumps(apps_list)]
+    # No --mountpoint: the helper computes /vaults/<label> after reading the
+    # volume label (post-cryptsetup) and injects it into this leader argv.
+    leader_args = ["_leader", "--apps", json.dumps(apps_list)]
     if first_app is not None:
         leader_args += ["--first", json.dumps(first_app)]
     if gpu:
@@ -227,7 +232,9 @@ def cmd_open(args: argparse.Namespace) -> int:
     # Quote the helper path: systemd re-tokenizes the ExecStopPost value on
     # whitespace, so an install/checkout path containing a space would otherwise
     # split into wrong args and the on-stop dismount would silently never run.
-    exec_stop_post = f'ExecStopPost=pkexec "{CLEANUP_HELPER_PATH}" --vault-hash {vh}'
+    # Session teardown: closes EVERY volume's dm from session-<sid>.lock (the
+    # workspace mounts died with the leader NS). Phase 2 = one volume per session.
+    exec_stop_post = f'ExecStopPost=pkexec "{CLEANUP_HELPER_PATH}" --session {sid}'
     # Unique per invocation: a fixed `veracage-<hash>.service` collides on a retry
     # if a prior attempt left the unit loaded ("Unit ... was already loaded").
     # The vault-hash prefix keeps it identifiable; the random suffix avoids reuse.
@@ -238,7 +245,7 @@ def cmd_open(args: argparse.Namespace) -> int:
     # to our stdin flows through to the helper (which reads it for cryptsetup);
     # a GUI has no tty for an interactive prompt.
     helper_flags = ["--source", str(vault), "--backend", backend,
-                    "--mountpoint", str(mountpoint)]
+                    "--session", sid]
     if args.passphrase_stdin:
         helper_flags.append("--passphrase-stdin")
     # Shared exchange folder: ensure ~/Veracage/Exchange exists (we own it) and

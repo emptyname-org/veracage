@@ -932,9 +932,12 @@ fn run_session_bootstrap(
     }
     let runtime_dir = setenv_value(args, "XDG_RUNTIME_DIR")
         .unwrap_or_else(|| fail("XDG_RUNTIME_DIR not forwarded; need it for the control socket", 2));
+    // Key the control socket by the source vault hash (as the legacy path does),
+    // so `veracage list/close <vault>` keeps finding it in Phase 2 (one vault per
+    // session). Phase 5 reworks this to a session-scoped control protocol.
     let ctl_path = PathBuf::from(&runtime_dir)
         .join("veracage/sessions")
-        .join(format!("session-{sid}.sock"));
+        .join(format!("{}.sock", vault_hash(source)));
 
     let cont = PathBuf::from(continuation());
     if !is_executable(&cont) {

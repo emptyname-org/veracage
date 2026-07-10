@@ -90,7 +90,8 @@ def test_open_registers_execstoppost_cleanup(monkeypatch, configured, fake_vault
     assert prop is not None, "ExecStopPost property missing"
     assert "pkexec" in prop
     assert "veracage-cleanup" in prop
-    assert "--vault-hash" in prop
+    # Shared-workspace: teardown is session-scoped (closes every volume's dm).
+    assert f"--session {os.getuid()}" in prop
 
 
 def test_open_unit_name_includes_vault_hash(monkeypatch, configured, fake_vault):
@@ -110,6 +111,7 @@ def test_open_passes_vault_but_not_identity(monkeypatch, configured, fake_vault)
     _, argv = _run_open(monkeypatch, fake_vault, "kate")
     pairs = list(zip(argv, argv[1:]))
     assert ("--source", str(fake_vault)) in pairs
+    assert ("--session", str(os.getuid())) in pairs   # the workspace session id
     assert ("--user", str(os.getuid())) not in pairs
     assert ("--group", str(os.getgid())) not in pairs
     assert "--continuation" not in argv
@@ -145,7 +147,9 @@ def test_open_without_app_launches_nothing(monkeypatch, configured, fake_vault):
     after = argv[sep + 1:]
     assert after[0] == "_leader"
     pairs = dict(zip(after, after[1:]))
-    assert "--mountpoint" in pairs
+    # No --mountpoint: the helper computes /vaults/<label> post-cryptsetup and
+    # injects it into the leader argv (the CLI can't know the label upfront).
+    assert "--mountpoint" not in pairs
     assert "--first" not in after                # nothing auto-launched
     specs = json.loads(pairs["--apps"])          # all enabled apps for the toolbar
     execs = {s["exec"] for s in specs}
