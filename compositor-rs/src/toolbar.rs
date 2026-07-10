@@ -59,10 +59,6 @@ pub struct Toolbar {
     /// Dark vs light egui visuals. Default LIGHT; the human side passes
     /// `VERACAGE_THEME=dark` (from config) when it spawns the compositor.
     dark: bool,
-    /// When true, draw the desktop (mounted-vault tiles) as an OVERLAY on top of
-    /// the app windows — the ⌂ Home button toggles it, so the desktop is reachable
-    /// even with a maximized app up (it's normally only shown when no window maps).
-    show_desktop: bool,
 }
 
 impl Toolbar {
@@ -89,7 +85,6 @@ impl Toolbar {
             pointer: egui::Pos2::ZERO,
             height: TOOLBAR_HEIGHT as f32,
             dark: std::env::var("VERACAGE_THEME").as_deref() == Ok("dark"),
-            show_desktop: false,
         })
     }
 
@@ -128,9 +123,7 @@ impl Toolbar {
     /// withholds pointer events from the sandbox while this holds, so a click on a
     /// dropdown item reaches egui rather than the app underneath.
     pub fn wants_pointer(&self) -> bool {
-        // While the desktop overlay is up it covers the app: gate ALL pointer
-        // events to egui so clicks hit the tiles, not the app underneath.
-        self.ctx.wants_pointer_input() || self.show_desktop
+        self.ctx.wants_pointer_input()
     }
 
     /// Run the UI and paint it into the currently-bound framebuffer. `size_px` is
@@ -174,22 +167,11 @@ impl Toolbar {
 
         let mut action = ToolbarAction::None;
         let height = self.height;
-        // Local copy the closure can mutate (can't touch &mut self inside ctx.run).
-        let mut show_desktop = self.show_desktop;
         let full = self.ctx.run(raw, |ctx| {
             egui::TopBottomPanel::top("veracage_menu")
                 .exact_height(height)
                 .show(ctx, |ui| {
                     egui::menu::bar(ui, |ui| {
-                        // ⌂ Home: toggle the desktop (mounted-vault tiles) as an
-                        // overlay, so it's reachable even with a maximized app up.
-                        if ui
-                            .selectable_label(show_desktop, "\u{2302}")
-                            .on_hover_text("Show the Veracage desktop")
-                            .clicked()
-                        {
-                            show_desktop = !show_desktop;
-                        }
                         ui.menu_button("File", |ui| {
                             if ui.button("Open vault\u{2026}").clicked() {
                                 action = ToolbarAction::Command("open");
@@ -262,17 +244,17 @@ impl Toolbar {
                     });
                 });
 
-            // Desktop — the mounted-volume "home": shown when no window is mapped,
-            // OR on demand as an overlay via the ⌂ Home button (so it's reachable
-            // with a maximized app up). The filled CentralPanel is composited AFTER
-            // the sandbox surfaces, so as an overlay it naturally covers the app.
-            // With no vault it prompts to open one; with vaults mounted it shows a
-            // clickable tile per vault that launches the vault's opener.
-            if !has_windows || show_desktop {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    if leaders.is_empty() {
+            // The compositor backdrop IS the desktop (rendered first, behind every
+            // window) — there is no opaque egui desktop panel, so app windows open
+            // ON the desktop like any normal compositor. When nothing is open we
+            // draw only a centred hint on a TRANSPARENT panel (so the backdrop shows
+            // through); once a window maps it covers the hint, as a desktop should.
+            if !has_windows {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
                         ui.vertical_centered(|ui| {
-                            ui.add_space(ui.available_height() * 0.38);
+                            ui.add_space(ui.available_height() * 0.4);
                             ui.label(
                                 egui::RichText::new("\u{1F512}  No vault open")
                                     .size(28.0)
@@ -283,38 +265,9 @@ impl Toolbar {
                                 egui::RichText::new("File \u{25B8} Open vault\u{2026}").weak(),
                             );
                         });
-                    } else {
-                        ui.add_space(24.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
-                            for l in leaders {
-                                let text = egui::RichText::new(format!(
-                                    "\u{1F4C1}\n{}",
-                                    l.label
-                                ))
-                                .size(20.0);
-                                let tile =
-                                    ui.add_sized([160.0, 116.0], egui::Button::new(text));
-                                let tile = tile.on_hover_text(match l.opener {
-                                    Some(_) => "Open this vault",
-                                    None => "No app enabled \u{2014} Apps \u{25B8} Configure",
-                                });
-                                if let Some(idx) = l.opener {
-                                    if tile.clicked() {
-                                        action = ToolbarAction::LaunchApp {
-                                            sock: l.sock.clone(),
-                                            index: idx,
-                                        };
-                                        show_desktop = false; // launched → back to the app
-                                    }
-                                }
-                            }
-                        });
-                    }
-                });
+                    });
             }
         });
-        self.show_desktop = show_desktop;
 
         let clipped = self.ctx.tessellate(full.shapes, full.pixels_per_point);
         self.painter.paint_and_update_textures(
