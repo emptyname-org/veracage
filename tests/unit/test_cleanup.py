@@ -249,3 +249,103 @@ def test_cleanup_one_keeps_lock_on_failed_close(tmp_path):
         rc = cleanup.cleanup_one(p)
     assert rc == 5
     assert p.exists()
+
+
+# ------------------------------------------------- session lock (shared WS) --
+
+def _session_lock(tmp_path: Path, sid: str, volumes, user_uid="1000") -> Path:
+    """Write a session lock: one `volume=<dm>\t<label>` line per volume."""
+    lines = [f"user_uid={user_uid}"]
+    lines += [f"volume={dm}\t{label}" for dm, label in volumes]
+    p = tmp_path / f"session-{sid}.lock"
+    p.write_text("\n".join(lines) + "\n")
+    return p
+
+
+def test_parse_session_lock_roundtrip(tmp_path):
+    p = _session_lock(tmp_path, "a" * 16,
+                      [("veracage-aaaaaaaaaaaa", "Work"),
+                       ("veracage-bbbbbbbbbbbb", "Photos")])
+    owner, vols = cleanup.parse_session_lock(p)
+    assert owner == "1000"
+    assert vols == [("veracage-aaaaaaaaaaaa", "Work"),
+                    ("veracage-bbbbbbbbbbbb", "Photos")]
+
+
+def test_parse_session_lock_skips_malformed_volume_lines(tmp_path):
+    p = tmp_path / "s.lock"
+    p.write_text("user_uid=1000\nvolume=\nvolume=veracage-aaaaaaaaaaaa\ngarbage\n")
+    owner, vols = cleanup.parse_session_lock(p)
+    assert owner == "1000"
+    assert vols == [("veracage-aaaaaaaaaaaa", "")]   # empty dm skipped; label optional
+
+
+def test_cleanup_session_closes_every_dm(tmp_path):
+    p = _session_lock(tmp_path, "c" * 16,
+                      [("veracage-abc123abc123", "A"),
+                       ("veracage-def456def456", "B")])
+    ok = mock.MagicMock(returncode=0)
+    with mock.patch("veracage.cleanup.subprocess.run", return_value=ok) as r, \
+         mock.patch("veracage.cleanup.Path.exists", return_value=True):
+        rc = cleanup.cleanup_session(p)
+    assert rc == 0
+    closed = [c.args[0] for c in r.call_args_list]
+    assert ["cryptsetup", "close", "veracage-abc123abc123"] in closed
+    assert ["cryptsetup", "close", "veracage-def456def456"] in closed
+    assert not p.exists()   # lock dropped once all closed
+
+
+def test_cleanup_session_keeps_lock_if_a_close_fails(tmp_path):
+    """One EBUSY device ⇒ the session may be live ⇒ keep the lock (recovery)."""
+    p = _session_lock(tmp_path, "d" * 16,
+                      [("veracage-abc123abc123", "A"),
+                       ("veracage-def456def456", "B")])
+    busy = mock.MagicMock(returncode=5, stderr="device busy")
+    with mock.patch("veracage.cleanup.subprocess.run", return_value=busy), \
+         mock.patch("veracage.cleanup.Path.exists", return_value=True):
+        rc = cleanup.cleanup_session(p)
+    assert rc == 5
+    assert p.exists()
+
+
+def test_cleanup_session_refuses_garbage_dm(tmp_path):
+    p = _session_lock(tmp_path, "e" * 16, [("../../evil", "A")])
+    with mock.patch("veracage.cleanup.subprocess.run") as r:
+        rc = cleanup.cleanup_session(p)
+    assert rc == 2
+    r.assert_not_called()
+    assert p.exists()
+
+
+def test_cleanup_session_refuses_wrong_owner(tmp_path, monkeypatch):
+    monkeypatch.setenv("PKEXEC_UID", "1001")   # attacker, not the owner
+    p = _session_lock(tmp_path, "f" * 16, [("veracage-abc123abc123", "A")])
+    with mock.patch("veracage.cleanup.subprocess.run") as r:
+        rc = cleanup.cleanup_session(p)
+    assert rc == 2
+    r.assert_not_called()
+
+
+def test_cleanup_session_returns_0_when_missing(tmp_path):
+    assert cleanup.cleanup_session(tmp_path / "session-nope.lock") == 0
+
+
+def test_main_dispatches_to_cleanup_session(monkeypatch, tmp_path):
+    monkeypatch.setattr("veracage.cleanup.os.geteuid", lambda: 0)
+    monkeypatch.setattr("veracage.cleanup.LOCKS_DIR", tmp_path)
+    sid = "abcdef0123456789"
+    with mock.patch("veracage.cleanup.cleanup_session", return_value=0) as c:
+        cleanup.main(["--session", sid])
+    c.assert_called_once_with(tmp_path / f"session-{sid}.lock")
+
+
+def test_main_rejects_bad_session_id(monkeypatch, capsys):
+    monkeypatch.setattr("veracage.cleanup.os.geteuid", lambda: 0)
+    for bad in ["../x", "abc", "g" * 16, "ABCDABCDABCDABCD"]:
+        assert cleanup.main(["--session", bad]) == 2
+    assert "invalid session id" in capsys.readouterr().err
+
+
+def test_main_session_and_vault_hash_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        cleanup.main(["--session", "a" * 16, "--vault-hash", "b" * 16])
