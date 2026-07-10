@@ -12,7 +12,7 @@ use smithay::{
         calloop::EventLoop,
         winit::{platform::wayland::WindowAttributesWayland, window::WindowAttributes},
     },
-    utils::{Rectangle, Transform},
+    utils::{IsAlive, Rectangle, Transform},
 };
 
 use crate::State;
@@ -97,8 +97,37 @@ pub fn init_winit(
 
                 // A transient EGL/GL error (context loss, host-resize race, GL OOM)
                 // must skip the frame, not abort the compositor and every app.
+                let scale_f = output.current_scale().fractional_scale();
                 let render_err: Option<String> = match backend.bind() {
                     Ok((renderer, mut framebuffer)) => {
+                        // Drag-and-drop icon: composite the "ghost" at the cursor,
+                        // on top of the app windows, so a drag has visual feedback
+                        // (the drop itself works even without it). Cleared on drop.
+                        let dnd: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                            match &state.dnd_icon {
+                                Some(icon) if icon.surface.alive() => {
+                                    let cursor = state
+                                        .seat
+                                        .get_pointer()
+                                        .map(|p| p.current_location())
+                                        .unwrap_or_default();
+                                    let pos = (cursor + icon.offset.to_f64())
+                                        .to_physical(scale_f)
+                                        .to_i32_round();
+                                    smithay::backend::renderer::element::AsRenderElements::<
+                                        GlesRenderer,
+                                    >::render_elements(
+                                        &smithay::desktop::space::SurfaceTree::from_surface(
+                                            &icon.surface,
+                                        ),
+                                        renderer,
+                                        pos,
+                                        smithay::utils::Scale::from(scale_f),
+                                        1.0,
+                                    )
+                                }
+                                _ => Vec::new(),
+                            };
                         smithay::desktop::space::render_output::<
                             _,
                             WaylandSurfaceRenderElement<GlesRenderer>,
@@ -108,10 +137,10 @@ pub fn init_winit(
                             &output,
                             renderer,
                             &mut framebuffer,
-                            output.current_scale().fractional_scale() as f32,
+                            scale_f as f32,
                             0,
                             [&state.space],
-                            &[],
+                            &dnd,
                             &mut damage_tracker,
                             [0.1, 0.1, 0.1, 1.0],
                         )

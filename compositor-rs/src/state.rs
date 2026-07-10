@@ -90,6 +90,20 @@ pub struct State {
     /// files so app buttons appear/disappear as vaults open and close.
     pub leaders: Vec<crate::toolbar::LeaderApps>,
     pub leaders_scan_at: std::time::Duration,
+
+    /// The current drag-and-drop icon surface (the "ghost" that follows the
+    /// cursor during a DnD), set when a client starts a drag and cleared on drop.
+    /// Composited at the pointer each frame — without it a drag has no visual
+    /// feedback even though the drop itself works.
+    pub dnd_icon: Option<DndIcon>,
+}
+
+/// A drag-and-drop icon: the client's icon surface plus the offset from the
+/// cursor hotspot at which to draw it.
+#[derive(Debug)]
+pub struct DndIcon {
+    pub surface: WlSurface,
+    pub offset: Point<i32, Logical>,
 }
 
 impl State {
@@ -185,6 +199,7 @@ impl State {
             host_clipboard: None,
             toolbar: None,
             toolbar_failed: false,
+            dnd_icon: None,
             leaders: Vec::new(),
             leaders_scan_at: std::time::Duration::ZERO,
         }

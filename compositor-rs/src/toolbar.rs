@@ -21,7 +21,7 @@ use std::sync::Arc;
 /// placement, since a point and a logical pixel are the same size). The sandbox
 /// space is offset down by this much (see xdg_shell) so app titlebars aren't
 /// hidden under the overlay, and the strip is gated from sandbox input.
-pub const TOOLBAR_HEIGHT: i32 = 34;
+pub const TOOLBAR_HEIGHT: i32 = 44;
 
 /// What a menu selection maps to. Clipboard actions reuse the in-process bridge
 /// (identical to the Ctrl+Alt+V/C keybinds); LaunchApp asks a vault's leader (over
@@ -144,6 +144,17 @@ impl Toolbar {
         } else {
             egui::Visuals::light()
         });
+        // Fonts ~50% bigger, matching the agent windows (theme::bump_fonts).
+        // Absolute sizes, so calling every frame is idempotent.
+        self.ctx.style_mut(|s| {
+            use egui::FontFamily::{Monospace, Proportional};
+            use egui::{FontId, TextStyle};
+            s.text_styles.insert(TextStyle::Small, FontId::new(14.0, Proportional));
+            s.text_styles.insert(TextStyle::Body, FontId::new(18.0, Proportional));
+            s.text_styles.insert(TextStyle::Button, FontId::new(18.0, Proportional));
+            s.text_styles.insert(TextStyle::Heading, FontId::new(28.0, Proportional));
+            s.text_styles.insert(TextStyle::Monospace, FontId::new(18.0, Monospace));
+        });
         let (pw, ph) = (size_px.0.max(1) as f32, size_px.1.max(1) as f32);
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -246,7 +257,7 @@ impl Toolbar {
                             ui.add_space(ui.available_height() * 0.38);
                             ui.label(
                                 egui::RichText::new("\u{1F512}  No vault open")
-                                    .size(20.0)
+                                    .size(28.0)
                                     .weak(),
                             );
                             ui.add_space(4.0);
@@ -263,9 +274,9 @@ impl Toolbar {
                                     "\u{1F4C1}\n{}",
                                     l.label
                                 ))
-                                .size(15.0);
+                                .size(20.0);
                                 let tile =
-                                    ui.add_sized([132.0, 96.0], egui::Button::new(text));
+                                    ui.add_sized([160.0, 116.0], egui::Button::new(text));
                                 let tile = tile.on_hover_text(match l.opener {
                                     Some(_) => "Open this vault",
                                     None => "No app enabled \u{2014} Apps \u{25B8} Configure",

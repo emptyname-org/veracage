@@ -3,17 +3,18 @@ mod decoration;
 mod xdg_shell;
 
 use crate::State;
+use crate::state::DndIcon;
 
 //
 // Wl Seat
 //
 
-use smithay::input::dnd::{DnDGrab, DndGrabHandler, GrabType, Source};
+use smithay::input::dnd::{DnDGrab, DndGrabHandler, DndTarget, GrabType, Source};
 use smithay::input::pointer::Focus;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::Serial;
+use smithay::utils::{Logical, Point, Serial};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::fractional_scale::{FractionalScaleHandler, with_fractional_scale};
 use smithay::wayland::output::OutputHandler;
@@ -92,16 +93,34 @@ impl PrimarySelectionHandler for State {
     }
 }
 
-impl DndGrabHandler for State {}
+impl DndGrabHandler for State {
+    // Remove the drag icon once the drag ends (drop or cancel) — otherwise the
+    // ghost would linger under the cursor after the DnD completes.
+    fn dropped(
+        &mut self,
+        _target: Option<DndTarget<'_, Self>>,
+        _validated: bool,
+        _seat: Seat<Self>,
+        _location: Point<f64, Logical>,
+    ) {
+        self.dnd_icon = None;
+    }
+    fn cancelled(&mut self, _seat: Seat<Self>, _location: Point<f64, Logical>) {
+        self.dnd_icon = None;
+    }
+}
 impl WaylandDndGrabHandler for State {
     fn dnd_requested<S: Source>(
         &mut self,
         source: S,
-        _icon: Option<WlSurface>,
+        icon: Option<WlSurface>,
         seat: Seat<Self>,
         serial: Serial,
         type_: GrabType,
     ) {
+        // Track the icon surface so the render loop can composite it at the
+        // cursor (the drag's visual feedback; the drop itself works regardless).
+        self.dnd_icon = icon.map(|surface| DndIcon { surface, offset: (0, 0).into() });
         match type_ {
             GrabType::Pointer => {
                 let ptr = seat.get_pointer().unwrap();
