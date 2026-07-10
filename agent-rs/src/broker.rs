@@ -54,8 +54,11 @@ pub fn run_broker() -> ! {
         open_req: dir.join("open.req"),
     };
 
-    // The front door: pick + unlock the first vault (brings up the compositor).
-    b.open_flow();
+    // Compositor-first: bring up the EMPTY compositor (the front door) — no
+    // startup picker. File → Open then mounts a vault. If no apps are configured
+    // yet, open the Configure picker so the user can set one up (item 2).
+    b.ensure_compositor();
+    b.maybe_configure();
 
     loop {
         b.reap();
@@ -106,21 +109,10 @@ impl Broker {
         let vault = path.to_string_lossy().into_owned();
         let name = base(&vault);
 
-        // Passphrase via a fresh process; stdout is the raw passphrase, exit!=0 =
-        // cancelled. Wrapped in Zeroizing so the captured bytes are wiped on drop.
-        let exe = std::env::current_exe()
-            .unwrap_or_else(|_| PathBuf::from("veracage-agent"));
-        let out = match Command::new(&exe).arg("_passphrase").arg(&name).output() {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("veracage: passphrase dialog: {e}");
-                return;
-            }
+        // Collect the volume passphrase. Wrapped in Zeroizing so it's wiped on drop.
+        let Some(mut pass) = prompt_passphrase(&name) else {
+            return; // cancelled or no prompt available
         };
-        if !out.status.success() {
-            return; // user cancelled the passphrase
-        }
-        let mut pass = Zeroizing::new(out.stdout);
 
         let Some(bin) = veracage_bin() else {
             eprintln!("veracage: cannot find the veracage CLI next to this app; refusing to send the passphrase.");
@@ -151,6 +143,7 @@ impl Broker {
             "open" => self.open_flow(),
             "configure" => self.spawn_dialog("configure"),
             "settings" => self.spawn_dialog("_settings"),
+            "about" => self.spawn_dialog("_about"),
             "close" => self.close_last(),
             "import" | "export" => {
                 // File transfer is the shared Exchange folder — drop files in on
@@ -164,6 +157,32 @@ impl Broker {
                 }
             }
             other => eprintln!("veracage: unknown command {other:?}"),
+        }
+    }
+
+    /// Bring up the empty compositor (front door) if it isn't running — via the
+    /// CLI, which pkexecs the helper's `--spawn-compositor` and waits for it. This
+    /// blocks on the polkit prompt + the compositor coming up. Passes the config
+    /// theme through so the compositor matches the agent windows.
+    fn ensure_compositor(&mut self) {
+        let Some(bin) = veracage_bin() else {
+            eprintln!("veracage: cannot find the veracage CLI; no compositor.");
+            return;
+        };
+        let mut c = Command::new(bin);
+        c.arg("_up");
+        if crate::config::load().theme == "dark" {
+            c.env("VERACAGE_THEME", "dark");
+        }
+        if let Err(e) = c.status() {
+            eprintln!("veracage: could not start the compositor: {e}");
+        }
+    }
+
+    /// Item 2: with no apps enabled yet, open the Configure picker after load.
+    fn maybe_configure(&mut self) {
+        if crate::config::load().apps.is_empty() {
+            self.spawn_dialog("configure");
         }
     }
 
@@ -218,6 +237,31 @@ fn base(p: &str) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or(p)
         .to_string()
+}
+
+/// Prompt for the volume passphrase. Prefer the native KDE dialog
+/// (`kdialog --password`) so it matches the polkit prompt's look; fall back to our
+/// own hardened egui dialog (`veracage-agent _passphrase`) if kdialog is absent.
+/// Returns None on cancel. The bytes are Zeroizing-wrapped for wipe-on-drop.
+fn prompt_passphrase(name: &str) -> Option<Zeroizing<Vec<u8>>> {
+    match Command::new("kdialog")
+        .arg("--password")
+        .arg(format!("Enter the passphrase for {name}"))
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let mut p = o.stdout;
+            while matches!(p.last(), Some(b'\n' | b'\r')) {
+                p.pop();
+            }
+            return Some(Zeroizing::new(p));
+        }
+        Ok(_) => return None, // user cancelled the kdialog prompt
+        Err(_) => {}          // kdialog not installed — fall through to egui
+    }
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("veracage-agent"));
+    let out = Command::new(exe).arg("_passphrase").arg(name).output().ok()?;
+    out.status.success().then(|| Zeroizing::new(out.stdout))
 }
 
 fn human_runtime_dir() -> PathBuf {

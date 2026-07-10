@@ -167,8 +167,12 @@ pub fn init_winit(
                     state.leaders_scan_at = now;
                 }
                 let scale = output.current_scale().fractional_scale();
+                // The desktop indicator shows only with an empty space; a mapped
+                // sandbox window means the app IS the indication (and a filled
+                // CentralPanel would paint over it).
+                let has_windows = state.space.elements().next().is_some();
                 let action = if let Some(tb) = state.toolbar.as_mut() {
-                    tb.render((size.w, size.h), scale, &state.leaders)
+                    tb.render((size.w, size.h), scale, &state.leaders, has_windows)
                 } else {
                     crate::toolbar::ToolbarAction::None
                 };

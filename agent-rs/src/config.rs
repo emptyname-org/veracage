@@ -43,16 +43,37 @@ struct DefaultSection {
     gpu: bool,
     #[serde(default = "default_suspend")]
     suspend_action: String,
+    #[serde(default = "default_theme")]
+    theme: String,
+    #[serde(default = "default_true")]
+    exchange: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exchange_dir: Option<String>,
 }
 
 impl Default for DefaultSection {
     fn default() -> Self {
-        DefaultSection { last_used_app: None, gpu: false, suspend_action: default_suspend() }
+        DefaultSection {
+            last_used_app: None,
+            gpu: false,
+            suspend_action: default_suspend(),
+            theme: default_theme(),
+            exchange: true,
+            exchange_dir: None,
+        }
     }
 }
 
 fn default_suspend() -> String {
     "dismount".into()
+}
+
+fn default_theme() -> String {
+    "light".into()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize)]
@@ -72,6 +93,9 @@ pub struct Config {
     pub last_used_app: Option<String>,
     pub gpu: bool,
     pub suspend_action: String,
+    pub theme: String,             // "light" | "dark" (| "system", future)
+    pub exchange: bool,            // host<->vault shared folder on/off
+    pub exchange_dir: Option<String>,
     volumes: BTreeMap<String, toml::Value>, // opaque pass-through
 }
 
@@ -82,6 +106,9 @@ impl Config {
             last_used_app: None,
             gpu: false,
             suspend_action: "dismount".into(),
+            theme: "light".into(),
+            exchange: true,
+            exchange_dir: None,
             volumes: BTreeMap::new(),
         }
     }
@@ -117,11 +144,21 @@ pub fn load() -> Config {
             "dismount".into()
         }
     };
+    let theme = match raw.default.theme.as_str() {
+        "light" | "dark" | "system" => raw.default.theme,
+        other => {
+            eprintln!("veracage: invalid theme {other:?}; using 'light'");
+            "light".into()
+        }
+    };
     Config {
         apps,
         last_used_app: raw.default.last_used_app,
         gpu: raw.default.gpu,
         suspend_action,
+        theme,
+        exchange: raw.default.exchange,
+        exchange_dir: raw.default.exchange_dir,
         volumes: raw.volumes,
     }
 }
@@ -150,6 +187,9 @@ pub fn save(cfg: &Config) -> io::Result<PathBuf> {
             last_used_app: cfg.last_used_app.clone(),
             gpu: cfg.gpu,
             suspend_action: cfg.suspend_action.clone(),
+            theme: cfg.theme.clone(),
+            exchange: cfg.exchange,
+            exchange_dir: cfg.exchange_dir.clone(),
         },
         apps,
         volumes: cfg.volumes.clone(),

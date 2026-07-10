@@ -34,7 +34,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .apps import App
+from .apps import App, is_file_manager
 from .sandbox import bwrap_command
 from .wayland import COMPOSITOR_RUNTIME, COMPOSITOR_SOCKET, compositor_is_up
 
@@ -235,12 +235,19 @@ def _publish_apps(state: _LeaderState) -> socket.socket | None:
         srv.listen(4)
         srv.setblocking(False)
         # Plain, dependency-free format the Rust compositor parses:
-        #   <sock filename>\n<volume label>\n<app name>\n<app name>\n...
+        #   <sock filename>\n<volume label>\n<opener index>\n<app name>\n<app name>...
         # Sanitize names the same way as the label: config is human-owned, but a
         # newline in a name would desync this newline-delimited protocol.
         names = [_sanitize_label(str(a.get("name") or a.get("exec") or "app"))
                  for a in state.app_specs]
-        body = [sock_path.name, state.volume_label or "Vault", *names]
+        # The "opener" — which enabled app the compositor's desktop tile launches
+        # to open this vault. First file manager, else the first app, else -1.
+        opener = next(
+            (i for i, a in enumerate(state.app_specs)
+             if is_file_manager(str(a.get("exec") or ""))),
+            0 if state.app_specs else -1,
+        )
+        body = [sock_path.name, state.volume_label or "Vault", str(opener), *names]
         _apps_file_path(state).write_text("\n".join(body) + "\n")
         return srv
     except OSError as e:

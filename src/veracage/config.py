@@ -53,8 +53,15 @@ class Config:
     last_used_app: str | None = None
     gpu: bool = False                     # /dev/dri passthrough default (off)
     suspend_action: str = "dismount"      # "dismount" | "ignore"
-    exchange: bool = True                 # host<->vault shared folder (~/Veracage/Exchange)
+    theme: str = "light"                  # compositor/agent egui theme: light|dark|system
+    exchange: bool = True                 # host<->vault shared folder
+    exchange_dir: str | None = None       # default ~/Veracage/Exchange when unset
     volumes: dict[str, VolumeConfig] = field(default_factory=dict)
+
+    def exchange_path(self) -> Path:
+        """The host exchange directory (default ~/Veracage/Exchange)."""
+        return (Path(self.exchange_dir).expanduser() if self.exchange_dir
+                else Path.home() / "Veracage" / "Exchange")
 
     def is_empty(self) -> bool:
         return not self.apps
@@ -122,6 +129,11 @@ def load() -> Config:
         last = None
     gpu = _coerce_bool(default.get("gpu", False), "default.gpu")
     exchange = _coerce_bool(default.get("exchange", True), "default.exchange")
+    exchange_dir = default.get("exchange_dir") or None
+    theme = default.get("theme", "light")
+    if theme not in ("light", "dark", "system"):
+        print(f"veracage: invalid theme {theme!r}; using 'light'", file=sys.stderr)
+        theme = "light"
     suspend_action = default.get("suspend_action", "dismount")
     if suspend_action not in ("dismount", "ignore"):
         print(f"veracage: invalid suspend_action {suspend_action!r} "
@@ -151,7 +163,8 @@ def load() -> Config:
                 backend=bval,
             )
     return Config(apps=apps, last_used_app=last, gpu=gpu,
-                  suspend_action=suspend_action, exchange=exchange, volumes=volumes)
+                  suspend_action=suspend_action, theme=theme, exchange=exchange,
+                  exchange_dir=exchange_dir, volumes=volumes)
 
 
 def save(cfg: Config) -> Path:
@@ -161,9 +174,13 @@ def save(cfg: Config) -> Path:
                         "", "[default]"]
     if cfg.last_used_app:
         lines += [f'last_used_app  = "{_esc(cfg.last_used_app)}"']
-    lines += [f"gpu            = {_toml_bool(cfg.gpu)}",
+    lines += [f'theme          = "{_esc(cfg.theme)}"',
+              f"gpu            = {_toml_bool(cfg.gpu)}",
               f"exchange       = {_toml_bool(cfg.exchange)}",
-              f'suspend_action = "{_esc(cfg.suspend_action)}"',
+              f'suspend_action = "{_esc(cfg.suspend_action)}"']
+    if cfg.exchange_dir:
+        lines += [f'exchange_dir   = "{_esc(cfg.exchange_dir)}"']
+    lines += [
               ""]
     for key, a in cfg.apps.items():
         lines += [f"[apps.{key}]",

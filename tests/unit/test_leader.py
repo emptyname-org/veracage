@@ -178,13 +178,43 @@ def test_publish_apps_writes_socket_and_file(tmp_path, monkeypatch):
         lines = (tmp_path / "app-deadbeef.apps").read_text().splitlines()
         assert lines[0] == "app-deadbeef.sock"     # compositor connects to this
         assert lines[1] == "MyVol"                 # volume label (window title)
-        assert lines[2:] == ["Kate", "Okular"]     # button labels, in order
+        assert lines[2] == "0"                     # opener index (no fm -> first app)
+        assert lines[3:] == ["Kate", "Okular"]     # button labels, in order
         assert (tmp_path / "app-deadbeef.sock").is_socket()
     finally:
         srv.close()
         leader._unpublish_apps(st)
     assert not (tmp_path / "app-deadbeef.sock").exists()
     assert not (tmp_path / "app-deadbeef.apps").exists()
+
+
+def test_publish_apps_opener_prefers_file_manager(tmp_path, monkeypatch):
+    monkeypatch.setattr(leader, "COMPOSITOR_RUNTIME", tmp_path)
+    st = leader._LeaderState(
+        mountpoint="/run/veracage/deadbeef",
+        volume_label="MyVol",
+        app_specs=[{"name": "Kate", "exec": "kate", "args": []},
+                   {"name": "Files", "exec": "/usr/bin/dolphin", "args": []}])
+    srv = leader._publish_apps(st)
+    try:
+        lines = (tmp_path / "app-deadbeef.apps").read_text().splitlines()
+        assert lines[2] == "1"                     # dolphin is the opener, not kate
+    finally:
+        srv.close()
+        leader._unpublish_apps(st)
+
+
+def test_publish_apps_opener_minus_one_when_no_apps(tmp_path, monkeypatch):
+    monkeypatch.setattr(leader, "COMPOSITOR_RUNTIME", tmp_path)
+    st = leader._LeaderState(
+        mountpoint="/run/veracage/deadbeef", volume_label="Empty", app_specs=[])
+    srv = leader._publish_apps(st)
+    try:
+        lines = (tmp_path / "app-deadbeef.apps").read_text().splitlines()
+        assert lines[2] == "-1"                    # no app -> no opener
+    finally:
+        srv.close()
+        leader._unpublish_apps(st)
 
 
 def test_accept_app_launch_execs_by_index(tmp_path, monkeypatch):

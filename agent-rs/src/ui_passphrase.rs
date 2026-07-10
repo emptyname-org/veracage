@@ -27,7 +27,10 @@ pub fn run(vault_name: String) -> Result<(), eframe::Error> {
     eframe::run_native(
         "veracage-passphrase",
         options,
-        Box::new(move |_cc| Ok(Box::new(PassphraseDialog::new(vault_name)) as Box<dyn eframe::App>)),
+        Box::new(move |cc| {
+            crate::theme::apply(&cc.egui_ctx, &crate::config::load().theme);
+            Ok(Box::new(PassphraseDialog::new(vault_name)) as Box<dyn eframe::App>)
+        }),
     )
 }
 

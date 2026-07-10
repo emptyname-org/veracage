@@ -57,6 +57,7 @@ const ALLOWED_SETENV: &[&str] = &[
     "XDG_SESSION_TYPE",
     "DISPLAY",
     "LANG",
+    "VERACAGE_THEME",
 ];
 
 /// Trusted continuation, pinned at build time (the Makefile passes

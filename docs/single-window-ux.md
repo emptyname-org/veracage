@@ -31,9 +31,12 @@ compositor — hosts the UI, and delegates the host-side actions to the other.
 - **The human side becomes a windowless broker.** No standing window; it pops only
   transient dialogs (volume picker, passphrase prompt) and runs `pkexec` /
   `veracage open`, driven by commands from the compositor.
-- **The front door is a dialog, not a window.** Launching Veracage (app-menu icon,
-  or file-manager "Open with" on a `.vc`) triggers: volume picker → passphrase
-  prompt → `veracage open` → the compositor window appears. Nothing lingers.
+- **The front door is the empty compositor window.** Launching Veracage brings up
+  the compositor with its menu bar and no vault; **File → Open vault…** then runs
+  the volume picker → passphrase → `veracage open`. (Interim in the current build:
+  the broker pops the picker at launch instead; the empty-window front door — and
+  removing that startup picker — lands in the UI pass, see below.) A `.vc`
+  "Open with" opens straight to the passphrase, skipping the picker.
 
 ### Menu layout
 
@@ -151,8 +154,9 @@ a future config knob for no-plaintext-at-rest.
    dropdown input-capture via `wants_pointer`.
 2. **DONE (2026-07-09).** Agent → windowless broker + transient one-shot dialogs
    (`_passphrase`, `_settings`, `configure` as fresh processes since winit can't
-   reopen an EventLoop); `ui_launcher.rs` deleted; single-instance pid guard; the
-   front door is now the broker's `rfd` picker + passphrase dialog.
+   reopen an EventLoop); `ui_launcher.rs` deleted; single-instance pid guard. Front
+   door is *interim* the broker's `rfd` picker at launch (the empty-compositor front
+   door is the target — see Deferred).
 3. **DONE (2026-07-09).** File transfer = the idmapped **Exchange folder** (above),
    which *replaced* the token-gated `veracage-io` plan entirely (net deletion).
    Proven by `spike10` (idmap on a plain host dir, both-way rw + write-back owner)
@@ -164,3 +168,19 @@ a future config knob for no-plaintext-at-rest.
 Visual/interactive verification (menu feel, dropdown input capture over the sandbox,
 the transient dialogs, the open flow) needs the user's KDE box; the build + the
 headless compositor smoke are VPS-tested.
+
+## Deferred (the UI pass) — empty-compositor front door
+
+The model above puts the front door on the empty compositor window; the current
+build still pops the picker at launch. To land it (and delete that startup picker):
+
+- Capability exists: helper `--spawn-compositor` brings the compositor up with no
+  vault; the menu already handles the empty state (`(open a vault first)`).
+- Change: the broker's startup does **ensure-compositor-up** (spawn
+  `--spawn-compositor` if not running) instead of the immediate `open_flow()` — the
+  picker then fires only on the File → Open command (`open_flow` is unchanged, just
+  no longer called at startup).
+- **Caveat:** spawning the compositor is a `pkexec`, so a cold launch prompts polkit
+  once. Keep the compositor **persistent** across launches (spawn once; later
+  launches just focus it → no re-prompt); `auth_self_keep` covers a vault opened
+  shortly after. Don't lazily defer the spawn to first-open, or launch shows nothing.

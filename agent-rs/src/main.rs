@@ -12,6 +12,8 @@ mod apps;
 mod broker;
 mod config;
 mod proto;
+mod theme;
+mod ui_about;
 mod ui_config;
 mod ui_passphrase;
 mod ui_settings;
@@ -66,6 +68,17 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("veracage-agent: settings: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // About window: `veracage-agent _about` (Help → About Veracage).
+    if args.get(1).map(String::as_str) == Some("_about") {
+        return match ui_about::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("veracage-agent: about: {e}");
                 ExitCode::FAILURE
             }
         };

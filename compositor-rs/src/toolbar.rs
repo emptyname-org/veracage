@@ -38,11 +38,14 @@ pub enum ToolbarAction {
 }
 
 /// One open vault's launchers, discovered from `/run/veracage/rt/<id>.apps`:
-/// the app socket to poke, the volume label (window title), and the enabled app
-/// names (button labels, in order).
+/// the app socket to poke, the volume label (window title), the enabled app
+/// names (button labels, in order), and the "opener" — the app index the desktop
+/// tile launches to open the vault (a file manager if enabled, else the first app;
+/// `None` if the vault has no enabled apps).
 pub struct LeaderApps {
     pub sock: std::path::PathBuf,
     pub label: String,
+    pub opener: Option<usize>,
     pub names: Vec<String>,
 }
 
@@ -53,6 +56,9 @@ pub struct Toolbar {
     pointer: egui::Pos2,
     /// Reserved strip height, in logical points, at the top of the window.
     pub height: f32,
+    /// Dark vs light egui visuals. Default LIGHT; the human side passes
+    /// `VERACAGE_THEME=dark` (from config) when it spawns the compositor.
+    dark: bool,
 }
 
 impl Toolbar {
@@ -78,6 +84,7 @@ impl Toolbar {
             events: Vec::new(),
             pointer: egui::Pos2::ZERO,
             height: TOOLBAR_HEIGHT as f32,
+            dark: std::env::var("VERACAGE_THEME").as_deref() == Ok("dark"),
         })
     }
 
@@ -128,9 +135,15 @@ impl Toolbar {
         size_px: (i32, i32),
         scale: f64,
         leaders: &[LeaderApps],
+        has_windows: bool,
     ) -> ToolbarAction {
         let ppp = (scale as f32).max(1.0);
         self.ctx.set_pixels_per_point(ppp);
+        self.ctx.set_visuals(if self.dark {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        });
         let (pw, ph) = (size_px.0.max(1) as f32, size_px.1.max(1) as f32);
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -198,24 +211,78 @@ impl Toolbar {
                                     }
                                 }
                             }
-                        });
-                        ui.menu_button("Settings", |ui| {
+                            // Configure the enabled-app set — last line of Apps.
+                            ui.separator();
                             if ui.button("Configure apps\u{2026}").clicked() {
                                 action = ToolbarAction::Command("configure");
                                 ui.close_menu();
                             }
+                        });
+                        ui.menu_button("Settings", |ui| {
                             if ui.button("Settings\u{2026}").clicked() {
                                 action = ToolbarAction::Command("settings");
                                 ui.close_menu();
                             }
                         });
                         ui.menu_button("Help", |ui| {
-                            ui.label("Clipboard: Ctrl+Alt+V paste \u{2022} Ctrl+Alt+C copy");
-                            ui.separator();
-                            ui.label("Veracage");
+                            if ui.button("About Veracage\u{2026}").clicked() {
+                                action = ToolbarAction::Command("about");
+                                ui.close_menu();
+                            }
                         });
                     });
                 });
+
+            // Desktop — shown ONLY when no sandbox window is mapped (otherwise the
+            // filled CentralPanel would paint over the app windows, since egui is
+            // composited AFTER the sandbox surfaces into the same framebuffer). It
+            // is the mounted-volume indicator: with no vault it prompts to open one;
+            // with vaults mounted it shows a clickable tile per vault that launches
+            // the vault's opener (its file manager) so the vault is never invisible.
+            if !has_windows {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if leaders.is_empty() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(ui.available_height() * 0.38);
+                            ui.label(
+                                egui::RichText::new("\u{1F512}  No vault open")
+                                    .size(20.0)
+                                    .weak(),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("File \u{25B8} Open vault\u{2026}").weak(),
+                            );
+                        });
+                    } else {
+                        ui.add_space(24.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
+                            for l in leaders {
+                                let text = egui::RichText::new(format!(
+                                    "\u{1F4C1}\n{}",
+                                    l.label
+                                ))
+                                .size(15.0);
+                                let tile =
+                                    ui.add_sized([132.0, 96.0], egui::Button::new(text));
+                                let tile = tile.on_hover_text(match l.opener {
+                                    Some(_) => "Open this vault",
+                                    None => "No app enabled \u{2014} Apps \u{25B8} Configure",
+                                });
+                                if let Some(idx) = l.opener {
+                                    if tile.clicked() {
+                                        action = ToolbarAction::LaunchApp {
+                                            sock: l.sock.clone(),
+                                            index: idx,
+                                        };
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+            }
         });
 
         let clipped = self.ctx.tessellate(full.shapes, full.pixels_per_point);
@@ -297,10 +364,15 @@ pub fn scan_leaders() -> Vec<LeaderApps> {
             continue;
         }
         let label = lines.next().unwrap_or("Vault").to_string();
+        // Opener index: which app the desktop tile launches. `-1` (or an
+        // out-of-range value, checked once names are known) means "no opener".
+        let opener_raw: i64 = lines.next().and_then(|s| s.trim().parse().ok()).unwrap_or(-1);
         let names: Vec<String> = lines.filter(|l| !l.is_empty()).map(str::to_string).collect();
+        let opener = usize::try_from(opener_raw).ok().filter(|&i| i < names.len());
         out.push(LeaderApps {
             sock: runtime.join(sockname),
             label,
+            opener,
             names,
         });
     }

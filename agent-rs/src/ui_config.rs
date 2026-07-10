@@ -29,7 +29,10 @@ pub fn run_configure() -> Result<Outcome, eframe::Error> {
     eframe::run_native(
         "veracage-configure",
         options,
-        Box::new(move |_cc| Ok(Box::new(app) as Box<dyn eframe::App>)),
+        Box::new(move |cc| {
+            crate::theme::apply(&cc.egui_ctx, &config::load().theme);
+            Ok(Box::new(app) as Box<dyn eframe::App>)
+        }),
     )?;
     let out = std::mem::take(&mut *outcome.lock().unwrap());
     Ok(out)
@@ -100,6 +103,17 @@ fn basename(s: &str) -> String {
         .to_string()
 }
 
+/// Known file-manager binaries (keep in sync with FILE_MANAGERS in cli.py). Used
+/// to nudge the user to enable one — it's what opens the vault on load.
+const FILE_MANAGERS: &[&str] = &[
+    "dolphin", "nautilus", "nemo", "thunar", "pcmanfm", "pcmanfm-qt",
+    "caja", "konqueror", "krusader", "nnn", "ranger",
+];
+
+fn is_file_manager(exec: &str) -> bool {
+    FILE_MANAGERS.contains(&basename(exec).as_str())
+}
+
 fn key_for(exec: &str, taken: &HashSet<String>) -> String {
     let base: String = basename(exec)
         .to_lowercase()
@@ -139,6 +153,20 @@ impl eframe::App for ConfigApp {
                 "Any installed program can be added. It runs against the vault,\n\
                  confined by the sandbox (no host files, no network).",
             );
+            // Nudge: a file manager is what opens the vault on load — make sure one
+            // is enabled.
+            let have_fm = self.apps.iter().any(|a| is_file_manager(&a.exec));
+            if have_fm {
+                ui.label(egui::RichText::new(
+                    "\u{1F4C1} A file manager is enabled — it opens the vault on load.",
+                ).weak());
+            } else {
+                ui.colored_label(
+                    egui::Color32::from_rgb(180, 130, 40),
+                    "\u{1F4C1} Add a file manager (e.g. Dolphin) to browse the vault \
+                     — it opens automatically when a vault loads.",
+                );
+            }
             ui.separator();
 
             // Add row
@@ -187,7 +215,8 @@ impl eframe::App for ConfigApp {
                         } else {
                             "  (not installed)"
                         };
-                        ui.label(format!("{}  —  {}{}{}", a.name, a.exec, args, missing));
+                        let tag = if is_file_manager(&a.exec) { "\u{1F4C1} " } else { "" };
+                        ui.label(format!("{}{}  —  {}{}{}", tag, a.name, a.exec, args, missing));
                     });
                 }
                 if let Some(i) = remove {

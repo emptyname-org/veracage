@@ -3,6 +3,19 @@
 Ideas deliberately deferred. Not commitments; each needs a design pass before
 it's built. Keep the bar high: the vault side stays a simple executor.
 
+## Before the first GitHub push (sequenced)
+
+1. **UI fixes** — polish the single-window UX on the real box; add the
+   empty-compositor front door (see `single-window-ux.md` §Deferred), which lets us
+   delete the startup picker.
+2. **Code-cleanup / deletion pass** — after the UI fixes: cut what the redesign made
+   obsolete (dead paths superseded by the compositor/broker/exchange). Favour net
+   deletion; propose the removals as a list before cutting.
+3. **Naming review** — the vocabulary is still provisional (`glossary.md`), incl. the
+   product name; settle it before publishing.
+
+Then push.
+
 ## Persistent app-settings store (opt-in)
 
 **Idea.** A small, veracage-owned encrypted store — separate from the user's

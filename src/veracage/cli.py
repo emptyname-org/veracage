@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from . import cleanup, config, configure, leader
+from .apps import FILE_MANAGERS
 from .sandbox import bwrap_command  # noqa: F401  (kept for downstream tests)
 
 # Privileged helpers. An install (`make install`) sets VERACAGE_HELPER /
@@ -62,7 +63,6 @@ def _default_compositor() -> str:
 
 COMPOSITOR_PATH = os.environ.get("VERACAGE_COMPOSITOR", _default_compositor())
 
-
 # Env vars to forward through pkexec (which strips the environment).
 # WAYLAND_DISPLAY + XDG_RUNTIME_DIR are required for the nested compositor to
 # reach the host compositor and place its socket; the rest are useful for
@@ -73,6 +73,7 @@ _FORWARD_ENV = (
     "XDG_SESSION_TYPE",
     "DISPLAY",
     "LANG",
+    "VERACAGE_THEME",   # compositor egui theme (light default; "dark" opts in)
 )
 
 
@@ -103,6 +104,32 @@ def cmd_compositor(args: argparse.Namespace) -> int:
     os.execv(resolved, [resolved, "--socket", args.socket])
 
 
+def cmd_up(args: argparse.Namespace) -> int:
+    """Bring up the persistent compositor with NO vault — the empty front door.
+    Idempotent (a no-op if it's already running). One pkexec; the polkit agent
+    prompts. Blocks until the compositor's socket appears so callers can proceed."""
+    from . import wayland
+    if wayland.compositor_is_up():
+        return 0
+    unit = f"veracage-compositor-{secrets.token_hex(3)}.service"
+    cmd = [
+        "systemd-run", "--user", "--collect", "--quiet",
+        f"--unit={unit}", "--description=Veracage compositor",
+        "pkexec", HELPER_PATH, "--spawn-compositor", *_forward_env_args(),
+        "--", "_compositor", "--socket", "wl-vc",
+    ]
+    rc = subprocess.run(cmd).returncode
+    if rc != 0:
+        print(f"veracage: could not start the compositor (rc={rc}).", file=sys.stderr)
+        return rc
+    try:
+        wayland.wait_for_compositor()
+    except Exception as e:  # noqa: BLE001 - surface a bring-up timeout cleanly
+        print(f"veracage: compositor did not come up: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
 # ----------------------------------------------------------- open --------
 
 def cmd_open(args: argparse.Namespace) -> int:
@@ -114,8 +141,7 @@ def cmd_open(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
 
-    # Every enabled app becomes a toolbar launcher; nothing is auto-launched
-    # unless one is named explicitly (`veracage open <vault> <app>`).
+    # Every enabled app becomes a toolbar launcher.
     apps_list = [{"name": a.name, "exec": a.exec, "args": a.args}
                  for a in cfg.apps.values()]
     first_app = None
@@ -128,6 +154,13 @@ def cmd_open(args: argparse.Namespace) -> int:
             return 2
         a = cfg.apps[args.app]
         first_app = {"name": a.name, "exec": a.exec, "args": a.args}
+    else:
+        # No app named: auto-launch a file manager if one is enabled, so opening a
+        # vault lands you in a browser of its contents (nothing else auto-launches).
+        fm = next((a for a in cfg.apps.values()
+                   if Path(a.exec).name in FILE_MANAGERS), None)
+        if fm is not None:
+            first_app = {"name": fm.name, "exec": fm.exec, "args": fm.args}
 
     vault = Path(args.vault).resolve()
     if not vault.exists():   # file or block device; the helper validates which
@@ -212,7 +245,7 @@ def cmd_open(args: argparse.Namespace) -> int:
     # pass it to the helper, which idmap-mounts it into the sandbox at /exchange.
     # The helper re-validates ownership; disabled per-config via `exchange = false`.
     if cfg.exchange:
-        xdir = Path.home() / "Veracage" / "Exchange"
+        xdir = cfg.exchange_path()
         try:
             xdir.mkdir(parents=True, exist_ok=True)
             xdir.chmod(0o700)
@@ -302,6 +335,9 @@ def main() -> int:
     p_comp = sub.add_parser("_compositor", help=argparse.SUPPRESS)
     p_comp.add_argument("--socket", required=True)
     p_comp.set_defaults(func=cmd_compositor)
+
+    p_up = sub.add_parser("_up", help=argparse.SUPPRESS)  # bring up the empty compositor
+    p_up.set_defaults(func=cmd_up)
 
     p_list = sub.add_parser("list", help="list apps in a running session")
     p_list.add_argument("vault")
