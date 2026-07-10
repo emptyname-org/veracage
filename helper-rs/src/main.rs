@@ -48,6 +48,13 @@ const VAULT_USER: &str = "veracage";
 /// `wl-vc` Wayland socket and `compositor.pid`.
 const COMPOSITOR_RUNTIME: &str = "/run/veracage/rt";
 
+/// Shared-workspace model (docs/shared-workspace-redesign.md, Phase 2): the ONE
+/// session's private mount NS holds every open volume under this tmpfs, each at
+/// `<WORKSPACE>/<label>`. A tmpfs so the whole tree (and every idmap mount on it)
+/// vanishes when the session leader — which holds the NS — dies; only the global
+/// dm devices survive and are closed from the session lock.
+const WORKSPACE: &str = "/run/veracage/vaults";
+
 /// Env vars the launcher may forward into the (unprivileged) continuation.
 /// pkexec strips the environment; anything outside this set is dropped, so a
 /// direct pkexec caller can't smuggle e.g. LD_PRELOAD/LD_LIBRARY_PATH through.
@@ -134,6 +141,11 @@ struct Args {
     source: Option<String>,
     backend: Option<Backend>, // None = auto-detect
     mountpoint: Option<String>,
+    /// `--session <id>`: shared-workspace bootstrap. When set, the helper mounts
+    /// the volume at `<WORKSPACE>/<label>` in a tmpfs workspace and holds it via
+    /// the session leader (Phase 2), writing `session-<id>.lock`/`.pid`. When
+    /// unset, the legacy per-vault path runs (own NS, own `/run/veracage/<hash>`).
+    session: Option<String>,
     /// `--exchange <dir>`: a human-owned host directory to idmap-mount into the
     /// sandbox as a shared exchange folder. Caller-supplied, so validated (owner
     /// == human, real dir, no final-component symlink) before root touches it.
@@ -155,6 +167,7 @@ fn parse_args() -> Args {
     let mut source: Option<String> = None;
     let mut backend: Option<Backend> = None;
     let mut mountpoint: Option<String> = None;
+    let mut session: Option<String> = None;
     let mut exchange: Option<String> = None;
     let mut setenv: Vec<String> = Vec::new();
     let mut rest: Vec<String> = Vec::new();
@@ -186,6 +199,7 @@ fn parse_args() -> Args {
                 }
             }
             "--mountpoint" => mountpoint = it.next(),
+            "--session" => session = it.next(),
             "--exchange" => exchange = it.next(),
             "--setenv" => {
                 if let Some(kv) = it.next() {
@@ -199,7 +213,7 @@ fn parse_args() -> Args {
             other => fail(&format!("unexpected argument: {other}"), 2),
         }
     }
-    Args { spawn_compositor, source, backend, mountpoint, exchange, setenv, rest, passphrase }
+    Args { spawn_compositor, source, backend, mountpoint, session, exchange, setenv, rest, passphrase }
 }
 
 /// (uid, gid) of the invoking human, taken from PKEXEC_UID — never from argv.
@@ -343,6 +357,92 @@ fn write_pidfile(path: &Path, uid: u32, gid: u32) {
             try_chown(path, uid, gid);
         }
         Err(e) => eprintln!("veracage-helper: pidfile {}: {e}", path.display()),
+    }
+}
+
+// --------------------------------------------------- shared-workspace ------
+
+/// A 16-char session id: `[0-9]` only (the CLI passes the human uid; the field
+/// names `session-<id>.lock`/`.pid`, so reject anything that could traverse).
+fn session_id_ok(sid: &str) -> bool {
+    !sid.is_empty() && sid.len() <= 16 && sid.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Sanitize a volume label into a single safe path component for `<WORKSPACE>/…`
+/// (mirrors leader.py `_sanitize_label`): keep `[A-Za-z0-9._-]`, map the rest to
+/// `_`, cap length, and fall back to a hash for empty / `.` / `..`.
+fn sanitize_label(label: &str, source: &Path) -> String {
+    let mut s: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .collect();
+    s.truncate(64);
+    let trimmed = s.trim_matches(['.', '_', '-']);
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return format!("vault-{}", vault_hash(source));
+    }
+    trimmed.to_string()
+}
+
+/// The per-volume mountpoint under the workspace tmpfs: `<WORKSPACE>/<label>`,
+/// with a `-2`, `-3`… suffix if that directory already exists (a second volume
+/// with the same label). Called inside the session NS, after the tmpfs is up.
+fn workspace_path(label: &str, source: &Path) -> PathBuf {
+    let base = sanitize_label(label, source);
+    let root = Path::new(WORKSPACE);
+    let first = root.join(&base);
+    if !first.exists() {
+        return first;
+    }
+    (2..1000)
+        .map(|n| root.join(format!("{base}-{n}")))
+        .find(|p| !p.exists())
+        .unwrap_or(first)
+}
+
+/// Append a volume to the session lock (`session-<sid>.lock`, root-owned 0600):
+/// `user_uid=<uid>` once, then a `volume=<dm_name>\t<label>` line per open
+/// volume. cleanup.py `cleanup_session` walks these to close every dm on teardown.
+/// Written BEFORE the mount (with the dm_name we pre-generated) so an early crash
+/// still leaves the ExecStopPost a device to close.
+fn write_session_lock(sid: &str, dm_name: &str, label: &str, uid: u32) {
+    let path = format!("/run/veracage/session-{sid}.lock");
+    use std::io::Write;
+    // Create-or-append: the first volume creates it (with the uid header); later
+    // volumes (Phase 3, via setns) append their own `volume=` line.
+    let fresh = !Path::new(&path).exists();
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .unwrap_or_else(|e| fail(&format!("session lock {path}: {e}"), 1));
+    if fresh {
+        let _ = f.write_all(format!("user_uid={uid}\n").as_bytes());
+    }
+    f.write_all(format!("volume={dm_name}\t{label}\n").as_bytes())
+        .unwrap_or_else(|e| fail(&format!("write session lock {path}: {e}"), 1));
+}
+
+/// Record the session leader's pid (`session-<sid>.pid`, root-owned 0600) so the
+/// add-volume path (Phase 3) can find + verify the NS holder. Root-only: the pid
+/// is only consumed by another root (pkexec) helper, never the human side.
+fn write_session_pidfile(sid: &str, pid: i32) {
+    let path = format!("/run/veracage/session-{sid}.pid");
+    let _ = std::fs::remove_file(&path);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            let _ = f.write_all(format!("{pid}\n").as_bytes());
+        }
+        Err(e) => eprintln!("veracage-helper: session pidfile {path}: {e}"),
     }
 }
 
@@ -672,6 +772,249 @@ fn child(
     fail(&format!("exec continuation {}: {err}", cont.display()), 127);
 }
 
+/// Shared-workspace bootstrap child (Phase 2). Like `child`, but instead of a
+/// per-vault `/run/veracage/<hash>` mountpoint it stands up the session's tmpfs
+/// **workspace** and lands the first volume at `<WORKSPACE>/<label>`. The process
+/// becomes the session leader and holds this namespace for the session's life
+/// (Phase 3 `setns`es into it to add more volumes). The staging `.raw` mount and
+/// every `<WORKSPACE>/*` idmap mount live on the tmpfs and vanish with the NS —
+/// only the global dm device must be closed (from the session lock) on teardown.
+#[allow(clippy::too_many_arguments)]
+fn session_child(
+    vault_uid: u32,
+    vault_gid: u32,
+    human_uid: u32,
+    human_gid: u32,
+    source: &Path,
+    backend: Option<Backend>,
+    sid: &str,
+    dm_name: &str,
+    ctl_path: &Path,
+    cont: &Path,
+    args: &Args,
+) -> ! {
+    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+        fail_errno("unshare(CLONE_NEWNS)");
+    }
+    let root = CString::new("/").unwrap();
+    if unsafe {
+        libc::mount(ptr::null(), root.as_ptr(), ptr::null(), libc::MS_REC | libc::MS_SLAVE, ptr::null())
+    } != 0
+    {
+        fail_errno("mount --make-rslave /");
+    }
+
+    // The workspace tmpfs: all volumes live here, private to this NS, gone when
+    // the leader dies. mode=0755 so the vault uid can traverse into its volumes.
+    let ws = CString::new(WORKSPACE).unwrap();
+    let tmpfs = CString::new("tmpfs").unwrap();
+    let data = CString::new("mode=0755").unwrap();
+    if unsafe { libc::mount(tmpfs.as_ptr(), ws.as_ptr(), tmpfs.as_ptr(), 0, data.as_ptr() as *const _) } != 0 {
+        fail_errno(&format!("mount tmpfs {WORKSPACE}"));
+    }
+
+    let backend = backend.unwrap_or_else(|| crypt::detect(source));
+    crypt::open(source, backend, dm_name, args.passphrase.as_deref())
+        .unwrap_or_else(|e| fail(&format!("{e}"), 1));
+    let dm_path = format!("/dev/mapper/{dm_name}");
+
+    let volume_label = read_volume_label(&dm_path).unwrap_or_else(|| {
+        source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Vault".into())
+    });
+    // Where this volume lands in the workspace (deduped). Computed here, INSIDE
+    // the NS, because the label is only known after cryptsetup — so the leader is
+    // told the path by injecting it into the continuation argv below.
+    let mountpoint = workspace_path(&volume_label, source);
+    let raw = PathBuf::from(format!("{}.raw", mountpoint.display()));
+    let vault_run = PathBuf::from(format!("/run/veracage/session-{sid}.run"));
+
+    // Stage-mount the decrypted fs to read its on-disk owner, then idmap-clone it
+    // to the workspace path (identical dance to the per-vault `child`).
+    std::fs::create_dir_all(&raw).unwrap_or_else(|e| fail(&format!("mkdir staging: {e}"), 1));
+    set_mode(&raw, 0o700);
+    let st = Command::new(tool("mount"))
+        .args(["-o", "nodev,nosuid", &dm_path])
+        .arg(&raw)
+        .status()
+        .unwrap_or_else(|e| fail(&format!("spawn mount: {e}"), 1));
+    if !st.success() {
+        let _ = crypt::close(dm_name);
+        fail(&format!("mount failed: {}", st.code().unwrap_or(-1)), st.code().unwrap_or(1));
+    }
+    try_chown(&raw, human_uid, human_gid);
+
+    std::fs::create_dir_all(&mountpoint).unwrap_or_else(|e| fail(&format!("mkdir mountpoint: {e}"), 1));
+    set_mode(&mountpoint, 0o755);
+    if let Err(e) = idmap::idmap_mount(&raw, &mountpoint, human_uid, human_gid, vault_uid, vault_gid, 0) {
+        let _ = Command::new(tool("umount")).arg(&raw).status();
+        let _ = crypt::close(dm_name);
+        fail(&format!("idmap_mount: {e}"), 1);
+    }
+    let _ = Command::new(tool("umount")).arg(&raw).status();
+    let _ = std::fs::remove_dir(&raw);
+
+    // Shared exchange folder (idmap a human-owned host dir), same as the per-vault
+    // path — bound at /exchange, top-level, presented as veracage-owned.
+    if let Some(xpath) = args.exchange.as_deref() {
+        match validated_exchange(xpath, human_uid) {
+            Some(x) => {
+                let xmp = PathBuf::from(format!("{WORKSPACE}/.exchange"));
+                let _ = std::fs::create_dir_all(&xmp);
+                set_mode(&xmp, 0o700);
+                match idmap::idmap_mount(
+                    &x, &xmp, human_uid, human_gid, vault_uid, vault_gid,
+                    idmap::ATTR_NOSUID_NODEV_NOEXEC,
+                ) {
+                    Ok(()) => env::set_var("VERACAGE_EXCHANGE", &xmp),
+                    Err(e) => eprintln!("veracage: exchange idmap failed ({e}); no /exchange"),
+                }
+            }
+            None => eprintln!("veracage: exchange {xpath:?} is not a human-owned directory; skipping"),
+        }
+    }
+
+    let ctl_fd = ipc::create_control_socket(ctl_path, human_uid, human_gid)
+        .unwrap_or_else(|e| fail(&format!("control socket: {e}"), 1));
+
+    std::fs::create_dir_all(&vault_run).unwrap_or_else(|e| fail(&format!("mkdir vault-run: {e}"), 1));
+    set_mode(&vault_run, 0o700);
+    chown(&vault_run, vault_uid, vault_gid);
+
+    unsafe {
+        if libc::setgroups(0, ptr::null()) != 0 {
+            fail_errno("setgroups");
+        }
+        if libc::setresgid(vault_gid, vault_gid, vault_gid) != 0 {
+            fail_errno("setresgid");
+        }
+        if libc::setresuid(vault_uid, vault_uid, vault_uid) != 0 {
+            fail_errno("setresuid");
+        }
+    }
+
+    for kv in &args.setenv {
+        if let Some((k, v)) = kv.split_once('=') {
+            if ALLOWED_SETENV.contains(&k) {
+                env::set_var(k, v);
+            }
+        }
+    }
+    env::set_var("VERACAGE_CONTROL_FD", ctl_fd.to_string());
+    env::set_var("VERACAGE_VAULT_RUNTIME", &vault_run);
+    env::set_var("VERACAGE_VOLUME_LABEL", &volume_label);
+
+    // Inject the helper-computed mountpoint into the leader's argv — the CLI can't
+    // know `<WORKSPACE>/<label>` (the label is read post-cryptsetup, above).
+    let mut rest = args.rest.clone();
+    rest.push("--mountpoint".to_string());
+    rest.push(mountpoint.display().to_string());
+    check_continuation_argv(&rest);
+    let err = Command::new(cont).args(&rest).exec();
+    fail(&format!("exec continuation {}: {err}", cont.display()), 127);
+}
+
+/// Shared-workspace bootstrap parent (Phase 2). Brings up the compositor if
+/// needed, records the session lock (pre-fork, for crash safety), forks the
+/// session leader (`session_child`), records its pid, and on its exit closes the
+/// volume's dm + drops the session lock/pid/socket. The vault mounts died with
+/// the leader's NS, so there is no mountpoint tidy here.
+fn run_session_bootstrap(
+    args: &Args,
+    human_uid: u32,
+    human_gid: u32,
+    vault_uid: u32,
+    vault_gid: u32,
+    source: &Path,
+) -> ! {
+    let sid = args.session.as_deref().unwrap();
+    if !session_id_ok(sid) {
+        fail(&format!("invalid --session {sid:?}"), 2);
+    }
+    let runtime_dir = setenv_value(args, "XDG_RUNTIME_DIR")
+        .unwrap_or_else(|| fail("XDG_RUNTIME_DIR not forwarded; need it for the control socket", 2));
+    let ctl_path = PathBuf::from(&runtime_dir)
+        .join("veracage/sessions")
+        .join(format!("session-{sid}.sock"));
+
+    let cont = PathBuf::from(continuation());
+    if !is_executable(&cont) {
+        fail(&format!("continuation not executable: {}", cont.display()), 2);
+    }
+
+    // Workspace tmpfs target must exist for the child's mount (created in the
+    // shared fs; the child's tmpfs hides it, the host sees an empty dir).
+    if let Err(e) = std::fs::create_dir_all(WORKSPACE) {
+        fail(&format!("{WORKSPACE}: {e}"), 1);
+    }
+    set_mode(WORKSPACE, 0o755);
+
+    let dm_name = random_dm_name();
+    // Pre-fork lock (empty label; the dm_name is what teardown needs). The child
+    // knows the real label but the lock only has to name the device to close.
+    write_session_lock(sid, &dm_name, "", human_uid);
+
+    ensure_compositor_running(args, vault_uid, vault_gid);
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        fail_errno("fork");
+    }
+    if pid == 0 {
+        session_child(vault_uid, vault_gid, human_uid, human_gid, source, args.backend,
+                      sid, &dm_name, &ctl_path, &cont, args);
+    }
+
+    // Parent (root, original NS): the session leader's pid lets Phase 3 find the
+    // workspace NS; on the leader's exit we close the dm + drop the session state.
+    write_session_pidfile(sid, pid);
+    install_signal_forwarding(pid);
+    let rc = wait_for(pid);
+
+    let dm_path = format!("/dev/mapper/{dm_name}");
+    let mut close_ok = true;
+    if Path::new(&dm_path).exists() {
+        close_ok = crypt::close(&dm_name).is_ok();
+    }
+    let _ = std::fs::remove_dir_all(format!("/run/veracage/session-{sid}.run"));
+    let _ = std::fs::remove_file(&ctl_path);
+    let _ = std::fs::remove_file(format!("/run/veracage/session-{sid}.pid"));
+    if close_ok {
+        let _ = std::fs::remove_file(format!("/run/veracage/session-{sid}.lock"));
+    }
+    std::process::exit(rc);
+}
+
+/// One prompt: if the shared compositor isn't running, bring it up (detached) as
+/// part of THIS pkexec so `veracage open` needs no second authorization. The
+/// forked child setsid()s and execs the compositor (outlives the session); the
+/// caller doesn't wait on it. Shared by the per-vault and session-bootstrap paths.
+fn ensure_compositor_running(args: &Args, vault_uid: u32, vault_gid: u32) {
+    if compositor_is_up() {
+        return;
+    }
+    let cpid = unsafe { libc::fork() };
+    if cpid < 0 {
+        fail_errno("fork(compositor)");
+    }
+    if cpid == 0 {
+        unsafe { libc::setsid() };
+        let rest = [
+            "_compositor".to_string(),
+            "--socket".to_string(),
+            "wl-vc".to_string(),
+        ];
+        spawn_compositor(vault_uid, vault_gid, args, &rest); // execs; never returns
+    }
+    // Give it a moment to create its socket so the leader finds it.
+    let sock = Path::new(COMPOSITOR_RUNTIME).join("wl-vc");
+    for _ in 0..120 {
+        if sock.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 fn main() {
     let args = parse_args();
 
@@ -720,6 +1063,13 @@ fn main() {
         fail(&format!("source must be a file or block device: {}", source.display()), 2);
     }
 
+    // Shared-workspace bootstrap (Phase 2): mount into the session's tmpfs
+    // workspace + hold it via the session leader. Diverges entirely from the
+    // legacy per-vault path below (own NS, own /run/veracage/<hash>).
+    if args.session.is_some() {
+        run_session_bootstrap(&args, human_uid, human_gid, vault_uid, vault_gid, &source);
+    }
+
     let mountpoint_arg = args
         .mountpoint
         .as_deref()
@@ -742,33 +1092,7 @@ fn main() {
     let lock = format!("/run/veracage/{}.lock", vault_hash(&source));
     write_lock(&lock, &dm_name, &mountpoint, human_uid);
 
-    // One prompt: if the shared compositor isn't running, bring it up here
-    // (detached) as part of THIS single pkexec — so `veracage open` needs no
-    // second pkexec just for the compositor. The child setsid()s and execs the
-    // compositor; the root parent doesn't wait on it (it outlives the session).
-    if !compositor_is_up() {
-        let cpid = unsafe { libc::fork() };
-        if cpid < 0 {
-            fail_errno("fork(compositor)");
-        }
-        if cpid == 0 {
-            unsafe { libc::setsid() };
-            let rest = [
-                "_compositor".to_string(),
-                "--socket".to_string(),
-                "wl-vc".to_string(),
-            ];
-            spawn_compositor(vault_uid, vault_gid, &args, &rest); // execs; never returns
-        }
-        // Give it a moment to create its socket so the leader finds it.
-        let sock = Path::new(COMPOSITOR_RUNTIME).join("wl-vc");
-        for _ in 0..120 {
-            if sock.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    }
+    ensure_compositor_running(&args, vault_uid, vault_gid);
 
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -853,4 +1177,43 @@ mod tests {
     }
 
     const PY_KNOWN_HASH: &str = "0631c55cceb0614f";
+
+    #[test]
+    fn session_id_accepts_uid_rejects_traversal() {
+        assert!(session_id_ok("1000"));
+        assert!(session_id_ok("0"));
+        assert!(!session_id_ok(""));
+        assert!(!session_id_ok("../etc"));
+        assert!(!session_id_ok("10a0"));          // non-digit
+        assert!(!session_id_ok("12345678901234567")); // 17 chars, too long
+        assert!(!session_id_ok("../../root"));
+    }
+
+    #[test]
+    fn sanitize_label_keeps_safe_maps_unsafe() {
+        let src = Path::new("/tmp/x.vc");
+        assert_eq!(sanitize_label("Work Docs", src), "Work_Docs");
+        assert_eq!(sanitize_label("photos-2024", src), "photos-2024");
+        assert_eq!(sanitize_label("a/b/../c", src), "a_b_.._c");
+    }
+
+    #[test]
+    fn sanitize_label_falls_back_to_hash_for_empty_or_dots() {
+        let src = Path::new("/tmp/veracage-x.vc");
+        let want = format!("vault-{}", vault_hash(src));
+        assert_eq!(sanitize_label("", src), want);
+        assert_eq!(sanitize_label("...", src), want);
+        assert_eq!(sanitize_label("/", src), want);   // '/'->'_', trims to empty
+    }
+
+    #[test]
+    fn sanitize_label_is_a_single_component() {
+        let src = Path::new("/tmp/x.vc");
+        for label in ["../../etc", "a/b", "..", ".", "  ", "normal"] {
+            let s = sanitize_label(label, src);
+            assert!(!s.contains('/'), "{label:?} -> {s:?} contains a slash");
+            assert!(s != "." && s != "..", "{label:?} -> {s:?}");
+            assert!(!s.is_empty());
+        }
+    }
 }
