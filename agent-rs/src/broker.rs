@@ -55,10 +55,10 @@ pub fn run_broker() -> ! {
     };
 
     // Compositor-first: bring up the EMPTY compositor (the front door) — no
-    // startup picker. File → Open then mounts a vault. If no apps are configured
-    // yet, open the Configure picker so the user can set one up (item 2).
+    // startup picker. File → Open mounts a vault; Apps → Configure sets up apps.
+    // (No auto-Configure on empty config: it popped up behind the compositor and
+    // was more jarring than helpful.)
     b.ensure_compositor();
-    b.maybe_configure();
 
     loop {
         b.reap();
@@ -176,13 +176,6 @@ impl Broker {
         }
         if let Err(e) = c.status() {
             eprintln!("veracage: could not start the compositor: {e}");
-        }
-    }
-
-    /// Item 2: with no apps enabled yet, open the Configure picker after load.
-    fn maybe_configure(&mut self) {
-        if crate::config::load().apps.is_empty() {
-            self.spawn_dialog("configure");
         }
     }
 

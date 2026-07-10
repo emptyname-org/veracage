@@ -113,18 +113,18 @@ impl eframe::App for Settings {
                 if ui.button("Save").clicked() {
                     let d = self.exchange_dir.trim();
                     self.cfg.exchange_dir = (!d.is_empty()).then(|| d.to_string());
-                    self.status = match config::save(&self.cfg) {
-                        Ok(_) => "Settings saved.".into(),
-                        Err(e) => format!("Save failed: {e}"),
-                    };
+                    match config::save(&self.cfg) {
+                        Ok(_) => std::process::exit(0),
+                        Err(e) => self.status = format!("Save failed: {e}"),
+                    }
                 }
-                if ui.button("Close").clicked() {
+                if ui.button("Cancel").clicked() {
                     std::process::exit(0);
                 }
             });
             if !self.status.is_empty() {
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new(&self.status).weak());
+                ui.colored_label(egui::Color32::from_rgb(200, 80, 80), &self.status);
             }
         });
     }
