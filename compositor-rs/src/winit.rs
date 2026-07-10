@@ -98,25 +98,6 @@ pub fn init_winit(
                     Some(Scale::Fractional(scale_factor)),
                     None,
                 );
-                // Re-fill maximized app windows so they track the new window size
-                // (they were sized to the work area at map time in new_toplevel).
-                let top = crate::toolbar::TOOLBAR_HEIGHT;
-                let work = (size.w, (size.h - top).max(1));
-                // Main windows (no xdg parent) were maximized to the work area at
-                // map time; dialogs float. Re-fill the former on resize.
-                let maximized: Vec<_> = state
-                    .space
-                    .elements()
-                    .filter(|w| w.toplevel().map(|t| t.parent().is_none()).unwrap_or(false))
-                    .cloned()
-                    .collect();
-                for w in maximized {
-                    if let Some(t) = w.toplevel() {
-                        t.with_pending_state(|s| s.size = Some(work.into()));
-                        t.send_configure();
-                    }
-                    state.space.map_element(w, (0, top), false);
-                }
             }
             WinitEvent::Input(event) => state.process_input_event(event),
             WinitEvent::Redraw => {

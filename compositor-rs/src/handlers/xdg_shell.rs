@@ -47,11 +47,11 @@ impl XdgShellHandler for State {
             .next()
             .and_then(|o| self.space.output_geometry(o));
 
-        // Reserve the toolbar strip; fill the rest. This is a single-workspace
-        // compositor (one vault's apps at a time in view), so a main app window
-        // opens MAXIMIZED to the work area rather than as a small float on the
-        // dark backdrop. Transient toplevels (dialogs) keep their own size and
-        // just cascade, so an open/save dialog isn't blown up to fullscreen.
+        // Reserve the toolbar strip. A main app window opens LARGE but NOT
+        // maximized — ~85% of the work area, centered — so it's comfortably big
+        // yet still a floating window (its own shadow reads naturally on the
+        // backdrop, no maximized edge-to-edge fill). Transient toplevels (dialogs)
+        // keep their own size and just cascade.
         let top = crate::toolbar::TOOLBAR_HEIGHT;
         let is_dialog = surface.parent().is_some();
         let loc = if let Some(geo) = output_geo {
@@ -66,13 +66,16 @@ impl XdgShellHandler for State {
                 let y = top + step.min((work_h - 200).max(0));
                 (x, y)
             } else {
+                let w = ((geo.size.w as f32 * 0.85) as i32).max(640);
+                let h = ((work_h as f32 * 0.85) as i32).max(480);
                 surface.with_pending_state(|state| {
                     state.bounds = Some((geo.size.w, work_h).into());
-                    state.size = Some((geo.size.w, work_h).into());
-                    state.states.set(xdg_toplevel::State::Maximized);
+                    state.size = Some((w, h).into());
                 });
                 surface.send_configure();
-                (0, top)
+                let x = (geo.size.w - w).max(0) / 2;
+                let y = top + (work_h - h).max(0) / 2;
+                (x, y)
             }
         } else {
             (0, top)
