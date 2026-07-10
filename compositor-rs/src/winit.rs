@@ -77,8 +77,7 @@ pub fn init_winit(
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
 
-    // Backdrop shown behind app windows (and briefly before one commits). Match
-    // the toolbar/desktop theme so opening a vault doesn't flash a dark void —
+    // The backdrop IS the desktop — drawn first, behind every window. Themed:
     // light-gray under the light theme, near-black under dark.
     let clear_color: [f32; 4] = if std::env::var("VERACAGE_THEME").as_deref() == Ok("dark") {
         [0.10, 0.10, 0.10, 1.0]
