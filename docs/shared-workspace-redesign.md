@@ -1,7 +1,13 @@
 # Shared workspace redesign — N volumes, one sandbox, drag-and-drop
 
-**Status: design note (not yet built).** Supersedes the per-vault sandbox model
-for the multi-volume case. Builds on `uid-isolation.md` (deny-by-uid + the
+**Status: Phases 1–4 BUILT + VPS-proven (2026-07-11); Phases 5–6 remain.**
+Phase 1 spike (idmap-into-setns) ✅ spike8. Phase 2 (session bootstrap) ✅ spike12.
+Phase 3 (setns add-volume + multi-volume teardown) ✅ spike13. Phase 4 (sandbox
+binds the `/vaults` tree, one global app set, multi-volume Places) ✅ unit-tested
+(bwrap-sees-all mechanic from spike8); real-app box test pending. Phase 5 (compositor
+per-volume close — the global Apps menu is already one list per the single session
+leader) and Phase 6 (two-volume Dolphin DnD e2e + docs) remain. Supersedes the
+per-vault sandbox model for the multi-volume case. Builds on `uid-isolation.md` (deny-by-uid + the
 persistent one-compositor architecture).
 
 ## Goal
