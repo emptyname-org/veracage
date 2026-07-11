@@ -349,3 +349,36 @@ def test_main_rejects_bad_session_id(monkeypatch, capsys):
 def test_main_session_and_vault_hash_mutually_exclusive():
     with pytest.raises(SystemExit):
         cleanup.main(["--session", "a" * 16, "--vault-hash", "b" * 16])
+
+
+# ------------------------------------------- session liveness guard (Phase 3) --
+
+def test_session_leader_alive_true_for_self(tmp_path):
+    import os
+    pidf = tmp_path / "session-x.pid"
+    st = cleanup._proc_starttime(os.getpid())
+    pidf.write_text(f"{os.getpid()}\n{st}\n")
+    assert cleanup.session_leader_alive(pidf) is True
+
+
+def test_session_leader_alive_false_on_starttime_mismatch(tmp_path):
+    import os
+    pidf = tmp_path / "session-x.pid"
+    pidf.write_text(f"{os.getpid()}\n0\n")   # our pid, wrong start-time (reuse)
+    assert cleanup.session_leader_alive(pidf) is False
+
+
+def test_session_leader_alive_false_when_missing(tmp_path):
+    assert cleanup.session_leader_alive(tmp_path / "nope.pid") is False
+
+
+def test_cleanup_session_noop_while_leader_alive(tmp_path):
+    """A 2nd open's ExecStopPost fires while the leader lives → must NOT tear
+    down the live session."""
+    p = _session_lock(tmp_path, "a" * 16, [("veracage-abc123abc123", "A")])
+    with mock.patch("veracage.cleanup.session_leader_alive", return_value=True), \
+         mock.patch("veracage.cleanup.subprocess.run") as r:
+        rc = cleanup.cleanup_session(p)
+    assert rc == 0
+    r.assert_not_called()      # leader alive → nothing closed
+    assert p.exists()          # lock kept

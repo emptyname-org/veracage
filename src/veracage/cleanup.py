@@ -173,6 +173,34 @@ def cleanup_one(p: Path) -> int:
     return rc
 
 
+def _proc_starttime(pid: int) -> str | None:
+    """`/proc/<pid>/stat` field 22 (start-time). comm (field 2) is parenthesised
+    and may contain spaces, so split after the last ')': the remaining fields
+    start at field 3, so start-time is index 19."""
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    rest = data[data.rfind(")") + 1:].split()
+    return rest[19] if len(rest) > 19 else None
+
+
+def session_leader_alive(pid_path: Path) -> bool:
+    """True if `pid_path` (`session-<sid>.pid`, "pid\\nstarttime") names a process
+    still alive with the SAME start-time (defeats pid reuse) — i.e. the session
+    leader is still running."""
+    try:
+        parts = pid_path.read_text().split()
+    except OSError:
+        return False
+    if not parts or not parts[0].isdigit():
+        return False
+    st = _proc_starttime(int(parts[0]))
+    if st is None:
+        return False
+    return len(parts) < 2 or st == parts[1]
+
+
 def cleanup_session(p: Path) -> int:
     """Close EVERY volume's dm device named in a session lock, then unlink the
     lock + control socket. The vault mounts died with the leader's namespace, so
@@ -201,6 +229,14 @@ def cleanup_session(p: Path) -> int:
               f"(owner uid {owner}); refusing", file=sys.stderr)
         return 2
 
+    # Liveness guard: if the session leader is still running, this teardown was
+    # triggered by a SUBSIDIARY (add-volume) unit stopping — not the session
+    # ending — so it must be a no-op. Only when the leader is gone do we close the
+    # volumes. This is what makes it safe for every `veracage open` to carry the
+    # same `ExecStopPost=cleanup --session <sid>` (the shared-workspace model).
+    if session_leader_alive(p.with_suffix(".pid")):
+        return 0
+
     rc = 0
     for dm_name, _label in volumes:
         if not DM_NAME_RE.match(dm_name):
@@ -223,6 +259,12 @@ def cleanup_session(p: Path) -> int:
         if owner.isdigit():
             with contextlib.suppress(OSError):
                 (Path(f"/run/user/{owner}/veracage/sessions") / f"{p.stem}.sock").unlink()
+        # Drop the session pidfile and the host-side vault-runtime scratch too
+        # (the workspace tmpfs itself died with the leader's namespace).
+        with contextlib.suppress(OSError):
+            p.with_suffix(".pid").unlink()
+        with contextlib.suppress(OSError):
+            shutil.rmtree(p.with_suffix(".run"), ignore_errors=True)
         with contextlib.suppress(FileNotFoundError):
             p.unlink()
     return rc

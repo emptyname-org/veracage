@@ -425,11 +425,13 @@ fn write_session_lock(sid: &str, dm_name: &str, label: &str, uid: u32) {
         .unwrap_or_else(|e| fail(&format!("write session lock {path}: {e}"), 1));
 }
 
-/// Record the session leader's pid (`session-<sid>.pid`, root-owned 0600) so the
-/// add-volume path (Phase 3) can find + verify the NS holder. Root-only: the pid
-/// is only consumed by another root (pkexec) helper, never the human side.
+/// Record the session leader's pid + start-time (`session-<sid>.pid`, root 0600):
+/// the add-volume path (Phase 3) reads it to find the workspace NS holder, and the
+/// start-time pins it against pid reuse. Root-only (consumed by another pkexec
+/// helper / the root cleanup, never the human side).
 fn write_session_pidfile(sid: &str, pid: i32) {
     let path = format!("/run/veracage/session-{sid}.pid");
+    let st = proc_starttime(pid).unwrap_or(0);
     let _ = std::fs::remove_file(&path);
     match std::fs::OpenOptions::new()
         .write(true)
@@ -440,10 +442,66 @@ fn write_session_pidfile(sid: &str, pid: i32) {
     {
         Ok(mut f) => {
             use std::io::Write;
-            let _ = f.write_all(format!("{pid}\n").as_bytes());
+            let _ = f.write_all(format!("{pid}\n{st}\n").as_bytes());
         }
         Err(e) => eprintln!("veracage-helper: session pidfile {path}: {e}"),
     }
+}
+
+/// `/proc/<pid>/stat` field 22 (start-time, clock ticks since boot). `comm`
+/// (field 2) is parenthesised and may contain spaces/parens, so split after the
+/// LAST ')'; the remaining fields start at field 3, so start-time is index 19.
+fn proc_starttime(pid: i32) -> Option<u64> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &s[s.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// True if `/proc/<pid>` exists and is owned by `uid` — i.e. the process is alive
+/// and its real uid is `uid` (the leader is the only thing running as the vault uid).
+fn proc_owned_by(pid: i32, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(format!("/proc/{pid}")).map(|m| m.uid() == uid).unwrap_or(false)
+}
+
+/// `veracage-` + 12 lowercase hex, matching DM_NAME_RE in cleanup.py.
+fn is_veracage_dm(name: &str) -> bool {
+    matches!(name.strip_prefix("veracage-"),
+        Some(h) if h.len() == 12 && h.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+}
+
+/// If a live, verified session leader is recorded for `sid`, return its pid.
+/// Verifies: pid alive + owned by the vault uid (only the leader runs as it) +
+/// start-time matches the pidfile (defeats pid reuse). `None` => no live session,
+/// so the caller BOOTSTRAPS a new one instead of joining.
+fn verify_session_leader(sid: &str, vault_uid: u32) -> Option<i32> {
+    let body = std::fs::read_to_string(format!("/run/veracage/session-{sid}.pid")).ok()?;
+    let mut lines = body.lines();
+    let pid: i32 = lines.next()?.trim().parse().ok()?;
+    let want_st: u64 = lines.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    if pid <= 1 || !proc_owned_by(pid, vault_uid) || proc_starttime(pid) != Some(want_st) {
+        return None;
+    }
+    Some(pid)
+}
+
+/// Close EVERY volume's dm named in the session lock. The leader's namespace (and
+/// thus every `/vaults/*` mount) is already gone, so only the global dm devices
+/// survive and must be closed. Mirrors cleanup.py's `cleanup_session`, for the
+/// graceful in-helper teardown. Returns true iff every dm is now gone.
+fn close_all_session_dms(sid: &str) -> bool {
+    let path = format!("/run/veracage/session-{sid}.lock");
+    let Ok(body) = std::fs::read_to_string(&path) else { return true };
+    let mut all_ok = true;
+    for line in body.lines() {
+        if let Some(v) = line.strip_prefix("volume=") {
+            let dm = v.split('\t').next().unwrap_or("").trim();
+            if is_veracage_dm(dm) && Path::new(&format!("/dev/mapper/{dm}")).exists() {
+                all_ok &= crypt::close(dm).is_ok();
+            }
+        }
+    }
+    all_ok
 }
 
 /// Bring up the ONE persistent `veracage`-uid compositor. Unlike the vault path
@@ -780,6 +838,59 @@ fn child(
 /// every `<WORKSPACE>/*` idmap mount live on the tmpfs and vanish with the NS —
 /// only the global dm device must be closed (from the session lock) on teardown.
 #[allow(clippy::too_many_arguments)]
+/// cryptsetup-open `source` and idmap-mount it at `<WORKSPACE>/<label>` in the
+/// CURRENT mount namespace (the workspace tmpfs must already be mounted — the
+/// bootstrap child mounts it after unshare; the add child inherits it via setns).
+/// The label is read from the decrypted device, so the mountpoint is only known
+/// here. Returns (mountpoint, label). Fails (closing the dm) on any mount error.
+#[allow(clippy::too_many_arguments)]
+fn mount_volume_at_workspace(
+    source: &Path,
+    backend: Option<Backend>,
+    passphrase: Option<&[u8]>,
+    human_uid: u32,
+    human_gid: u32,
+    vault_uid: u32,
+    vault_gid: u32,
+    dm_name: &str,
+) -> (PathBuf, String) {
+    let backend = backend.unwrap_or_else(|| crypt::detect(source));
+    crypt::open(source, backend, dm_name, passphrase).unwrap_or_else(|e| fail(&format!("{e}"), 1));
+    let dm_path = format!("/dev/mapper/{dm_name}");
+
+    let label = read_volume_label(&dm_path).unwrap_or_else(|| {
+        source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Vault".into())
+    });
+    let mountpoint = workspace_path(&label, source);
+    let raw = PathBuf::from(format!("{}.raw", mountpoint.display()));
+
+    // Stage-mount the decrypted fs to read its on-disk owner, then idmap-clone it
+    // to the workspace path (identical dance to the per-vault `child`).
+    std::fs::create_dir_all(&raw).unwrap_or_else(|e| fail(&format!("mkdir staging: {e}"), 1));
+    set_mode(&raw, 0o700);
+    let st = Command::new(tool("mount"))
+        .args(["-o", "nodev,nosuid", &dm_path])
+        .arg(&raw)
+        .status()
+        .unwrap_or_else(|e| fail(&format!("spawn mount: {e}"), 1));
+    if !st.success() {
+        let _ = crypt::close(dm_name);
+        fail(&format!("mount failed: {}", st.code().unwrap_or(-1)), st.code().unwrap_or(1));
+    }
+    try_chown(&raw, human_uid, human_gid);
+
+    std::fs::create_dir_all(&mountpoint).unwrap_or_else(|e| fail(&format!("mkdir mountpoint: {e}"), 1));
+    set_mode(&mountpoint, 0o755);
+    if let Err(e) = idmap::idmap_mount(&raw, &mountpoint, human_uid, human_gid, vault_uid, vault_gid, 0) {
+        let _ = Command::new(tool("umount")).arg(&raw).status();
+        let _ = crypt::close(dm_name);
+        fail(&format!("idmap_mount: {e}"), 1);
+    }
+    let _ = Command::new(tool("umount")).arg(&raw).status();
+    let _ = std::fs::remove_dir(&raw);
+    (mountpoint, label)
+}
+
 fn session_child(
     vault_uid: u32,
     vault_gid: u32,
@@ -813,45 +924,14 @@ fn session_child(
         fail_errno(&format!("mount tmpfs {WORKSPACE}"));
     }
 
-    let backend = backend.unwrap_or_else(|| crypt::detect(source));
-    crypt::open(source, backend, dm_name, args.passphrase.as_deref())
-        .unwrap_or_else(|e| fail(&format!("{e}"), 1));
-    let dm_path = format!("/dev/mapper/{dm_name}");
-
-    let volume_label = read_volume_label(&dm_path).unwrap_or_else(|| {
-        source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Vault".into())
-    });
-    // Where this volume lands in the workspace (deduped). Computed here, INSIDE
-    // the NS, because the label is only known after cryptsetup — so the leader is
-    // told the path by injecting it into the continuation argv below.
-    let mountpoint = workspace_path(&volume_label, source);
-    let raw = PathBuf::from(format!("{}.raw", mountpoint.display()));
+    // cryptsetup + idmap-mount the volume into the workspace (shared with the
+    // add-volume path). The label is only known post-cryptsetup, so the leader is
+    // told the resulting mountpoint by injecting it into the continuation argv.
+    let (mountpoint, volume_label) = mount_volume_at_workspace(
+        source, backend, args.passphrase.as_deref(),
+        human_uid, human_gid, vault_uid, vault_gid, dm_name,
+    );
     let vault_run = PathBuf::from(format!("/run/veracage/session-{sid}.run"));
-
-    // Stage-mount the decrypted fs to read its on-disk owner, then idmap-clone it
-    // to the workspace path (identical dance to the per-vault `child`).
-    std::fs::create_dir_all(&raw).unwrap_or_else(|e| fail(&format!("mkdir staging: {e}"), 1));
-    set_mode(&raw, 0o700);
-    let st = Command::new(tool("mount"))
-        .args(["-o", "nodev,nosuid", &dm_path])
-        .arg(&raw)
-        .status()
-        .unwrap_or_else(|e| fail(&format!("spawn mount: {e}"), 1));
-    if !st.success() {
-        let _ = crypt::close(dm_name);
-        fail(&format!("mount failed: {}", st.code().unwrap_or(-1)), st.code().unwrap_or(1));
-    }
-    try_chown(&raw, human_uid, human_gid);
-
-    std::fs::create_dir_all(&mountpoint).unwrap_or_else(|e| fail(&format!("mkdir mountpoint: {e}"), 1));
-    set_mode(&mountpoint, 0o755);
-    if let Err(e) = idmap::idmap_mount(&raw, &mountpoint, human_uid, human_gid, vault_uid, vault_gid, 0) {
-        let _ = Command::new(tool("umount")).arg(&raw).status();
-        let _ = crypt::close(dm_name);
-        fail(&format!("idmap_mount: {e}"), 1);
-    }
-    let _ = Command::new(tool("umount")).arg(&raw).status();
-    let _ = std::fs::remove_dir(&raw);
 
     // Shared exchange folder (idmap a human-owned host dir), same as the per-vault
     // path — bound at /exchange, top-level, presented as veracage-owned.
@@ -967,22 +1047,82 @@ fn run_session_bootstrap(
                       sid, &dm_name, &ctl_path, &cont, args);
     }
 
-    // Parent (root, original NS): the session leader's pid lets Phase 3 find the
-    // workspace NS; on the leader's exit we close the dm + drop the session state.
+    // Parent (root, original NS): the session leader's pid (+ start-time) lets the
+    // add-volume path find + verify the workspace NS holder.
     write_session_pidfile(sid, pid);
     install_signal_forwarding(pid);
     let rc = wait_for(pid);
 
-    let dm_path = format!("/dev/mapper/{dm_name}");
-    let mut close_ok = true;
-    if Path::new(&dm_path).exists() {
-        close_ok = crypt::close(&dm_name).is_ok();
-    }
+    // The leader (holding the workspace NS) has exited: every /vaults/* mount is
+    // gone with the NS, so close EVERY volume's dm from the session lock (this
+    // volume plus any added later via setns). ExecStopPost `cleanup --session` is
+    // the crash-safety backup (idempotent; it no-ops while the leader is alive).
+    let all_closed = close_all_session_dms(sid);
     let _ = std::fs::remove_dir_all(format!("/run/veracage/session-{sid}.run"));
     let _ = std::fs::remove_file(&ctl_path);
     let _ = std::fs::remove_file(format!("/run/veracage/session-{sid}.pid"));
-    if close_ok {
+    if all_closed {
         let _ = std::fs::remove_file(format!("/run/veracage/session-{sid}.lock"));
+    }
+    std::process::exit(rc);
+}
+
+/// Subsequent open (Phase 3): a live session already holds the workspace NS, so
+/// JOIN it (setns) and mount this volume there, then EXIT — the session leader
+/// keeps holding the mount, and teardown closes this dm from the session lock. No
+/// leader, no compositor bring-up, no ExecStopPost teardown (the CLI's
+/// `cleanup --session` no-ops while the leader is alive).
+fn run_session_add(
+    args: &Args,
+    human_uid: u32,
+    human_gid: u32,
+    vault_uid: u32,
+    vault_gid: u32,
+    source: &Path,
+    leader_pid: i32,
+) -> ! {
+    let sid = args.session.as_deref().unwrap();
+    let dm_name = random_dm_name();
+    // Append to the session lock BEFORE the mount (crash safety): the dm_name is
+    // pre-generated, so even an early kill leaves teardown a device to close.
+    write_session_lock(sid, &dm_name, "", human_uid);
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        fail_errno("fork");
+    }
+    if pid == 0 {
+        // Child: join the leader's mount namespace (the workspace), mount the
+        // volume there, exit. setns must run in a child so the parent stays in the
+        // host NS. The pid was verified (owner + start-time) before we got here.
+        let ns = format!("/proc/{leader_pid}/ns/mnt");
+        let c = CString::new(ns.clone()).unwrap();
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            fail_errno(&format!("open {ns}"));
+        }
+        if unsafe { libc::setns(fd, libc::CLONE_NEWNS) } != 0 {
+            fail_errno("setns(mnt)");
+        }
+        unsafe { libc::close(fd) };
+        // In the workspace NS now (tmpfs at WORKSPACE inherited from the leader).
+        let _ = mount_volume_at_workspace(
+            source, args.backend, args.passphrase.as_deref(),
+            human_uid, human_gid, vault_uid, vault_gid, &dm_name,
+        );
+        // Phase 4 TODO: signal the leader to re-seed Places for the new volume.
+        std::process::exit(0);
+    }
+
+    // Parent: wait for the add-child. On failure, close this volume's dm (the child
+    // may have opened it before erroring) so it doesn't leak; the stale lock line
+    // is harmless (teardown's close is guarded by the device existing).
+    let rc = wait_for(pid);
+    if rc != 0 {
+        let dm_path = format!("/dev/mapper/{dm_name}");
+        if Path::new(&dm_path).exists() {
+            let _ = crypt::close(&dm_name);
+        }
     }
     std::process::exit(rc);
 }
@@ -1066,11 +1206,22 @@ fn main() {
         fail(&format!("source must be a file or block device: {}", source.display()), 2);
     }
 
-    // Shared-workspace bootstrap (Phase 2): mount into the session's tmpfs
-    // workspace + hold it via the session leader. Diverges entirely from the
-    // legacy per-vault path below (own NS, own /run/veracage/<hash>).
-    if args.session.is_some() {
-        run_session_bootstrap(&args, human_uid, human_gid, vault_uid, vault_gid, &source);
+    // Shared-workspace open. Diverges entirely from the legacy per-vault path
+    // below. The helper picks bootstrap vs. add-volume by whether a LIVE, verified
+    // session leader already holds the workspace NS (so the CLI needs no
+    // session-liveness check — it always passes --session <uid>).
+    if let Some(sid) = args.session.as_deref() {
+        if !session_id_ok(sid) {
+            fail(&format!("invalid --session {sid:?}"), 2);
+        }
+        match verify_session_leader(sid, vault_uid) {
+            Some(leader_pid) => {
+                run_session_add(&args, human_uid, human_gid, vault_uid, vault_gid, &source, leader_pid)
+            }
+            None => {
+                run_session_bootstrap(&args, human_uid, human_gid, vault_uid, vault_gid, &source)
+            }
+        }
     }
 
     let mountpoint_arg = args
@@ -1218,5 +1369,27 @@ mod tests {
             assert!(s != "." && s != "..", "{label:?} -> {s:?}");
             assert!(!s.is_empty());
         }
+    }
+
+    #[test]
+    fn is_veracage_dm_matches_cleanup_regex() {
+        assert!(is_veracage_dm("veracage-0123456789ab"));
+        assert!(!is_veracage_dm("veracage-0123456789")); // 10 hex
+        assert!(!is_veracage_dm("veracage-0123456789ABCD")); // upper + len
+        assert!(!is_veracage_dm("veracage-../../x"));
+        assert!(!is_veracage_dm("evil"));
+        assert!(!is_veracage_dm(""));
+    }
+
+    #[test]
+    fn proc_starttime_reads_self() {
+        let pid = std::process::id() as i32;
+        assert!(proc_starttime(pid).map(|s| s > 0).unwrap_or(false));
+    }
+
+    #[test]
+    fn verify_session_leader_none_without_pidfile() {
+        // A sid with no session pidfile → no live session (caller bootstraps).
+        assert!(verify_session_leader("987654321098765", 0).is_none());
     }
 }
