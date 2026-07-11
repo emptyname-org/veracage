@@ -139,6 +139,11 @@ impl Broker {
     }
 
     fn dispatch(&mut self, verb: &str) {
+        // Per-volume close carries a label: `close-volume:<label>` (Phase 5).
+        if let Some(label) = verb.strip_prefix("close-volume:") {
+            self.close_volume(label);
+            return;
+        }
         match verb {
             "open" => self.open_flow(),
             "configure" => self.spawn_dialog("configure"),
@@ -186,6 +191,15 @@ impl Broker {
         match Command::new(exe).arg(sub).spawn() {
             Ok(child) => self.jobs.push(child),
             Err(e) => eprintln!("veracage: could not open {sub}: {e}"),
+        }
+    }
+
+    /// Close ONE volume of the running session (compositor's Close volume ▸ …).
+    fn close_volume(&mut self, label: &str) {
+        let Some(bin) = veracage_bin() else { return };
+        match Command::new(bin).arg("close-volume").arg(label).spawn() {
+            Ok(child) => self.jobs.push(child),
+            Err(e) => eprintln!("veracage: could not close volume {label}: {e}"),
         }
     }
 

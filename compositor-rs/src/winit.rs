@@ -226,6 +226,9 @@ pub fn init_winit(
                     crate::toolbar::ToolbarAction::Command(verb) => {
                         crate::toolbar::request_command(verb)
                     }
+                    crate::toolbar::ToolbarAction::CloseVolume(label) => {
+                        crate::toolbar::request_command(&format!("close-volume:{label}"))
+                    }
                     crate::toolbar::ToolbarAction::Quit => state.loop_signal.stop(),
                     crate::toolbar::ToolbarAction::None => {}
                 }

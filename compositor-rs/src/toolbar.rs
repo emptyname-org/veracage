@@ -34,6 +34,7 @@ pub enum ToolbarAction {
     ClipPull, // sandbox selection -> host
     LaunchApp { sock: std::path::PathBuf, index: usize },
     Command(&'static str), // broker verbs: open/configure/settings/close/import/export
+    CloseVolume(String),   // close ONE volume of the session (by label)
     Quit,                  // stop the compositor loop (in-process)
 }
 
@@ -45,6 +46,7 @@ pub enum ToolbarAction {
 pub struct LeaderApps {
     pub sock: std::path::PathBuf,
     pub label: String,
+    pub volumes: Vec<String>, // open-volume labels (for the per-volume Close menu)
     pub opener: Option<usize>,
     pub names: Vec<String>,
 }
@@ -186,6 +188,21 @@ impl Toolbar {
                                 ui.close_menu();
                             }
                             ui.separator();
+                            // Per-volume close — one item per open volume across
+                            // the session (Phase 5). Only shown when >1 volume is
+                            // open; a single volume just uses "Close vault".
+                            let vols: Vec<&String> =
+                                leaders.iter().flat_map(|l| &l.volumes).collect();
+                            if vols.len() > 1 {
+                                ui.menu_button("Close volume", |ui| {
+                                    for v in &vols {
+                                        if ui.button(v.as_str()).clicked() {
+                                            action = ToolbarAction::CloseVolume((*v).clone());
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
+                            }
                             if ui.button("Close vault").clicked() {
                                 action = ToolbarAction::Command("close");
                                 ui.close_menu();
@@ -348,6 +365,14 @@ pub fn scan_leaders() -> Vec<LeaderApps> {
             continue;
         }
         let label = lines.next().unwrap_or("Vault").to_string();
+        // Open-volume labels (tab-separated) for the per-volume Close menu.
+        let volumes: Vec<String> = lines
+            .next()
+            .unwrap_or("")
+            .split('\t')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
         // Opener index: which app the desktop tile launches. `-1` (or an
         // out-of-range value, checked once names are known) means "no opener".
         let opener_raw: i64 = lines.next().and_then(|s| s.trim().parse().ok()).unwrap_or(-1);
@@ -356,6 +381,7 @@ pub fn scan_leaders() -> Vec<LeaderApps> {
         out.push(LeaderApps {
             sock: runtime.join(sockname),
             label,
+            volumes,
             opener,
             names,
         });

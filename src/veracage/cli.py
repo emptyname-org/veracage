@@ -314,6 +314,20 @@ def cmd_close(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_close_volume(args: argparse.Namespace) -> int:
+    """Close ONE volume of the running session (Phase 5). `label` is the workspace
+    directory name (a single component). pkexecs the helper's --close-volume,
+    which setns'es into the session and unmounts + deferred-closes just that
+    volume, leaving the rest running. Driven by the compositor's per-volume close.
+    """
+    label = args.label
+    if not label or "/" in label or label in (".", ".."):
+        print(f"veracage: invalid volume label {label!r}", file=sys.stderr)
+        return 2
+    cmd = ["pkexec", HELPER_PATH, "--close-volume", label, "--session", str(os.getuid())]
+    return subprocess.run(cmd).returncode
+
+
 # ----------------------------------------------------------- main --------
 
 def main() -> int:
@@ -350,6 +364,10 @@ def main() -> int:
     p_close = sub.add_parser("close", help="close a running session")
     p_close.add_argument("vault")
     p_close.set_defaults(func=cmd_close)
+
+    p_cv = sub.add_parser("close-volume", help="close one volume of the session")
+    p_cv.add_argument("label", help="the volume's label (workspace directory name)")
+    p_cv.set_defaults(func=cmd_close_volume)
 
     configure.add_subparser(sub)
 

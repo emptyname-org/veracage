@@ -178,8 +178,9 @@ def test_publish_apps_writes_socket_and_file(tmp_path, monkeypatch):
         lines = (tmp_path / "app-deadbeef.apps").read_text().splitlines()
         assert lines[0] == "app-deadbeef.sock"     # compositor connects to this
         assert lines[1] == "MyVol"                 # volume label (window title)
-        assert lines[2] == "0"                     # opener index (no fm -> first app)
-        assert lines[3:] == ["Kate", "Okular"]     # button labels, in order
+        assert lines[2] == ""                      # open-volume list (none scanned here)
+        assert lines[3] == "0"                     # opener index (no fm -> first app)
+        assert lines[4:] == ["Kate", "Okular"]     # button labels, in order
         assert (tmp_path / "app-deadbeef.sock").is_socket()
     finally:
         srv.close()
@@ -198,7 +199,7 @@ def test_publish_apps_opener_prefers_file_manager(tmp_path, monkeypatch):
     srv = leader._publish_apps(st)
     try:
         lines = (tmp_path / "app-deadbeef.apps").read_text().splitlines()
-        assert lines[2] == "1"                     # dolphin is the opener, not kate
+        assert lines[3] == "1"                     # dolphin is the opener, not kate
     finally:
         srv.close()
         leader._unpublish_apps(st)
@@ -211,7 +212,7 @@ def test_publish_apps_opener_minus_one_when_no_apps(tmp_path, monkeypatch):
     srv = leader._publish_apps(st)
     try:
         lines = (tmp_path / "app-deadbeef.apps").read_text().splitlines()
-        assert lines[2] == "-1"                    # no app -> no opener
+        assert lines[3] == "-1"                    # no app -> no opener
     finally:
         srv.close()
         leader._unpublish_apps(st)

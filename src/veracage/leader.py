@@ -69,7 +69,8 @@ class _LeaderState:
     closing: bool = False
     app_specs: list = field(default_factory=list)  # enabled apps, for the toolbar
     places_file: Path | None = None  # seeded KDE Places (vault under its label)
-    volume_label: str = "Vault"      # volume label (window title + Places name)
+    volume_label: str = "Vault"      # joined labels for the window title
+    volumes: list = field(default_factory=list)  # per-volume labels (per-vol close)
     exchange: str | None = None      # idmapped host<->vault shared dir -> /exchange
 
 
@@ -273,7 +274,12 @@ def _write_apps_file(state: _LeaderState) -> None:
          if is_file_manager(str(a.get("exec") or ""))),
         0 if state.app_specs else -1,
     )
-    body = [_app_socket_path(state).name, state.volume_label or "Vault", str(opener), *names]
+    # Format the compositor parses (see scan_leaders in toolbar.rs):
+    #   <sock>\n<title>\n<vol1>\t<vol2>…\n<opener>\n<name>\n<name>…
+    # The volumes line (tab-separated) drives the per-volume Close menu.
+    volumes = "\t".join(state.volumes)
+    body = [_app_socket_path(state).name, state.volume_label or "Vault",
+            volumes, str(opener), *names]
     _apps_file_path(state).write_text("\n".join(body) + "\n")
 
 
@@ -401,6 +407,7 @@ def run_leader(mountpoint: str, gpu: bool, app_specs: list, first_app: dict | No
     # sandbox binds the whole /vaults tree so one app sees them all.
     state.exchange = os.environ.get("VERACAGE_EXCHANGE") or None
     labels = scan_volumes()
+    state.volumes = labels
     state.volume_label = ", ".join(labels) if labels else "Vault"
     state.places_file = _write_places_file(labels, state.exchange is not None)
 
@@ -444,6 +451,7 @@ def run_leader(mountpoint: str, gpu: bool, app_specs: list, first_app: dict | No
                 cur = scan_volumes()
                 if cur != seen_labels:
                     seen_labels = cur
+                    state.volumes = cur
                     state.volume_label = ", ".join(cur) if cur else "Vault"
                     state.places_file = _write_places_file(cur, state.exchange is not None)
                     _write_apps_file(state)
