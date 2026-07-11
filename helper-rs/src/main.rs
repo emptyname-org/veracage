@@ -146,6 +146,10 @@ struct Args {
     /// the session leader (Phase 2), writing `session-<id>.lock`/`.pid`. When
     /// unset, the legacy per-vault path runs (own NS, own `/run/veracage/<hash>`).
     session: Option<String>,
+    /// `--close-volume <label>`: setns into the session and close JUST this volume
+    /// (unmount + `cryptsetup close --deferred` + drop it from the lock), leaving
+    /// the rest of the session running (Phase 5). Needs --session.
+    close_volume: Option<String>,
     /// `--exchange <dir>`: a human-owned host directory to idmap-mount into the
     /// sandbox as a shared exchange folder. Caller-supplied, so validated (owner
     /// == human, real dir, no final-component symlink) before root touches it.
@@ -168,6 +172,7 @@ fn parse_args() -> Args {
     let mut backend: Option<Backend> = None;
     let mut mountpoint: Option<String> = None;
     let mut session: Option<String> = None;
+    let mut close_volume: Option<String> = None;
     let mut exchange: Option<String> = None;
     let mut setenv: Vec<String> = Vec::new();
     let mut rest: Vec<String> = Vec::new();
@@ -200,6 +205,7 @@ fn parse_args() -> Args {
             }
             "--mountpoint" => mountpoint = it.next(),
             "--session" => session = it.next(),
+            "--close-volume" => close_volume = it.next(),
             "--exchange" => exchange = it.next(),
             "--setenv" => {
                 if let Some(kv) = it.next() {
@@ -213,7 +219,7 @@ fn parse_args() -> Args {
             other => fail(&format!("unexpected argument: {other}"), 2),
         }
     }
-    Args { spawn_compositor, source, backend, mountpoint, session, exchange, setenv, rest, passphrase }
+    Args { spawn_compositor, source, backend, mountpoint, session, close_volume, exchange, setenv, rest, passphrase }
 }
 
 /// (uid, gid) of the invoking human, taken from PKEXEC_UID — never from argv.
@@ -502,6 +508,92 @@ fn close_all_session_dms(sid: &str) -> bool {
         }
     }
     all_ok
+}
+
+/// A safe volume label = a single path component (non-empty, no '/', not '.'/'..').
+fn label_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 128 && !s.contains('/') && s != "." && s != ".."
+}
+
+/// The dm device backing the mount at `mp` in the CURRENT namespace: read
+/// /proc/self/mountinfo (field 5 = mount point, field 3 = maj:min), resolve
+/// `/sys/dev/block/<maj:min>/dm/name`, and accept only a `veracage-<12hex>` name.
+fn dm_at_mountpoint(mp: &str) -> Option<String> {
+    let mi = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    for line in mi.lines() {
+        let f: Vec<&str> = line.split(' ').collect();
+        if f.len() > 4 && f[4] == mp {
+            let name = std::fs::read_to_string(format!("/sys/dev/block/{}/dm/name", f[2])).ok()?;
+            let name = name.trim().to_string();
+            return is_veracage_dm(&name).then_some(name);
+        }
+    }
+    None
+}
+
+/// Rewrite the session lock without `dm_name`'s volume line (a closed volume). The
+/// lock is on the shared root fs, so this works from inside the leader's NS too.
+fn session_lock_remove(sid: &str, dm_name: &str) {
+    let path = format!("/run/veracage/session-{sid}.lock");
+    let Ok(body) = std::fs::read_to_string(&path) else { return };
+    let kept: String = body
+        .lines()
+        .filter(|l| {
+            l.strip_prefix("volume=")
+                .map(|v| v.split('\t').next().unwrap_or("").trim() != dm_name)
+                .unwrap_or(true) // keep non-volume lines (user_uid header)
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, kept).is_ok() {
+        set_mode(&tmp, 0o600);
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// Phase 5: close JUST one volume of a running session — join the leader's NS,
+/// unmount `<WORKSPACE>/<label>` (lazy: a running app keeps its own copy), then
+/// `cryptsetup close --deferred` the dm (so a volume still held by an app closes
+/// when released) and drop it from the session lock. The rest of the session runs
+/// on. No --source, no leader, no compositor.
+fn run_close_volume(args: &Args, vault_uid: u32) -> ! {
+    let sid = args.session.as_deref().unwrap_or_else(|| fail("--close-volume needs --session", 2));
+    if !session_id_ok(sid) {
+        fail(&format!("invalid --session {sid:?}"), 2);
+    }
+    let label = args.close_volume.as_deref().unwrap();
+    if !label_ok(label) {
+        fail(&format!("invalid --close-volume label {label:?}"), 2);
+    }
+    let leader_pid = verify_session_leader(sid, vault_uid)
+        .unwrap_or_else(|| fail("no live session to close a volume from", 1));
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        fail_errno("fork");
+    }
+    if pid == 0 {
+        let ns = format!("/proc/{leader_pid}/ns/mnt");
+        let c = CString::new(ns.clone()).unwrap();
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            fail_errno(&format!("open {ns}"));
+        }
+        if unsafe { libc::setns(fd, libc::CLONE_NEWNS) } != 0 {
+            fail_errno("setns(mnt)");
+        }
+        unsafe { libc::close(fd) };
+        let mp = format!("{WORKSPACE}/{label}");
+        let dm = dm_at_mountpoint(&mp).unwrap_or_else(|| fail(&format!("volume {label} not mounted"), 1));
+        let cmp = CString::new(mp.clone()).unwrap();
+        unsafe { libc::umount2(cmp.as_ptr(), libc::MNT_DETACH) };
+        let _ = Command::new(tool("cryptsetup")).args(["close", "--deferred", &dm]).status();
+        session_lock_remove(sid, &dm);
+        let _ = std::fs::remove_dir(&mp);
+        std::process::exit(0);
+    }
+    std::process::exit(wait_for(pid));
 }
 
 /// Bring up the ONE persistent `veracage`-uid compositor. Unlike the vault path
@@ -1193,6 +1285,12 @@ fn main() {
         spawn_compositor(vault_uid, vault_gid, &args, &args.rest);
     }
 
+    // `--close-volume <label>`: close ONE volume of a running session (Phase 5).
+    // No --source; joins the leader's NS and unmounts/closes just that volume.
+    if args.close_volume.is_some() {
+        run_close_volume(&args, vault_uid);
+    }
+
     let source_arg = args
         .source
         .as_deref()
@@ -1391,5 +1489,16 @@ mod tests {
     fn verify_session_leader_none_without_pidfile() {
         // A sid with no session pidfile → no live session (caller bootstraps).
         assert!(verify_session_leader("987654321098765", 0).is_none());
+    }
+
+    #[test]
+    fn label_ok_rejects_traversal() {
+        assert!(label_ok("volA"));
+        assert!(label_ok("Work_Docs"));
+        assert!(!label_ok(""));
+        assert!(!label_ok("."));
+        assert!(!label_ok(".."));
+        assert!(!label_ok("a/b"));
+        assert!(!label_ok("../../etc"));
     }
 }
