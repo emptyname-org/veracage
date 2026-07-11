@@ -33,7 +33,12 @@ which owns the clipboard and hosts an in-window toolbar.
   host is idmap-mounted into the sandbox at `/exchange`. Drop a file in on either
   side and it's there on the other, owned by you — no dialogs, no copies. Off via
   `exchange = false`. (Design: `docs/single-window-ux.md`.)
-- **Multi-vault** — one compositor hosts every open vault's apps (shared clipboard).
+- **Multi-volume shared workspace** — open several volumes at once and they share
+  **one private mount namespace**, appearing side by side at `/vaults/<label>`. One
+  set of apps sees them all, so a single file manager can **drag-and-drop between
+  volumes**. Subsequent opens `setns` into the running session; **Close volume ▸**
+  closes just one (the rest run on). Volumes are shown at an app's **launch time**
+  (open them first, then launch). (Design: `docs/shared-workspace-redesign.md`.)
 - **Enable any installed app** — `veracage configure` (GUI picker) or
   `--add <binary>` / `--remove <key>` / `--list`. No fixed catalog.
 - **Crash-safe teardown** — the session is a `systemd --user` transient service
@@ -87,10 +92,12 @@ in `PREFIX/libexec/veracage`; a polkit policy, a `.desktop` + icon, a udev rule
 ```
 veracage configure                    # enable apps (GUI picker)
 veracage configure --add dolphin      # or by binary name
-veracage open /path/to/vault.vc       # mount + open the compositor
+veracage open /path/to/vault.vc       # mount into the shared workspace
 veracage open /path/to/vault.vc kate  # auto-launch an app too
+veracage open /path/to/other.vc       # a 2nd volume joins the same workspace
 veracage list  /path/to/vault.vc
-veracage close /path/to/vault.vc
+veracage close-volume <label>         # close one volume (or Close volume ▸ menu)
+veracage close /path/to/vault.vc      # tear the whole session down
 ```
 
 `pkexec` prompts for your account password; the CLI then prompts for the vault
@@ -111,7 +118,7 @@ suspend_action = "dismount"     # or "ignore" to keep mounted across suspend
 name     = "Kate"
 category = "text"
 exec     = "kate"
-args     = ["/vault"]
+args     = ["/vaults"]          # the app opens on the workspace (all open volumes)
 
 [volumes."/home/you/Documents/work.vc"]   # optional per-volume overrides
 default_app  = "okular"
