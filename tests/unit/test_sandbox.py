@@ -9,7 +9,7 @@ import pytest
 from veracage import sandbox
 from veracage.apps import App
 
-_KATE = App("kate", "Kate", "kate", ["/vault"])
+_KATE = App("kate", "Kate", "kate", ["/vaults"])
 _OKULAR = App("okular", "Okular", "okular")
 
 
@@ -29,9 +29,9 @@ def test_exchange_bound_at_slash_exchange_when_given():
     sock = Path("/tmp/veracage-test.sock")
     argv = sandbox.bwrap_command("/run/veracage/abc", _KATE, sock,
                                  exchange="/run/veracage/abc.x")
-    # bound at a TOP-LEVEL /exchange, never under /vault (encrypted-at-rest invariant)
+    # bound at a TOP-LEVEL /exchange, never under /vaults (encrypted-at-rest invariant)
     assert _adjacent(argv, "/run/veracage/abc.x", "/exchange")
-    assert "/vault/exchange" not in argv
+    assert "/vaults/exchange" not in argv
 
 
 def test_no_exchange_bind_by_default(argv):
@@ -63,16 +63,16 @@ def test_starts_with_bwrap(argv):
 def test_app_command_appears_after_double_dash(argv):
     sep = argv.index("--")
     assert argv[sep + 1] == "kate"
-    assert "/vault" in argv[sep + 1:]
+    assert "/vaults" in argv[sep + 1:]
 
 
 def test_vault_is_bound_at_slash_vault(argv):
-    # `--bind <mp> /vault` must be present
+    # `--bind <mp> /vaults` must be present
     pairs = list(zip(argv, argv[1:], argv[2:]))
     assert any(
-        a == "--bind" and b == "/run/veracage/abc" and c == "/vault"
+        a == "--bind" and b == "/run/veracage/abc" and c == "/vaults"
         for a, b, c in pairs
-    ), "vault not bound at /vault"
+    ), "vault not bound at /vaults"
 
 
 def test_runtime_dir_is_tmpfs(argv):
@@ -120,7 +120,7 @@ def test_home_is_vault_xdg_is_ephemeral_off_vault(argv):
     so nothing app-generated (not even an empty dotdir) is written into it."""
     triples = list(zip(argv, argv[1:], argv[2:]))
     pairs = list(zip(argv, argv[1:]))
-    assert ("--setenv", "HOME", "/vault") in triples
+    assert ("--setenv", "HOME", "/vaults") in triples
     # XDG dirs are on the ephemeral /xdg tmpfs, never inside the vault.
     assert ("--tmpfs", "/xdg") in pairs, "/xdg is not an ephemeral tmpfs"
     assert ("--setenv", "XDG_CONFIG_HOME", "/xdg/config") in triples
@@ -128,7 +128,7 @@ def test_home_is_vault_xdg_is_ephemeral_off_vault(argv):
     assert ("--setenv", "XDG_DATA_HOME", "/xdg/data") in triples
     # No XDG_* points into the vault.
     assert not any(
-        k.startswith("XDG_") and str(v).startswith("/vault")
+        k.startswith("XDG_") and str(v).startswith("/vaults")
         for a, k, v in triples if a == "--setenv"
     ), "an XDG dir points into the vault"
 
@@ -140,12 +140,12 @@ def test_no_share_user_no_share_net_no_network(argv):
 
 
 def test_app_args_are_passed(argv):
-    # Kate's catalog entry is ["/vault"]; the bwrap argv ends with `kate /vault`.
-    assert argv[-2:] == ["kate", "/vault"]
+    # Kate's catalog entry is ["/vaults"]; the bwrap argv ends with `kate /vaults`.
+    assert argv[-2:] == ["kate", "/vaults"]
 
 
 def test_chdir_to_vault(argv):
-    assert ("--chdir", "/vault") in list(zip(argv, argv[1:]))
+    assert ("--chdir", "/vaults") in list(zip(argv, argv[1:]))
 
 
 def test_etc_is_not_wholesale_bound(argv):

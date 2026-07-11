@@ -4,7 +4,7 @@ There is no catalog / whitelist: you enable ANY installed binary. It is launched
 in the sandbox against the vault (bwrap-confined — no host filesystem, no
 network), so which binary it is doesn't widen what the vault can do.
 
-  veracage configure --add kate --arg /vault   # enable `kate /vault`
+  veracage configure --add kate --arg /vaults   # enable `kate /vaults`
   veracage configure --add /opt/foo/bin/foo    # enable an arbitrary binary
   veracage configure --remove kate             # disable it
   veracage configure --list                    # show enabled apps
@@ -110,6 +110,6 @@ def add_subparser(sub: argparse._SubParsersAction) -> None:
     g.add_argument("--list", action="store_true", help="list enabled apps")
     p.add_argument("--name", help="display name for --add (default: the binary name)")
     p.add_argument("--arg", action="append", metavar="ARG",
-                   help="argument to pass the app (repeatable), e.g. --arg /vault")
+                   help="argument to pass the app (repeatable), e.g. --arg /vaults")
     p.add_argument("--key", help="explicit config key for --add")
     p.set_defaults(func=main)

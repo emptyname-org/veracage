@@ -240,13 +240,23 @@ def test_accept_app_launch_execs_by_index(tmp_path, monkeypatch):
     assert launched["spec"]["exec"] == "okular"
 
 
-def test_write_places_file_uses_label(tmp_path, monkeypatch):
+def test_write_places_file_one_entry_per_volume(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    p = leader._write_places_file("Photos & Docs")
+    p = leader._write_places_file(["Work", "Photos"])
     assert p == tmp_path / "user-places.xbel"
     body = p.read_text()
-    assert 'href="file:///vault"' in body
-    assert "<title>Photos &amp; Docs</title>" in body   # XML-escaped label
+    # one Places entry per open volume, each at /vaults/<label>
+    assert 'href="file:///vaults/Work"' in body
+    assert 'href="file:///vaults/Photos"' in body
+    assert "<title>Work</title>" in body and "<title>Photos</title>" in body
+
+
+def test_scan_volumes_lists_dirs_skips_dotfiles(tmp_path):
+    (tmp_path / "volA").mkdir()
+    (tmp_path / "volB").mkdir()
+    (tmp_path / ".exchange").mkdir()          # dot entry — skipped
+    (tmp_path / "note.txt").write_text("x")   # not a dir — skipped
+    assert leader.scan_volumes(tmp_path) == ["volA", "volB"]
 
 
 def test_accept_app_launch_ignores_out_of_range(tmp_path, monkeypatch):

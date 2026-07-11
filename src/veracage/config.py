@@ -8,7 +8,7 @@ Schema (slice 1.5):
     [apps.kate]
     name     = "Kate"
     exec     = "kate"
-    args     = ["/vault"]
+    args     = ["/vaults"]
 
 The `apps.*` table is the user's enabled list — any installed binary they added.
 Anything not in the config is not shown as a toolbar launcher by `veracage open`.
@@ -111,11 +111,17 @@ def load() -> Config:
                       file=sys.stderr)
                 continue
             try:
+                # Migrate pre-shared-workspace configs: the sandbox binds the
+                # /vaults tree now, so an app pointed at the old single /vault
+                # would open a non-existent path. Retarget /vault[/…] -> /vaults.
+                raw_args = list(entry.get("args", []))
+                args = [("/vaults" + a[len("/vault"):]) if a == "/vault" or a.startswith("/vault/")
+                        else a for a in raw_args]
                 apps[key] = App(
                     key=key,
                     name=entry["name"],
                     exec=entry["exec"],
-                    args=list(entry.get("args", [])),
+                    args=args,
                 )
             except (KeyError, TypeError) as e:
                 print(f"veracage: config entry [apps.{key}] invalid ({e}); skipping",

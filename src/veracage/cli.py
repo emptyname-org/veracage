@@ -134,12 +134,9 @@ def cmd_up(args: argparse.Namespace) -> int:
 
 def cmd_open(args: argparse.Namespace) -> int:
     cfg = config.load()
-    if cfg.is_empty():
-        print("veracage: no apps enabled yet.\n"
-              "Add one with `veracage configure --add <binary>` (e.g. kate, dolphin),\n"
-              "or open the launcher's Configure window, then re-run.",
-              file=sys.stderr)
-        return 2
+    # Apps and volumes are independent (shared-workspace model): a vault mounts
+    # even with no apps enabled — it just appears with nothing launched, and the
+    # user enables/launches apps from the compositor. (No is_empty() gate.)
 
     # Every enabled app becomes a toolbar launcher.
     apps_list = [{"name": a.name, "exec": a.exec, "args": a.args}

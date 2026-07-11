@@ -13,7 +13,7 @@ def test_load_missing_returns_empty(tmp_xdg_config):
 def test_save_then_load_roundtrip(tmp_xdg_config):
     original = config.Config(
         apps={
-            "kate":   apps.App("kate", "Kate", "kate", ["/vault"]),
+            "kate":   apps.App("kate", "Kate", "kate", ["/vaults"]),
             "okular": apps.App("okular", "Okular", "okular"),
         },
         last_used_app="okular",
@@ -24,8 +24,20 @@ def test_save_then_load_roundtrip(tmp_xdg_config):
     assert set(loaded.apps) == {"kate", "okular"}
     assert loaded.apps["kate"].exec == "kate"
     assert loaded.apps["okular"].args == []
-    assert loaded.apps["kate"].args == ["/vault"]
+    assert loaded.apps["kate"].args == ["/vaults"]
     assert loaded.last_used_app == "okular"
+
+
+def test_load_migrates_old_vault_args(tmp_xdg_config):
+    """Pre-shared-workspace configs pointed apps at /vault; load retargets them
+    to the /vaults tree (the sandbox no longer has a bare /vault)."""
+    config.save(config.Config(apps={
+        "dolphin": apps.App("dolphin", "Dolphin", "dolphin", ["/vault"]),
+        "kate":    apps.App("kate", "Kate", "kate", ["/vault/Docs", "-b"]),
+    }))
+    loaded = config.load()
+    assert loaded.apps["dolphin"].args == ["/vaults"]
+    assert loaded.apps["kate"].args == ["/vaults/Docs", "-b"]
 
 
 def test_load_skips_malformed_entry(tmp_xdg_config, capsys):

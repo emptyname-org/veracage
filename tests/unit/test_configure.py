@@ -15,10 +15,10 @@ def _ns(**kw):
 
 def test_add_enables_installed_binary(tmp_xdg_config, fake_path_with):
     fake_path_with(["kate"])
-    assert configure._add(_ns(add="kate", arg=["/vault"])) == 0
+    assert configure._add(_ns(add="kate", arg=["/vaults"])) == 0
     cfg = config.load()
     assert cfg.apps["kate"].exec == "kate"
-    assert cfg.apps["kate"].args == ["/vault"]
+    assert cfg.apps["kate"].args == ["/vaults"]
 
 
 def test_add_rejects_uninstalled(tmp_xdg_config, fake_path_with):

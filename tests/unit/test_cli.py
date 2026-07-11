@@ -180,17 +180,21 @@ def test_open_rejects_missing_vault(monkeypatch, configured, tmp_path, capsys):
     assert "not found" in capsys.readouterr().err
 
 
-def test_open_refuses_when_no_apps_configured(monkeypatch, tmp_xdg_config, fake_vault, capsys):
-    """No catalog auto-detection any more: an empty config refuses cleanly (no
-    mount) and points at `veracage configure --add`, rather than guessing."""
+def test_open_mounts_even_with_no_apps_configured(monkeypatch, tmp_xdg_config, fake_vault):
+    """Shared-workspace model: apps and volumes are independent, so an empty app
+    config no longer blocks a mount — the vault opens with nothing launched
+    (--apps [], no --first), and the user enables/launches apps afterwards."""
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
-    with mock.patch("subprocess.run") as run:
-        rc = cli.cmd_open(argparse.Namespace(
+    monkeypatch.setenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen"):
+        run.return_value.returncode = 0
+        cli.cmd_open(argparse.Namespace(
             vault=str(fake_vault), app=None, passphrase_stdin=False))
-    assert rc == 2
-    assert not run.called                       # no vault mount attempted
-    assert "configure --add" in capsys.readouterr().err
-    assert config.load().is_empty()
+    argv = run.call_args.args[0]
+    assert "pkexec" in argv                      # a mount WAS attempted
+    after = argv[argv.index("--") + 1:]
+    assert "--first" not in after                # nothing auto-launched
+    assert json.loads(dict(zip(after, after[1:]))["--apps"]) == []  # no apps
 
 
 # ---------------------------------------------- persistent compositor ----

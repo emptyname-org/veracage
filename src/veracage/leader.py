@@ -40,6 +40,23 @@ from .wayland import COMPOSITOR_RUNTIME, COMPOSITOR_SOCKET, compositor_is_up
 
 _MAX_REQUEST_BYTES = 64 * 1024  # control requests are tiny; cap to bound memory
 
+# The shared-workspace root (must match WORKSPACE in helper-rs/src/main.rs): the
+# leader's private-NS tmpfs holding every open volume at <WORKSPACE>/<label>. The
+# sandbox binds this whole tree at /vaults, so one app sees all volumes.
+WORKSPACE = Path("/run/veracage/vaults")
+
+
+def scan_volumes(root: Path = WORKSPACE) -> list[str]:
+    """The open volumes' labels — the directory names under the workspace root
+    (the helper already sanitised them to a single safe path component). Dot
+    entries (the `.exchange` mount, staging leftovers) are skipped. Sorted."""
+    try:
+        names = [e.name for e in os.scandir(root)
+                 if e.is_dir(follow_symlinks=False) and not e.name.startswith(".")]
+    except OSError:
+        return []
+    return sorted(names)
+
 
 # --------------------------------------------------------- leader state ----
 
@@ -120,7 +137,9 @@ def _launch_app(state: _LeaderState, spec) -> dict:
         except OSError:
             places_fd = None
     try:
-        argv = bwrap_command(state.mountpoint, app, state.wl_socket, state.gpu,
+        # Bind the whole workspace (/vaults tree), not one volume — the app sees
+        # every volume open at launch time (docs/shared-workspace-redesign.md).
+        argv = bwrap_command(str(WORKSPACE), app, state.wl_socket, state.gpu,
                              places_fd, state.exchange)
         # Detach the app's stdio. Inheriting the leader's stdin/out/err hands a
         # chatty viewer the session's terminal/journal: Qt/KF apps print the paths
@@ -234,25 +253,28 @@ def _publish_apps(state: _LeaderState) -> socket.socket | None:
         os.chmod(sock_path, 0o700)
         srv.listen(4)
         srv.setblocking(False)
-        # Plain, dependency-free format the Rust compositor parses:
-        #   <sock filename>\n<volume label>\n<opener index>\n<app name>\n<app name>...
-        # Sanitize names the same way as the label: config is human-owned, but a
-        # newline in a name would desync this newline-delimited protocol.
-        names = [_sanitize_label(str(a.get("name") or a.get("exec") or "app"))
-                 for a in state.app_specs]
-        # The "opener" — which enabled app the compositor's desktop tile launches
-        # to open this vault. First file manager, else the first app, else -1.
-        opener = next(
-            (i for i, a in enumerate(state.app_specs)
-             if is_file_manager(str(a.get("exec") or ""))),
-            0 if state.app_specs else -1,
-        )
-        body = [sock_path.name, state.volume_label or "Vault", str(opener), *names]
-        _apps_file_path(state).write_text("\n".join(body) + "\n")
+        _write_apps_file(state)
         return srv
     except OSError as e:
         print(f"veracage: could not publish toolbar apps: {e}", file=sys.stderr)
         return None
+
+
+def _write_apps_file(state: _LeaderState) -> None:
+    """(Re)write the `.apps` file the compositor toolbar reads. Plain, dependency-
+    free format:  <sock filename>\\n<volume label(s)>\\n<opener index>\\n<app name>…
+    Re-called when the open-volume set changes so the title tracks the volumes.
+    Names are sanitised like the label (a newline would desync the protocol)."""
+    names = [_sanitize_label(str(a.get("name") or a.get("exec") or "app"))
+             for a in state.app_specs]
+    # The "opener": first file manager, else the first app, else -1.
+    opener = next(
+        (i for i, a in enumerate(state.app_specs)
+         if is_file_manager(str(a.get("exec") or ""))),
+        0 if state.app_specs else -1,
+    )
+    body = [_app_socket_path(state).name, state.volume_label or "Vault", str(opener), *names]
+    _apps_file_path(state).write_text("\n".join(body) + "\n")
 
 
 def _unpublish_apps(state: _LeaderState) -> None:
@@ -280,7 +302,7 @@ def _accept_app_launch(app_srv: socket.socket, state: _LeaderState) -> None:
 #
 # Seed the sandbox file manager's Places so the vault appears as a named volume
 # (KDE/Dolphin reads $XDG_DATA_HOME/user-places.xbel). The label is the volume's
-# own filesystem label (the helper reads it via blkid); the entry points at /vault.
+# own filesystem label (the helper reads it via blkid); the entry points at /vaults.
 
 def _sanitize_label(raw: str) -> str:
     """A safe volume label: no newlines (they'd desync the newline-delimited
@@ -308,8 +330,15 @@ def _bookmark(href: str, title: str, icon: str, ident: str) -> str:
     )
 
 
-def _places_xbel(label: str, with_exchange: bool) -> str:
-    body = _bookmark("file:///vault", label, "drive-harddisk-encrypted", "veracage-vault")
+def _places_xbel(labels: list[str], with_exchange: bool) -> str:
+    # One Places entry per open volume, each pointing at /vaults/<label>. The
+    # names are the workspace directory names (helper-sanitised: no spaces/slashes),
+    # so they need no URL-encoding.
+    body = "".join(
+        _bookmark(f"file:///vaults/{lbl}", lbl, "drive-harddisk-encrypted",
+                  f"veracage-vault-{lbl}")
+        for lbl in (labels or ["Vault"])
+    )
     if with_exchange:
         # The shared host<->vault folder, mounted at /exchange in the sandbox.
         body += _bookmark("file:///exchange", "Exchange (host-shared)",
@@ -325,12 +354,13 @@ def _places_xbel(label: str, with_exchange: bool) -> str:
     )
 
 
-def _write_places_file(label: str, with_exchange: bool = False) -> Path | None:
-    """Write the seeded Places file to the vault runtime dir and return its path,
-    or None if it can't be written (the sandbox then just has no Places entry)."""
+def _write_places_file(labels: list[str], with_exchange: bool = False) -> Path | None:
+    """Write the seeded Places file (one entry per open volume) to the vault
+    runtime dir and return its path, or None if it can't be written (the sandbox
+    then just has no Places entries)."""
     try:
         path = Path(os.environ["XDG_RUNTIME_DIR"]) / "user-places.xbel"
-        path.write_text(_places_xbel(label, with_exchange))
+        path.write_text(_places_xbel(labels, with_exchange))
         return path
     except (OSError, KeyError) as e:
         print(f"veracage: could not seed Places: {e}", file=sys.stderr)
@@ -366,12 +396,13 @@ def run_leader(mountpoint: str, gpu: bool, app_specs: list, first_app: dict | No
         return 1
     state.wl_socket = COMPOSITOR_SOCKET
 
-    # The volume's label (the helper passes it in VERACAGE_VOLUME_LABEL; fall back
-    # to the mount name). Used for the compositor window title + the Places name.
-    raw_label = os.environ.get("VERACAGE_VOLUME_LABEL") or Path(mountpoint).name or "Vault"
-    state.volume_label = _sanitize_label(raw_label)
+    # The open volumes (there may be several — subsequent opens setns more into the
+    # workspace). Their labels drive the window title + the Places entries; the
+    # sandbox binds the whole /vaults tree so one app sees them all.
     state.exchange = os.environ.get("VERACAGE_EXCHANGE") or None
-    state.places_file = _write_places_file(state.volume_label, state.exchange is not None)
+    labels = scan_volumes()
+    state.volume_label = ", ".join(labels) if labels else "Vault"
+    state.places_file = _write_places_file(labels, state.exchange is not None)
 
     stop = threading.Event()
 
@@ -401,11 +432,21 @@ def run_leader(mountpoint: str, gpu: bool, app_specs: list, first_app: dict | No
         # its ExecStopPost cleanup close the dm device + unmount — otherwise the
         # leader would keep the vault mounted forever and block the next open.
         comp_seen = False
+        seen_labels = labels
         try:
             while not stop.is_set():
                 _reap_children(state)
                 if state.closing:
                     break
+                # Pick up volumes added to the workspace (subsequent opens setns
+                # more in): refresh Places (for the NEXT app launch — a running
+                # app's mount NS is fixed) and the compositor title.
+                cur = scan_volumes()
+                if cur != seen_labels:
+                    seen_labels = cur
+                    state.volume_label = ", ".join(cur) if cur else "Vault"
+                    state.places_file = _write_places_file(cur, state.exchange is not None)
+                    _write_apps_file(state)
                 if compositor_is_up():
                     comp_seen = True
                 elif comp_seen:

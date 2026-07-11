@@ -7,10 +7,17 @@ from pathlib import Path
 from .apps import App
 
 
-def bwrap_command(mountpoint: str, app: App, wayland_socket: Path,
+def bwrap_command(workspace: str, app: App, wayland_socket: Path,
                   gpu: bool = False, places_fd: int | None = None,
                   exchange: str | None = None) -> list[str]:
     """Construct argv for `bwrap`.
+
+    `workspace` is the shared-workspace root (the leader's tmpfs holding every
+    open volume at `<workspace>/<label>`); it is recursively bound at `/vaults`,
+    so a single app sees ALL open volumes side by side (`/vaults/<label>`) — the
+    basis for cross-volume drag-and-drop. Apps see the volumes mounted **at launch
+    time** (their mount namespace is fixed then); open the volumes first, then
+    launch.
 
     `wayland_socket` is the host-visible path to the (nested) Wayland socket
     the sandboxed app should connect to. We mount only that single socket
@@ -58,7 +65,7 @@ def bwrap_command(mountpoint: str, app: App, wayland_socket: Path,
         "--symlink", "usr/lib64", "/lib64",
         "--symlink", "usr/bin",   "/bin",
         "--symlink", "usr/sbin",  "/sbin",
-        "--bind", mountpoint, "/vault",
+        "--bind", workspace, "/vaults",
         # Hide the host runtime dir behind a tmpfs, then bind only the
         # (nested) Wayland socket. The sandbox can't see anything else
         # the user session left in there (dbus, pulseaudio, host wayland).
@@ -66,13 +73,12 @@ def bwrap_command(mountpoint: str, app: App, wayland_socket: Path,
         # it otherwise) and the wayland socket lives inside it.
         "--perms", "0700", "--tmpfs", f"/run/user/{uid}",
         "--bind", str(wayland_socket), f"/run/user/{uid}/wayland-0",
-        # HOME is the VAULT so the app's open/save dialogs default to the user's
-        # documents — a save that silently lands in a tmpfs home would be lost
-        # data. App config/cache/data instead go to an ephemeral tmpfs *outside*
-        # the vault (via XDG_*), so nothing app-generated is written into the
-        # volume — not even an empty dotdir. Only files the user explicitly saves
-        # under /vault persist. (A non-XDG app hardcoding ~/.foo would still hit
-        # the vault, but the catalog apps are all XDG-compliant.)
+        # HOME is the workspace ROOT so open/save dialogs default to the volumes
+        # (each a folder under /vaults); the file manager also opens here, showing
+        # every volume side by side. App config/cache/data go to an ephemeral tmpfs
+        # (via XDG_*), so nothing app-generated is written into any volume. Files
+        # the user saves under /vaults/<label> persist; a stray save to ~ itself
+        # (the tmpfs workspace root) would not — but that is not a volume.
         "--perms", "0700", "--tmpfs", "/xdg",
         # Env — start from EMPTY (`--clearenv`) so the possibly-hostile app does
         # NOT inherit the leader's environment (host DISPLAY, session tokens, auth
@@ -81,7 +87,7 @@ def bwrap_command(mountpoint: str, app: App, wayland_socket: Path,
         # implicit; this makes it explicit. PATH is required for bwrap to resolve
         # a bare `app.exec`; locale is added from an allowlist further down.
         "--clearenv",
-        "--setenv", "HOME", "/vault",
+        "--setenv", "HOME", "/vaults",
         "--setenv", "PATH", "/usr/bin:/bin:/usr/local/bin",
         "--setenv", "XDG_RUNTIME_DIR", f"/run/user/{uid}",
         "--setenv", "XDG_CONFIG_HOME", "/xdg/config",
@@ -90,7 +96,7 @@ def bwrap_command(mountpoint: str, app: App, wayland_socket: Path,
         "--setenv", "XDG_STATE_HOME",  "/xdg/state",
         "--setenv", "WAYLAND_DISPLAY", "wayland-0",
         "--setenv", "XDG_SESSION_TYPE", "wayland",
-        "--chdir", "/vault",
+        "--chdir", "/vaults",
     ]
     # Preserve locale (an explicit allowlist, not blanket inheritance) so dates,
     # numbers and fonts render correctly; everything else stays cleared.
@@ -112,7 +118,7 @@ def bwrap_command(mountpoint: str, app: App, wayland_socket: Path,
     if exchange is not None:
         # The idmapped host<->vault shared folder (helper mounted it in this NS,
         # presented as veracage-owned). Bind it at /exchange — a top-level path,
-        # NOT under /vault, so the "everything in HOME is encrypted" invariant
+        # NOT under /vaults, so the "everything in HOME is encrypted" invariant
         # holds. The underlying mount already carries nosuid,nodev,noexec.
         argv += ["--bind", exchange, "/exchange"]
     argv += ["--", app.exec, *app.args]

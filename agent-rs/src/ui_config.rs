@@ -81,11 +81,11 @@ impl ConfigApp {
             key: key_for(exec, &taken),
             name: name.to_string(),
             exec: exec.to_string(),
-            args: vec!["/vault".to_string()],
+            args: vec!["/vaults".to_string()],
         });
     }
 
-    /// Add ANY installed binary (name defaults to its basename, opened at /vault).
+    /// Add ANY installed binary (name defaults to its basename, opened at /vaults).
     fn add_custom(&mut self) {
         let exec = self.new_exec.trim().to_string();
         if exec.is_empty() {
@@ -104,7 +104,7 @@ impl ConfigApp {
             .map(|a| a.key.clone())
             .unwrap_or_else(|| key_for(&exec, &taken));
         self.apps.retain(|a| a.exec != exec);
-        self.apps.push(apps::App { key, name: basename(&exec), exec, args: vec!["/vault".into()] });
+        self.apps.push(apps::App { key, name: basename(&exec), exec, args: vec!["/vaults".into()] });
         self.new_exec.clear();
         self.error.clear();
     }
