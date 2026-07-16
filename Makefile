@@ -137,8 +137,8 @@ install: build build-agent build-compositor
 	$(SUDO) install -d "$(DESTDIR)$(SLEEPDIR)"
 	sed 's|@LIBDIR@|$(LIBDIR)|g' install/veracage-sleep.in | $(SUDO) tee "$(DESTDIR)$(SLEEPDIR)/veracage" >/dev/null
 	$(SUDO) chmod 0755 "$(DESTDIR)$(SLEEPDIR)/veracage"
-	@[ -n "$(DESTDIR)" ] || command -v update-desktop-database >/dev/null 2>&1 && sudo update-desktop-database "$(APPDIR)" 2>/dev/null || true
-	@[ -n "$(DESTDIR)" ] || command -v gtk-update-icon-cache >/dev/null 2>&1 && sudo gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor" 2>/dev/null || true
+	@[ -n "$(DESTDIR)" ] || { command -v update-desktop-database >/dev/null 2>&1 && sudo update-desktop-database "$(APPDIR)" 2>/dev/null; } || true
+	@[ -n "$(DESTDIR)" ] || { command -v gtk-update-icon-cache >/dev/null 2>&1 && sudo gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor" 2>/dev/null; } || true
 	@echo 'Installed to $(PREFIX). Launch "Veracage" from your app menu, or run: veracage configure'
 
 # --- dev install: polkit points at this checkout -------------------------

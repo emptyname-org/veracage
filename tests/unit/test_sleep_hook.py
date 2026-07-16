@@ -245,3 +245,112 @@ def test_pid_alive():
     assert sleep_hook.pid_alive(os.getpid()) is True
     # a pid that is essentially never live
     assert sleep_hook.pid_alive(2**31 - 1) is False
+
+
+# --------------------------------------- shared-workspace session teardown ---
+#
+# Regression for the redesign's primary path: every `veracage open` writes a
+# session-<sid>.lock (user_uid= + volume=<dm>\t<label> lines, NO dm_name=).
+# Routing it through the legacy parser read dm_name="" and silently skipped the
+# teardown — the machine slept with every dm-crypt key still in RAM.
+
+def _session_lock(tmp_path, volumes=None):
+    p = tmp_path / "session-1000.lock"
+    lines = ["user_uid=1000"]
+    lines += [f"volume={dm}\t{label}"
+              for dm, label in (volumes or [("veracage-aaaaaaaaaaaa", "A"),
+                                            ("veracage-bbbbbbbbbbbb", "B")])]
+    p.write_text("\n".join(lines) + "\n")
+    return p
+
+
+def test_main_routes_session_locks_to_shared_teardown(tmp_path):
+    locks = tmp_path / "veracage"
+    locks.mkdir()
+    (locks / "aa.lock").write_text("dm_name=veracage-aaaaaaaaaaaa\n")
+    (locks / "session-1000.lock").write_text(
+        "user_uid=1000\nvolume=veracage-bbbbbbbbbbbb\tWork\n")
+    legacy, shared = [], []
+    with mock.patch.object(sleep_hook.cleanup, "LOCKS_DIR", locks), \
+         mock.patch("os.geteuid", return_value=0), \
+         mock.patch.object(sleep_hook, "teardown_session", side_effect=legacy.append), \
+         mock.patch.object(sleep_hook, "teardown_shared_session",
+                           side_effect=shared.append):
+        assert sleep_hook.main(["pre", "suspend"]) == 0
+    assert [p.name for p in legacy] == ["aa.lock"]
+    assert [p.name for p in shared] == ["session-1000.lock"]
+
+
+def test_shared_teardown_skips_when_ignore(tmp_path):
+    p = _session_lock(tmp_path)
+    with mock.patch.object(sleep_hook, "owner_wants_dismount", return_value=False), \
+         mock.patch.object(sleep_hook, "dm_present") as dm, \
+         mock.patch("os.kill") as k:
+        sleep_hook.teardown_shared_session(p)
+    dm.assert_not_called()
+    k.assert_not_called()
+
+
+def test_shared_teardown_noop_when_dms_already_gone(tmp_path):
+    p = _session_lock(tmp_path)
+    with mock.patch.object(sleep_hook, "owner_wants_dismount", return_value=True), \
+         mock.patch.object(sleep_hook, "dm_present", return_value=False), \
+         mock.patch.object(sleep_hook, "_session_leader_pid") as lp, \
+         mock.patch("os.kill") as k:
+        sleep_hook.teardown_shared_session(p)
+    lp.assert_not_called()
+    k.assert_not_called()
+
+
+def test_shared_teardown_graceful_sigterm_then_dms_gone(tmp_path):
+    p = _session_lock(tmp_path)
+    with mock.patch.object(sleep_hook, "owner_wants_dismount", return_value=True), \
+         mock.patch.object(sleep_hook, "dm_present", return_value=True), \
+         mock.patch.object(sleep_hook, "_session_leader_pid", return_value=4321), \
+         mock.patch.object(sleep_hook, "_wait_dms_gone", return_value=True) as w, \
+         mock.patch.object(sleep_hook.cleanup, "cleanup_session") as cs, \
+         mock.patch("os.kill") as k:
+        sleep_hook.teardown_shared_session(p)
+    k.assert_called_once_with(4321, signal.SIGTERM)
+    # the grace wait covered EVERY volume's dm, not just the first
+    assert w.call_args.args[0] == ["veracage-aaaaaaaaaaaa", "veracage-bbbbbbbbbbbb"]
+    cs.assert_not_called()
+
+
+def test_shared_teardown_force_path_when_grace_expires(tmp_path):
+    p = _session_lock(tmp_path)
+    with mock.patch.object(sleep_hook, "owner_wants_dismount", return_value=True), \
+         mock.patch.object(sleep_hook, "dm_present", return_value=True), \
+         mock.patch.object(sleep_hook, "_session_leader_pid", return_value=999), \
+         mock.patch.object(sleep_hook, "pid_alive", return_value=True), \
+         mock.patch.object(sleep_hook, "_wait_dms_gone", return_value=False), \
+         mock.patch.object(sleep_hook.cleanup, "cleanup_session") as cs, \
+         mock.patch("os.kill") as k:
+        sleep_hook.teardown_shared_session(p)
+    kinds = {call.args[1] for call in k.call_args_list}
+    assert signal.SIGTERM in kinds and signal.SIGKILL in kinds
+    cs.assert_called_once_with(p)
+
+
+def test_shared_teardown_works_without_a_pidfile(tmp_path):
+    """No session pidfile (crashed helper): still force-close via cleanup."""
+    p = _session_lock(tmp_path)
+    with mock.patch.object(sleep_hook, "owner_wants_dismount", return_value=True), \
+         mock.patch.object(sleep_hook, "dm_present", return_value=True), \
+         mock.patch.object(sleep_hook, "_wait_dms_gone", return_value=False), \
+         mock.patch.object(sleep_hook.cleanup, "cleanup_session") as cs, \
+         mock.patch("os.kill") as k:
+        sleep_hook.teardown_shared_session(p)
+    k.assert_not_called()          # no verified leader → nothing to signal
+    cs.assert_called_once_with(p)  # but the devices still get closed
+
+
+def test_session_leader_pid_reads_verified_pidfile(tmp_path):
+    p = tmp_path / "session-1000.lock"
+    p.write_text("user_uid=1000\n")
+    pidf = tmp_path / "session-1000.pid"
+    st = cleanup._proc_starttime(os.getpid())
+    pidf.write_text(f"{os.getpid()}\n{st}\n")
+    assert sleep_hook._session_leader_pid(p) == os.getpid()
+    pidf.write_text(f"{os.getpid()}\n0\n")   # wrong start-time (pid reuse)
+    assert sleep_hook._session_leader_pid(p) is None

@@ -60,7 +60,7 @@ Generalizes the existing `configure.req` mtime signal into a small verb channel.
 
 - On a menu selection needing the broker, the compositor writes
   `/run/veracage/rt/cmd.req` — one line: `<counter> <verb> [payload]` (verbs:
-  `open`, `configure`, `settings`, `close`, `import`, `export`). Mode `0644` so the
+  `open`, `configure`, `settings`, `close-all`, `import`, `export`). Mode `0644` so the
   human broker can read the verb (`/run/veracage/rt` is `0711 veracage`; the broker
   traverses + reads by exact path). The counter makes each write a distinct event.
 - The broker polls the file's mtime (as it already does for `configure.req`) and,
@@ -88,8 +88,8 @@ Cold open shows **two** dialogs, in VeraCrypt order:
    `kdialog`/`zenity`).
 2. **polkit auth** — the desktop's polkit agent asks for the user's **login
    password** to authorize the root mount helper (`auth_self_keep`, cached ~5 min;
-   the compositor spawn + mount are one pkexec = one prompt). Not `sudo`, not root's
-   password.
+   the compositor bring-up and the mount are **two** pkexecs that `auth_self_keep`
+   coalesces into a **single** prompt). Not `sudo`, not root's password.
 
 Subsequent opens while a session is up: **only** the passphrase dialog (polkit
 cached), and the new vault's apps join the existing compositor window (no new
@@ -168,19 +168,3 @@ a future config knob for no-plaintext-at-rest.
 Visual/interactive verification (menu feel, dropdown input capture over the sandbox,
 the transient dialogs, the open flow) needs the user's KDE box; the build + the
 headless compositor smoke are VPS-tested.
-
-## Deferred (the UI pass) — empty-compositor front door
-
-The model above puts the front door on the empty compositor window; the current
-build still pops the picker at launch. To land it (and delete that startup picker):
-
-- Capability exists: helper `--spawn-compositor` brings the compositor up with no
-  vault; the menu already handles the empty state (`(open a vault first)`).
-- Change: the broker's startup does **ensure-compositor-up** (spawn
-  `--spawn-compositor` if not running) instead of the immediate `open_flow()` — the
-  picker then fires only on the File → Open command (`open_flow` is unchanged, just
-  no longer called at startup).
-- **Caveat:** spawning the compositor is a `pkexec`, so a cold launch prompts polkit
-  once. Keep the compositor **persistent** across launches (spawn once; later
-  launches just focus it → no re-prompt); `auth_self_keep` covers a vault opened
-  shortly after. Don't lazily defer the spawn to first-open, or launch shows nothing.

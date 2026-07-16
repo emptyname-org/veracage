@@ -31,6 +31,10 @@ use zeroize::{Zeroize, Zeroizing};
 const CMD_REQ: &str = "/run/veracage/rt/cmd.req"; // compositor -> broker (must match toolbar.rs)
 const COMPOSITOR_PID: &str = "/run/veracage/rt/compositor.pid";
 const POLL: Duration = Duration::from_millis(300);
+/// How long to wait for the compositor to FIRST appear before giving up (it comes
+/// up behind a polkit prompt whose duration is the user's, not ours). Generous so
+/// a slow authentication never orphans it; bounded so a cancelled auth still exits.
+const COMPOSITOR_FIRST_WAIT: Duration = Duration::from_secs(180);
 
 pub fn run_broker() -> ! {
     let dir = human_runtime_dir();
@@ -48,10 +52,11 @@ pub fn run_broker() -> ! {
 
     let mut b = Broker {
         jobs: Vec::new(),
-        last_vault: None,
         cmd_seen: mtime(Path::new(CMD_REQ)),
         open_seen: mtime(&dir.join("open.req")),
         open_req: dir.join("open.req"),
+        comp_seen: false,
+        started: std::time::Instant::now(),
     };
 
     // Compositor-first: bring up the EMPTY compositor (the front door) — no
@@ -79,10 +84,26 @@ pub fn run_broker() -> ! {
             b.open_flow();
         }
 
-        // Exit once nothing is in flight and no compositor remains — the session
-        // is fully over (or the first open was cancelled and never came up).
-        if b.jobs.is_empty() && !compositor_is_up() {
-            std::process::exit(0);
+        // Exit decision. The compositor is brought up asynchronously (its own
+        // systemd unit + a polkit prompt): `_up` returns after only a few seconds,
+        // but the user may still be authenticating, so the compositor can appear
+        // LATER. Exiting the moment it isn't up yet would orphan the compositor
+        // with no broker to serve its menu — the "run it, nothing happens" bug.
+        // So: never treat "compositor down" as session-over until we've SEEN it up
+        // at least once; before that, wait out a generous first-appearance grace
+        // (covers a slow polkit auth) rather than exiting.
+        if compositor_is_up() {
+            b.comp_seen = true;
+        }
+        if b.jobs.is_empty() {
+            if b.comp_seen && !compositor_is_up() {
+                std::process::exit(0); // session fully over
+            }
+            if !b.comp_seen && b.started.elapsed() > COMPOSITOR_FIRST_WAIT {
+                // It never came up (auth cancelled / bring-up failed) and nothing
+                // is in flight — give up rather than poll forever.
+                std::process::exit(0);
+            }
         }
         std::thread::sleep(POLL);
     }
@@ -90,10 +111,13 @@ pub fn run_broker() -> ! {
 
 struct Broker {
     jobs: Vec<Child>,
-    last_vault: Option<String>,
     cmd_seen: Option<u128>,
     open_seen: Option<u128>,
     open_req: PathBuf,
+    /// Latched once the compositor has been observed up — only then does its
+    /// later disappearance mean the session is over (see the exit decision).
+    comp_seen: bool,
+    started: std::time::Instant,
 }
 
 impl Broker {
@@ -131,7 +155,6 @@ impl Broker {
                     let _ = stdin.write_all(&pass); // drop -> EOF
                 }
                 self.jobs.push(child);
-                self.last_vault = Some(vault);
             }
             Err(e) => eprintln!("veracage: could not run `veracage open`: {e}"),
         }
@@ -144,18 +167,27 @@ impl Broker {
             self.close_volume(label);
             return;
         }
+        // "Close vault" closes EVERY open volume: `close-all:<l1>\t<l2>…`. Driven
+        // by the labels the compositor already has, so it works regardless of
+        // which process opened the vaults (unlike the old in-memory last_vault).
+        if let Some(labels) = verb.strip_prefix("close-all:") {
+            for label in labels.split('\t').filter(|l| !l.is_empty()) {
+                self.close_volume(label);
+            }
+            return;
+        }
         match verb {
             "open" => self.open_flow(),
             "configure" => self.spawn_dialog("configure"),
             "settings" => self.spawn_dialog("_settings"),
             "about" => self.spawn_dialog("_about"),
-            "close" => self.close_last(),
             "import" | "export" => {
                 // File transfer is the shared Exchange folder — drop files in on
                 // either side. Import/Export just open it in the host file manager.
-                let dir = std::env::var("HOME")
-                    .map(|h| format!("{h}/Veracage/Exchange"))
-                    .unwrap_or_default();
+                // Use the SAME dir the sandbox mounts at /exchange (the configured
+                // exchange_dir), not a hardcoded ~/Veracage/Exchange — otherwise
+                // files dropped here never appear inside the sandbox.
+                let dir = crate::config::load().exchange_path();
                 let _ = std::fs::create_dir_all(&dir);
                 if let Err(e) = Command::new("xdg-open").arg(&dir).spawn() {
                     eprintln!("veracage: open exchange folder: {e}");
@@ -200,18 +232,6 @@ impl Broker {
         match Command::new(bin).arg("close-volume").arg(label).spawn() {
             Ok(child) => self.jobs.push(child),
             Err(e) => eprintln!("veracage: could not close volume {label}: {e}"),
-        }
-    }
-
-    /// Close the most recently opened vault (the File → Close vault action).
-    fn close_last(&mut self) {
-        let Some(vault) = self.last_vault.clone() else {
-            return;
-        };
-        let Some(bin) = veracage_bin() else { return };
-        match Command::new(bin).arg("close").arg(&vault).spawn() {
-            Ok(child) => self.jobs.push(child),
-            Err(e) => eprintln!("veracage: could not close {vault}: {e}"),
         }
     }
 
@@ -263,8 +283,14 @@ fn prompt_passphrase(name: &str) -> Option<Zeroizing<Vec<u8>>> {
             }
             return Some(Zeroizing::new(p));
         }
-        Ok(_) => return None, // user cancelled the kdialog prompt
-        Err(_) => {}          // kdialog not installed — fall through to egui
+        // kdialog's documented cancel is exit code 1. ONLY that means "the user
+        // cancelled" → abort. Any OTHER failure (a missing Qt platform plugin,
+        // an unusable display, a killed-by-signal process — code() == None) is an
+        // ENVIRONMENTAL failure, not a cancel: fall through to our own egui dialog
+        // rather than silently aborting the open.
+        Ok(o) if o.status.code() == Some(1) => return None,
+        Ok(_) => {} // kdialog present but failed for another reason — try egui
+        Err(_) => {} // kdialog not installed — fall through to egui
     }
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("veracage-agent"));
     let out = Command::new(exe).arg("_passphrase").arg(name).output().ok()?;

@@ -46,10 +46,13 @@ _MAX_REQUEST_BYTES = 64 * 1024  # control requests are tiny; cap to bound memory
 WORKSPACE = Path("/run/veracage/vaults")
 
 
-def scan_volumes(root: Path = WORKSPACE) -> list[str]:
+def scan_volumes(root: Path | None = None) -> list[str]:
     """The open volumes' labels — the directory names under the workspace root
     (the helper already sanitised them to a single safe path component). Dot
-    entries (the `.exchange` mount, staging leftovers) are skipped. Sorted."""
+    entries are skipped (defense in depth; nothing dot-named is expected under
+    the workspace — the exchange mount lives OUTSIDE it). Sorted."""
+    if root is None:
+        root = WORKSPACE   # resolved at call time (tests monkeypatch WORKSPACE)
     try:
         names = [e.name for e in os.scandir(root)
                  if e.is_dir(follow_symlinks=False) and not e.name.startswith(".")]
@@ -91,8 +94,16 @@ def _handle_request(state: _LeaderState, req: dict) -> dict:
         return {"ok": True, "uid": os.getuid(), "mountpoint": state.mountpoint}
 
     if cmd == "list":
+        # `volumes` + `bootstrap_open` let the CLI's already-open probe tell "the
+        # session is alive" apart from "THIS vault is still mounted": after a
+        # per-volume close of the bootstrap volume, this socket keeps serving for
+        # the rest of the session, but the vault itself may be reopened. Scanned
+        # fresh (not state.volumes) so the reply can't lag the 1s rescan loop.
+        cur = scan_volumes()
         return {"ok": True,
-                "apps": [{"pid": p, "app": k} for p, k in state.children.items()]}
+                "apps": [{"pid": p, "app": k} for p, k in state.children.items()],
+                "volumes": cur,
+                "bootstrap_open": Path(state.mountpoint).name in cur}
 
     if cmd == "close":
         state.closing = True
@@ -519,9 +530,14 @@ def session_socket_path(vault: str) -> Path:
 def send_request(vault: str, request: dict) -> dict:
     """Connect to the running session for `vault` (by path) and send one
     request. Raises FileNotFoundError if no session is running."""
-    sock_path = session_socket_path(vault)
+    return send_request_to(session_socket_path(vault), request)
+
+
+def send_request_to(sock_path: Path, request: dict) -> dict:
+    """Send one request to a session control socket by PATH (the per-vault hash
+    naming is the caller's concern). Raises FileNotFoundError if absent."""
     if not sock_path.exists():
-        raise FileNotFoundError(f"no active session for {vault}")
+        raise FileNotFoundError(f"no session socket at {sock_path}")
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(2.0)
     try:

@@ -280,7 +280,8 @@ def test_parse_session_lock_skips_malformed_volume_lines(tmp_path):
     assert vols == [("veracage-aaaaaaaaaaaa", "")]   # empty dm skipped; label optional
 
 
-def test_cleanup_session_closes_every_dm(tmp_path):
+def test_cleanup_session_closes_every_dm(tmp_path, monkeypatch):
+    monkeypatch.setattr("veracage.cleanup.SESSIONS_BASE", tmp_path / "run-user")
     p = _session_lock(tmp_path, "c" * 16,
                       [("veracage-abc123abc123", "A"),
                        ("veracage-def456def456", "B")])
@@ -293,6 +294,40 @@ def test_cleanup_session_closes_every_dm(tmp_path):
     assert ["cryptsetup", "close", "veracage-abc123abc123"] in closed
     assert ["cryptsetup", "close", "veracage-def456def456"] in closed
     assert not p.exists()   # lock dropped once all closed
+
+
+def test_remove_stale_session_sockets_sweeps_the_dir(tmp_path, monkeypatch):
+    """Regression: the control socket is keyed by the bootstrap VAULT's hash, not
+    the session id — cleanup once unlinked a 'session-<sid>.sock' that never
+    existed and left the real stale socket behind."""
+    import socket as socket_mod
+    base = tmp_path.resolve()
+    monkeypatch.setattr("veracage.cleanup.SESSIONS_BASE", base)
+    d = base / "1000" / "veracage" / "sessions"
+    d.mkdir(parents=True)
+    s = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+    s.bind(str(d / "fff2a519aabbccdd.sock"))     # vault-hash-named, stale
+    (d / "not-a-socket.sock").write_text("plain file, must survive")
+    cleanup._remove_stale_session_sockets("1000")
+    s.close()
+    assert not (d / "fff2a519aabbccdd.sock").exists()
+    assert (d / "not-a-socket.sock").exists()
+
+
+def test_remove_stale_session_sockets_refuses_symlinked_dir(tmp_path, monkeypatch):
+    """Root must not follow a human-planted symlink out of the sessions dir."""
+    import socket as socket_mod
+    base = tmp_path.resolve()
+    monkeypatch.setattr("veracage.cleanup.SESSIONS_BASE", base)
+    elsewhere = base / "elsewhere" / "sessions"
+    elsewhere.mkdir(parents=True)
+    s = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+    s.bind(str(elsewhere / "victim.sock"))
+    (base / "1000").mkdir()
+    (base / "1000" / "veracage").symlink_to(base / "elsewhere")
+    cleanup._remove_stale_session_sockets("1000")
+    s.close()
+    assert (elsewhere / "victim.sock").exists()   # untouched
 
 
 def test_cleanup_session_keeps_lock_if_a_close_fails(tmp_path):
@@ -333,15 +368,30 @@ def test_cleanup_session_returns_0_when_missing(tmp_path):
 def test_main_dispatches_to_cleanup_session(monkeypatch, tmp_path):
     monkeypatch.setattr("veracage.cleanup.os.geteuid", lambda: 0)
     monkeypatch.setattr("veracage.cleanup.LOCKS_DIR", tmp_path)
-    sid = "abcdef0123456789"
+    sid = "1000"
     with mock.patch("veracage.cleanup.cleanup_session", return_value=0) as c:
         cleanup.main(["--session", sid])
     c.assert_called_once_with(tmp_path / f"session-{sid}.lock")
 
 
+def test_main_accepts_the_sid_the_cli_actually_passes(monkeypatch, tmp_path):
+    """Regression: cli.py registers `ExecStopPost=… --session <uid>` (a short
+    decimal). SID_RE once demanded 16 hex chars, so the crash-safety teardown
+    was ALWAYS rejected and the dm-crypt key stayed in RAM after a SIGKILL."""
+    import os
+    monkeypatch.setattr("veracage.cleanup.os.geteuid", lambda: 0)
+    monkeypatch.setattr("veracage.cleanup.LOCKS_DIR", tmp_path)
+    sid = str(os.getuid())
+    with mock.patch("veracage.cleanup.cleanup_session", return_value=0) as c:
+        assert cleanup.main(["--session", sid]) == 0
+    c.assert_called_once_with(tmp_path / f"session-{sid}.lock")
+
+
 def test_main_rejects_bad_session_id(monkeypatch, capsys):
     monkeypatch.setattr("veracage.cleanup.os.geteuid", lambda: 0)
-    for bad in ["../x", "abc", "g" * 16, "ABCDABCDABCDABCD"]:
+    # Must mirror helper-rs session_id_ok: 1-16 ASCII digits, nothing else.
+    for bad in ["../x", "abc", "g" * 16, "ABCDABCDABCDABCD", "", "1" * 17,
+                "abcdef0123456789"]:
         assert cleanup.main(["--session", bad]) == 2
     assert "invalid session id" in capsys.readouterr().err
 

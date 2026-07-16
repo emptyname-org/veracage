@@ -40,6 +40,23 @@ def test_load_migrates_old_vault_args(tmp_xdg_config):
     assert loaded.apps["kate"].args == ["/vaults/Docs", "-b"]
 
 
+def test_load_tolerates_non_string_arg(tmp_xdg_config):
+    """Regression: the /vault->/vaults migration called .startswith on every arg;
+    a non-string element (TOML allows mixed arrays) raised AttributeError, which
+    the entry handler didn't catch, so a crafted config crashed load() everywhere.
+    Now non-string args pass through untouched and the entry still loads."""
+    p = config.config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        '[apps.kate]\n'
+        'name = "Kate"\n'
+        'exec = "kate"\n'
+        'args = ["/vault/Docs", 123, "-b"]\n'
+    )
+    cfg = config.load()                      # must not raise
+    assert cfg.apps["kate"].args == ["/vaults/Docs", 123, "-b"]
+
+
 def test_load_skips_malformed_entry(tmp_xdg_config, capsys):
     """An [apps.X] table missing a required key should be skipped, not crash.
     A leftover `category` key (from an older config) is simply ignored."""

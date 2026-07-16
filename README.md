@@ -24,7 +24,8 @@ which owns the clipboard and hosts an in-window toolbar.
   host file dialogs, write `~/.config`) and shows only transient dialogs. The front
   door (app-menu icon, or "Open with" a `.vc`) is a volume picker + passphrase
   dialog, not a standing window. (Design: `docs/single-window-ux.md`.)
-- **`veracage open <vault> [app]`** — mount + bring up the compositor in one pkexec;
+- **`veracage open <vault> [app]`** — bring up the compositor, then mount: two
+  pkexecs behind a **single** password prompt (polkit `auth_self_keep`);
   launch apps from the compositor **Apps menu** (no second prompt).
 - **`veracage list <vault>` / `veracage close <vault>`** — inspect / tear down.
 - **Clipboard** — Ctrl+Alt+V (host→sandbox) / Ctrl+Alt+C (sandbox→host) or the

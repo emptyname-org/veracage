@@ -33,8 +33,9 @@ pub enum ToolbarAction {
     ClipPush, // host selection -> sandbox
     ClipPull, // sandbox selection -> host
     LaunchApp { sock: std::path::PathBuf, index: usize },
-    Command(&'static str), // broker verbs: open/configure/settings/close/import/export
+    Command(&'static str), // broker verbs: open/configure/settings/import/export
     CloseVolume(String),   // close ONE volume of the session (by label)
+    CloseAll(Vec<String>), // close EVERY open volume ("Close vault")
     Quit,                  // stop the compositor loop (in-process)
 }
 
@@ -189,22 +190,29 @@ impl Toolbar {
                             }
                             ui.separator();
                             // Per-volume close — one item per open volume across
-                            // the session (Phase 5). Only shown when >1 volume is
-                            // open; a single volume just uses "Close vault".
-                            let vols: Vec<&String> =
-                                leaders.iter().flat_map(|l| &l.volumes).collect();
+                            // the session (Phase 5). Shown only when >1 volume is
+                            // open; with a single volume "Close vault" already
+                            // closes it.
+                            let vols: Vec<String> =
+                                leaders.iter().flat_map(|l| l.volumes.clone()).collect();
                             if vols.len() > 1 {
                                 ui.menu_button("Close volume", |ui| {
                                     for v in &vols {
                                         if ui.button(v.as_str()).clicked() {
-                                            action = ToolbarAction::CloseVolume((*v).clone());
+                                            action = ToolbarAction::CloseVolume(v.clone());
                                             ui.close_menu();
                                         }
                                     }
                                 });
                             }
-                            if ui.button("Close vault").clicked() {
-                                action = ToolbarAction::Command("close");
+                            // "Close vault" closes EVERY open volume, by label —
+                            // the label path works regardless of which process
+                            // opened the vault (fixing the old close_last no-op
+                            // when the broker didn't do the open). Absent when the
+                            // workspace is empty (the front door). The compositor
+                            // stays up as the front door after the last close.
+                            if !vols.is_empty() && ui.button("Close vault").clicked() {
+                                action = ToolbarAction::CloseAll(vols.clone());
                                 ui.close_menu();
                             }
                             if ui.button("Quit").clicked() {
@@ -317,17 +325,28 @@ const CMD_REQ: &str = "cmd.req";
 /// file is world-readable (the broker reads it by exact path through the 0711 dir);
 /// at most an attacker learns a command was issued.
 pub fn request_command(verb: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let path = std::path::Path::new(RUNTIME_DIR).join(CMD_REQ);
-    // Truncating write bumps the mtime (the broker's change signal) and carries the
-    // verb. fs::write always updates mtime, so repeated same-verb clicks re-fire.
-    if let Err(e) = std::fs::write(&path, format!("{verb}\n")) {
+    // Write a temp file, make it broker-readable, THEN atomically rename it into
+    // place. A plain write-then-chmod leaves a window where the file exists 0600
+    // (the compositor's umask is 077): the broker polls the mtime and can read it
+    // during that window, get EACCES, and silently DROP the command — losing e.g.
+    // the very first menu click. rename() bumps the target's mtime (the broker's
+    // signal) and the file is 0644 the instant it appears.
+    let tmp = std::path::Path::new(RUNTIME_DIR).join(format!("{CMD_REQ}.tmp"));
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true).create(true).truncate(true).mode(0o644).open(&tmp)?;
+        f.write_all(format!("{verb}\n").as_bytes())?;
+        // create() honours the umask, so force 0644 even if 077 masked it off.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
+        std::fs::rename(&tmp, &path)
+    };
+    if let Err(e) = write() {
         tracing::warn!("toolbar: command {verb}: {e}");
-        return;
+        let _ = std::fs::remove_file(&tmp);
     }
-    // The compositor runs with umask 077 (socket hygiene), so the file lands 0600;
-    // make it broker-readable explicitly (the verb is not a secret).
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
 }
 
 /// Scan `RUNTIME_DIR` for the `*.apps` files each vault's leader writes, building

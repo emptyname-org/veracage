@@ -58,12 +58,13 @@ remove `rt/app-<mount-token>.*`.
 registration socket instead of files).
 
 ## A#4b — [TRACK] No lock around the compositor spawn
-Two concurrent first-`open`s both see "compositor down" and both fork
-`spawn_compositor`; the second's `remove_file(wl-vc)` unlinks the first's live
+Two concurrent first-`open`s both see "compositor down" (`ensure_compositor_up`)
+and each `systemd-run`s its own `veracage-compositor-<hex>` unit; both run
+`spawn_compositor`, and the second's `remove_file(wl-vc)` unlinks the first's live
 socket. Availability only (the `0711` dir blocks external planting). *Fix:* an flock
 around the check→spawn, or bind without pre-unlinking a live socket.
-`obsolete-if:` the compositor is brought up once at session start (launcher/systemd
-user service) instead of lazily by the mount helper.
+`obsolete-if:` the compositor bring-up is serialized (a flock, or a single unit
+that can't double-start).
 
 ## D#7 — [TRACK, needs a real box] Flipped180 vs egui orientation
 The output renders `Transform::Flipped180` but the toolbar panel + all gating math
@@ -109,15 +110,8 @@ move). Not a crash. *Fix:* keep a visible sliver on every edge.
   root today (polkit pins `exec.path` to the Rust helper) but it's a full-model
   bypass one policy edit away, and shares the `..` mountpoint weakness. *Fix:*
   delete it + the `cli.py` fallback (hard-error "build the Rust helper" instead).
-- **First-open vault race** (sibling of A#4b) — two concurrent
-  `veracage open <same vault>` both pass the no-session probe and both mount.
-  Self-inflicted, same-uid. *Fix:* flock the session path during bring-up.
 
 ## Misc LOW (record, revisit opportunistically)
-- **A#6** helper waits 6 s then mounts even if the forked compositor died pre-exec
-  (leader then has no display).
-- **A#7** detached compositor child not reaped → zombie for the session on early
-  failure.
 - **A#8** `--passphrase-stdin` with an interactive tty (no EOF) blocks the root
   helper forever (self-inflicted; add an isatty/timeout guard).
 - **B#5** leader serve loop is single-threaded (slowloris: a peer that never sends

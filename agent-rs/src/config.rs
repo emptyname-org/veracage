@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::apps::App;
@@ -27,8 +28,12 @@ pub fn config_path() -> PathBuf {
 struct Raw {
     #[serde(default)]
     default: DefaultSection,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    apps: BTreeMap<String, AppEntry>,
+    // IndexMap (not BTreeMap): preserve the on-disk / insertion order of apps so a
+    // GUI save doesn't reorder the toolbar launchers alphabetically — and doesn't
+    // change which file manager auto-opens (the first one in order). Matches
+    // config.py, which uses an insertion-ordered dict.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    apps: IndexMap<String, AppEntry>,
     // Preserved verbatim across a save — the picker never touches per-volume
     // overrides.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -100,6 +105,26 @@ pub struct Config {
 }
 
 impl Config {
+    /// The host exchange directory (mirrors config.py `Config.exchange_path`):
+    /// the configured `exchange_dir` (with a leading `~` expanded), else
+    /// `~/Veracage/Exchange`. This is the SAME dir cli.py mounts into the sandbox
+    /// at /exchange, so the broker's Import/Export must open exactly this.
+    pub fn exchange_path(&self) -> PathBuf {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        match self.exchange_dir.as_deref() {
+            Some(d) if d == "~" => home.unwrap_or_else(|| PathBuf::from("~")),
+            Some(d) => {
+                if let Some(rest) = d.strip_prefix("~/") {
+                    if let Some(h) = home {
+                        return h.join(rest);
+                    }
+                }
+                PathBuf::from(d)
+            }
+            None => home.unwrap_or_default().join("Veracage").join("Exchange"),
+        }
+    }
+
     pub fn empty() -> Config {
         Config {
             apps: Vec::new(),
@@ -206,4 +231,30 @@ pub fn save(cfg: &Config) -> io::Result<PathBuf> {
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, &p)?;
     Ok(p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str) -> AppEntry {
+        AppEntry { name: name.into(), exec: name.to_lowercase(), args: vec![] }
+    }
+
+    #[test]
+    fn apps_keep_insertion_order_not_alphabetical() {
+        // Regression: a BTreeMap re-sorted the app list alphabetically on save,
+        // reordering the toolbar and possibly changing which file manager auto-
+        // opens. IndexMap must preserve the order they were inserted.
+        let mut apps = IndexMap::new();
+        apps.insert("zed".to_string(), entry("Zed"));
+        apps.insert("kate".to_string(), entry("Kate"));
+        apps.insert("dolphin".to_string(), entry("Dolphin"));
+        let raw = Raw { default: DefaultSection::default(), apps, volumes: BTreeMap::new() };
+        let body = toml::to_string(&raw).unwrap();
+        let zed = body.find("[apps.zed]").unwrap();
+        let kate = body.find("[apps.kate]").unwrap();
+        let dolphin = body.find("[apps.dolphin]").unwrap();
+        assert!(zed < kate && kate < dolphin, "apps were reordered:\n{body}");
+    }
 }

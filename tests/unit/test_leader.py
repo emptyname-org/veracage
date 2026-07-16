@@ -25,7 +25,26 @@ def test_ping_returns_uid():
 
 
 def test_list_empty():
-    assert leader._handle_request(_state(), {"cmd": "list"}) == {"ok": True, "apps": []}
+    r = leader._handle_request(_state(), {"cmd": "list"})
+    assert r["ok"] is True and r["apps"] == []
+    # the reply also reports the open-volume set for the CLI's already-open probe
+    assert r["volumes"] == []            # /run/veracage/x doesn't exist here
+    assert r["bootstrap_open"] is False
+
+
+def test_list_reports_bootstrap_open(tmp_path, monkeypatch):
+    """After a per-volume close of the bootstrap volume, `bootstrap_open` must go
+    False so `veracage open <that vault>` is allowed again (the socket itself
+    keeps serving for the rest of the session)."""
+    monkeypatch.setattr(leader, "WORKSPACE", tmp_path)
+    (tmp_path / "Work").mkdir()
+    st = leader._LeaderState(mountpoint=str(tmp_path / "Work"))
+    r = leader._handle_request(st, {"cmd": "list"})
+    assert r["volumes"] == ["Work"]
+    assert r["bootstrap_open"] is True
+    (tmp_path / "Work").rmdir()          # the volume was closed
+    r = leader._handle_request(st, {"cmd": "list"})
+    assert r["bootstrap_open"] is False
 
 
 def test_close_sets_closing():

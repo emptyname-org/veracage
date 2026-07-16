@@ -33,11 +33,13 @@ There are three uids in play:
   it. It is **pinned** at build time (baked into the helper binary) so a
   malicious direct pkexec call cannot substitute its own program.
 - **leader** / **vault-side leader** — the long-lived session boss, running as
-  the **vault uid** inside the private namespace. Starts the nested compositor,
-  launches apps, serves the control socket. (`leader.py`.)
-- **agent** / **human-side agent** — the Qt **tray** UI, running as *you*
-  (human). Has *no* vault access; it talks to the leader over the control
-  socket. (`agent.py`.)
+  the **vault uid** inside the private namespace. Attaches to the persistent
+  nested compositor (it does not start it), launches apps, serves the control
+  socket. (`leader.py`.)
+- **agent** / **broker** — the human-side helper (`agent-rs`), running as *you*
+  (human). **Windowless** — only transient dialogs; it does the host-side things
+  a vault-uid process can't (`pkexec` the mount, host file dialogs, write config).
+  Has *no* vault access.
 
 ## The isolation (why external processes can't read the vault)
 
@@ -63,24 +65,23 @@ There are three uids in play:
 ## The display (cross-uid GUI)
 
 - **the veracage compositor** — our own `veracage-compositor`, a **separate**
-  compositor instance (one per session, on `/run/veracage/rt/wl-vc`) that runs as
-  the vault uid. The sandboxed apps connect to *it*, not to your desktop session —
-  so the sandbox clipboard / screencopy are separate from your desktop. It renders
-  into a single window on your real compositor.
+  compositor instance — **one persistent instance shared by every session**, on
+  `/run/veracage/rt/wl-vc` — that runs as the vault uid. The sandboxed apps
+  connect to *it*, not to your desktop session — so the sandbox clipboard /
+  screencopy are separate from your desktop. It renders into a single window on
+  your real compositor.
 
 ## Talking across the boundary
 
 - **control socket** — the unix socket the leader listens on for
-  `ping`/`list`/`exec`/`close` + the bridge. The human side connects to it *by
-  path* (the helper created it in your runtime dir, owned by you).
-- **bridge** — moving files **across the uid boundary**, since you can't touch
-  the vault and the vault uid can't touch your home.
-- **inbox** / **outbox** — `/vault/.veracage/in` and `/vault/.veracage/out`, the
-  staging dirs the bridge writes to / reads from.
-- **fd-passing** / **`SCM_RIGHTS`** — the unix-socket trick of handing an *open
-  file descriptor* to another process. Import = you pass a host-file fd to the
-  leader (it writes it into the vault as the vault uid); export = the leader
-  passes an outbox-file fd back to you. The fd crosses the uid boundary cleanly.
+  `ping`/`list`/`close` — status/lifecycle only, **no** exec or file transfer
+  (any same-uid process can reach it, so it must not be a vault-exfiltration
+  lever). The human side connects to it *by path* (the helper created it in your
+  runtime dir, owned by you).
+- **exchange folder** — the shared host↔vault directory (host `~/Veracage/Exchange`
+  by default, idmap-mounted into the sandbox at `/exchange`). Files dropped in on
+  either side appear on the other, owned by you — the file-transfer path (the old
+  control-socket bridge was removed).
 
 ## Privilege & lifecycle
 
@@ -89,13 +90,16 @@ There are three uids in play:
   *nothing* from its arguments.
 - **`PKEXEC_UID`** — the env var pkexec sets to the **real caller's** uid. The
   helper reads this to know "who the human is" — never from its own arguments.
-- **systemd `--user --scope`** / **`ExecStopPost`** — the session is wrapped in
-  a transient systemd unit so that **cleanup runs even if everything is
-  SIGKILL'd** (the `ExecStopPost` fires when the scope dies).
-- **lock file** — `/run/veracage/<hash>.lock`; records the dm-device name +
-  mountpoint so the crash-cleanup knows what to tear down. (Distinct from the
-  future **lock *state*** — the lock/unlock *feature* that evicts the key for
-  fast resume.)
+- **systemd `--user` transient service** / **`ExecStopPost`** — the session is
+  wrapped in a transient systemd **service** (not a scope — scope units reject
+  `Exec*` properties) so that **cleanup runs even if everything is SIGKILL'd**
+  (the `ExecStopPost` fires when the unit stops).
+- **session lock** — `/run/veracage/session-<sid>.lock` (`<sid>` = the human
+  uid); records every open volume's dm-device name so the crash-cleanup closes
+  them all. A `session-<sid>.flock` sibling serializes open/close/teardown. (The
+  legacy per-vault `<hash>.lock` remains for the deprecated single-vault path.
+  Distinct from the future **lock *state*** — the lock/unlock *feature* that
+  evicts the key for fast resume.)
 
 ## Crypto & mounts
 
@@ -104,10 +108,13 @@ There are three uids in play:
   (`backend = luks | veracrypt | auto`).
 - **dm device** — the decrypted block device cryptsetup creates at
   `/dev/mapper/veracage-<hex>`. Closing it = **evicting the key**.
-- **mountpoint** — `/run/veracage/<rand>`, where the idmapped vault appears.
-- **`.raw`** (staging) / **`.run`** (vault runtime) — sibling dirs the helper
-  provisions: `.raw` is the plain mount it reads to set up the idmap; `.run` is
-  the vault uid's writable scratch (compositor socket, bwrap's `/run/user`).
+- **workspace** / **mountpoint** — the shared-workspace tmpfs at
+  `/run/veracage/vaults` (private to the session NS); each volume is idmap-mounted
+  at `/vaults/<label>` inside it, bound into the sandbox as `/vaults`.
+- **`.raw`** (staging) / **`.run`** (vault runtime) — dirs the helper provisions:
+  `.<label>.raw` is the plain mount it reads to set up the idmap (dot-prefixed, so
+  the leader ignores it); `session-<sid>.run` is the vault uid's writable scratch
+  (compositor socket, bwrap's `/run/user`).
 
 ## Project shorthand
 

@@ -14,11 +14,18 @@ from veracage import apps, cli, config
 @pytest.fixture(autouse=True)
 def _no_active_session(monkeypatch):
     """Pretend there's no running session so cmd_open doesn't refuse. (The
-    compositor is brought up by the mount helper now, not cmd_open.)"""
+    compositor is brought up by the mount helper now, not cmd_open.) Also
+    neutralise the join-detection ping so tests never touch the developer's
+    real /run/user sockets."""
     monkeypatch.setattr(
         "veracage.cli.leader.send_request",
         mock.Mock(side_effect=FileNotFoundError),
     )
+    monkeypatch.setattr("veracage.cli._any_live_session", lambda: False)
+    # The compositor is brought up as its own unit before the mount; don't run a
+    # real systemd-run/pkexec from the argv tests. (A dedicated test asserts the
+    # bring-up happens.)
+    monkeypatch.setattr("veracage.cli.ensure_compositor_up", lambda: 0)
 
 
 @pytest.fixture
@@ -198,6 +205,95 @@ def test_open_mounts_even_with_no_apps_configured(monkeypatch, tmp_xdg_config, f
 
 
 # ---------------------------------------------- persistent compositor ----
+
+# --------------------------------------- compositor brought up as own unit --
+
+def test_open_brings_compositor_up_before_mount(monkeypatch, configured, fake_vault):
+    """The compositor must be brought up as its own systemd unit BEFORE the mount
+    (a compositor forked inside the session's unit dies when that unit stops)."""
+    calls = []
+    monkeypatch.setattr("veracage.cli.ensure_compositor_up",
+                        lambda: calls.append("up") or 0)
+    rc, argv = _run_open(monkeypatch, fake_vault, "kate")
+    assert rc == 0
+    assert calls == ["up"]                 # bring-up ran
+    assert argv is not None                # and the mount followed
+
+
+def test_open_aborts_if_compositor_wont_start(monkeypatch, configured, fake_vault):
+    monkeypatch.setattr("veracage.cli.ensure_compositor_up", lambda: 1)
+    rc, argv = _run_open(monkeypatch, fake_vault, "kate")
+    assert rc == 1
+    assert argv is None                    # never reached the mount pkexec
+
+
+# ------------------------------------------- already-open probe (Phase 5) --
+
+def test_open_refuses_when_bootstrap_volume_still_mounted(
+        monkeypatch, configured, fake_vault, capsys):
+    monkeypatch.setattr(
+        "veracage.cli.leader.send_request",
+        mock.Mock(return_value={"ok": True, "bootstrap_open": True,
+                                "volumes": ["fake"]}))
+    rc, argv = _run_open(monkeypatch, fake_vault, "kate")
+    assert rc == 2
+    assert argv is None                      # helper never invoked
+    assert "already open" in capsys.readouterr().err
+
+
+def test_open_proceeds_after_per_volume_close_of_bootstrap(
+        monkeypatch, configured, fake_vault):
+    """Regression: the leader keeps serving the bootstrap vault's socket for the
+    whole session, so a bare ok:true reply used to make the vault unopenable
+    after its volume was closed via Close volume — until the session ended."""
+    monkeypatch.setattr(
+        "veracage.cli.leader.send_request",
+        mock.Mock(return_value={"ok": True, "bootstrap_open": False,
+                                "volumes": ["other"]}))
+    rc, argv = _run_open(monkeypatch, fake_vault, "kate")
+    assert rc == 0
+    assert argv is not None and "pkexec" in argv   # proceeded to the helper
+
+
+def test_open_still_refuses_on_legacy_reply_without_bootstrap_open(
+        monkeypatch, configured, fake_vault):
+    monkeypatch.setattr(
+        "veracage.cli.leader.send_request",
+        mock.Mock(return_value={"ok": True}))
+    rc, _ = _run_open(monkeypatch, fake_vault, "kate")
+    assert rc == 2
+
+
+def test_open_into_live_session_tells_user_about_the_app(
+        monkeypatch, configured, fake_vault, capsys):
+    """Regression: the helper's add-volume path drops the leader argv, so
+    `veracage open B kate` on a live session mounts B but never launches kate —
+    the CLI must say so instead of exiting 0 silently."""
+    monkeypatch.setattr("veracage.cli._any_live_session", lambda: True)
+    rc, _ = _run_open(monkeypatch, fake_vault, "kate")
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "added to the running workspace" in err
+    assert "no app was auto-launched" in err
+
+
+def test_list_and_close_survive_a_stale_socket(monkeypatch, tmp_path, capsys):
+    """Regression: a socket file with a dead leader raises ConnectionRefusedError,
+    which cmd_list/cmd_close used to let traceback."""
+    stale = tmp_path / "stale.sock"
+    stale.write_text("")
+    monkeypatch.setattr("veracage.cli.leader.send_request",
+                        mock.Mock(side_effect=ConnectionRefusedError))
+    monkeypatch.setattr("veracage.cli.leader.session_socket_path",
+                        lambda _v: stale)
+    ns = argparse.Namespace(vault=str(tmp_path / "x.vc"))
+    assert cli.cmd_list(ns) == 2
+    assert not stale.exists()               # stale socket removed
+    stale.write_text("")
+    assert cli.cmd_close(ns) == 2
+    assert not stale.exists()
+    assert "no active session" in capsys.readouterr().err
+
 
 def test_cmd_compositor_execs_binary(monkeypatch, tmp_path):
     exe = tmp_path / "veracage-compositor"

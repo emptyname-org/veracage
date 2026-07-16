@@ -9,22 +9,26 @@ guaranteed to complete before the machine sleeps with no inhibitor to acquire.
 This replaces the old `agent-rs/src/suspend.rs` zbus watcher, whose dismount
 silently stopped happening whenever `Inhibit` was unavailable.
 
-On `pre`, every active session's dm-crypt key must leave RAM. For each
-`/run/veracage/<hash>.lock`:
+On `pre`, every active session's dm-crypt key must leave RAM.
 
-  1. Skip if the session owner set `suspend_action = "ignore"` (they opted to
-     keep the vault mounted across sleep).
-  2. SIGTERM the session leader: it terminates its apps, exits, and its private
-     mount namespace is destroyed (freeing the vault mount); the leader's
-     systemd unit then stops and its `ExecStopPost` runs `veracage-cleanup`,
-     which `cryptsetup close`s the device.
-  3. Wait for the dm device to disappear. If it lingers past the budget, force
-     it: SIGKILL the leader (bwrap `--die-with-parent` takes the apps with it,
-     tearing down the namespace) and run the cleanup close directly, so we never
+Shared-workspace sessions (`/run/veracage/session-<sid>.lock` — what every
+`veracage open` creates today):
+
+  1. Skip if the session owner set `suspend_action = "ignore"`.
+  2. SIGTERM the session leader (pid + start-time from `session-<sid>.pid`,
+     the helper's own verified record): it terminates its apps, exits, its
+     private mount NS (all `/vaults/*` mounts) dies with it, and the helper
+     parent / ExecStopPost `cryptsetup close`s every volume's dm device.
+  3. Wait for every dm named in the lock to disappear. Past the budget, force:
+     SIGKILL the leader and run `cleanup.cleanup_session` directly, so we never
      return to systemd with a key still resident.
+
+Legacy per-vault sessions (`/run/veracage/<hash>.lock`): the same dance with
+the single `dm_name=` device and the cmdline-matched leader.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import sys
@@ -137,8 +141,76 @@ def _wait_dm_gone(dm_name: str, timeout: float) -> bool:
     return not dm_present(dm_name)
 
 
+def _wait_dms_gone(dm_names: list[str], timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not any(dm_present(dm) for dm in dm_names):
+            return True
+        time.sleep(POLL_INTERVAL)
+    return not any(dm_present(dm) for dm in dm_names)
+
+
+def _session_leader_pid(lock_path: Path) -> int | None:
+    """The session leader's pid from `session-<sid>.pid`, verified against its
+    recorded start-time (the helper's own pid-reuse defence). None if absent,
+    malformed, or no longer naming the same live process."""
+    pid_path = lock_path.with_suffix(".pid")
+    if not cleanup.session_leader_alive(pid_path):
+        return None
+    try:
+        first = pid_path.read_text().split()[0]
+        return int(first)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def teardown_shared_session(lock_path: Path) -> None:
+    """Tear down a shared-workspace session (`session-<sid>.lock`, possibly
+    several volumes) so every dm-crypt key leaves RAM. Never raises."""
+    try:
+        owner, volumes = cleanup.parse_session_lock(lock_path)
+    except OSError as e:
+        print(f"veracage-sleep: cannot read {lock_path}: {e}", file=sys.stderr)
+        return
+
+    if not owner_wants_dismount(owner):
+        print(f"veracage-sleep: {lock_path.stem}: suspend_action=ignore; "
+              "leaving mounted.", file=sys.stderr)
+        return
+
+    dm_names = [dm for dm, _label in volumes if dm_present(dm)]
+    if not dm_names:
+        return  # nothing open; nothing to do
+
+    leader = _session_leader_pid(lock_path)
+
+    # Graceful: SIGTERM the leader → apps terminated, workspace NS destroyed,
+    # the helper parent / ExecStopPost closes every volume's dm.
+    if leader is not None:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(leader, signal.SIGTERM)
+    if _wait_dms_gone(dm_names, GRACE_SECONDS):
+        return
+
+    # Force: SIGKILL the leader (bwrap --die-with-parent takes the apps, freeing
+    # the mounts), then close the devices ourselves via the cleanup path.
+    if leader is not None and pid_alive(leader):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(leader, signal.SIGKILL)
+    _wait_dms_gone(dm_names, FORCE_SECONDS)
+    cleanup.cleanup_session(lock_path)  # close every dm + tidy (idempotent)
+
+    still = [dm for dm in dm_names if dm_present(dm)]
+    if still:
+        print(f"veracage-sleep: WARNING {lock_path.stem}: dm {', '.join(still)} "
+              "still present after force teardown; key may remain in RAM.",
+              file=sys.stderr)
+
+
 def teardown_session(lock_path: Path) -> None:
-    """Tear one session down so its dm-crypt key leaves RAM. Never raises."""
+    """Tear one LEGACY per-vault session down so its dm-crypt key leaves RAM.
+    Never raises. (Shared-workspace `session-*.lock` files take
+    `teardown_shared_session` instead — their format has no `dm_name=` field.)"""
     try:
         fields = cleanup.parse_lock(lock_path)
     except OSError as e:
@@ -206,7 +278,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     for lock in locks:
         try:
-            teardown_session(lock)
+            # Shared-workspace session locks have their own format (volume=
+            # lines, no dm_name=) — routing one through the legacy parser would
+            # read an empty dm_name and silently skip the teardown.
+            if lock.name.startswith("session-"):
+                teardown_shared_session(lock)
+            else:
+                teardown_session(lock)
         except Exception as e:  # noqa: BLE001 — a hook must never abort a sleep
             print(f"veracage-sleep: {lock.stem}: {e}", file=sys.stderr)
     return 0

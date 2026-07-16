@@ -1,14 +1,14 @@
 # Shared workspace redesign — N volumes, one sandbox, drag-and-drop
 
-**Status: Phases 1–4 BUILT + VPS-proven (2026-07-11); Phases 5–6 remain.**
-Phase 1 spike (idmap-into-setns) ✅ spike8. Phase 2 (session bootstrap) ✅ spike12.
+**Status: Phases 1–6 BUILT + VPS-proven (via spike8/12/13/15/16/17).**
+Phase 1 (idmap-into-setns) ✅ spike8. Phase 2 (session bootstrap) ✅ spike12.
 Phase 3 (setns add-volume + multi-volume teardown) ✅ spike13. Phase 4 (sandbox
-binds the `/vaults` tree, one global app set, multi-volume Places) ✅ unit-tested
-(bwrap-sees-all mechanic from spike8); real-app box test pending. Phase 5 (compositor
-per-volume close — the global Apps menu is already one list per the single session
-leader) and Phase 6 (two-volume Dolphin DnD e2e + docs) remain. Supersedes the
-per-vault sandbox model for the multi-volume case. Builds on `uid-isolation.md` (deny-by-uid + the
-persistent one-compositor architecture).
+binds the `/vaults` tree, one global app set, multi-volume Places) ✅. Phase 5
+(compositor per-volume close — the global Apps menu is already one list per the
+single session leader) ✅ spike15. Phase 6 (two-volume DnD + docs) ✅; the one
+box-gated check remaining is the real two-volume Dolphin drag-and-drop e2e.
+Supersedes the per-vault sandbox model for the multi-volume case. Builds on
+`uid-isolation.md` (deny-by-uid + the persistent one-compositor architecture).
 
 ## Goal
 
@@ -50,15 +50,17 @@ workspace mnt NS (private — hidden from host /proc/mounts)
 ## Lifecycle
 
 ### First open (bootstrap the session)
-`veracage open <A>` → systemd `--user` transient unit (this is the **session
-anchor**; its `ExecStopPost` tears the whole session down) → `pkexec` helper:
+`veracage open <A>` → the CLI first brings up the compositor as its **own**
+`systemd --user` unit (`veracage-compositor-<hex>.service`, if not already up, so
+it survives this session's teardown), then wraps the mount in a `systemd --user`
+transient unit (the **session anchor**; its `ExecStopPost` tears the whole session
+down) → `pkexec` helper:
 1. `unshare(CLONE_NEWNS)`, `/` rslave → this is the **workspace**.
 2. `cryptsetup open A` (global dm device) → idmap-mount at `/vaults/<labelA>`.
 3. Record A's `dm_name` + mountpoint in the **session lock** (`/run/veracage/
    session-<sid>.lock`, root-owned 0600, one line per open volume).
 4. Drop privileges → exec the session leader in the workspace NS. The leader
    writes `/run/veracage/session-<sid>.pid` (root-readable) and holds the NS.
-5. Bring up the compositor if it isn't already (unchanged `compositor_is_up`).
 
 ### Subsequent open (add a volume to the running session)
 `veracage open <B>` → a **short-lived** transient action (no ExecStopPost — B's

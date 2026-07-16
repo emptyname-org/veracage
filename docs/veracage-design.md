@@ -59,8 +59,8 @@ Full topology in `uid-isolation.md` §"Process architecture"; in brief:
   the config picker, edits settings. The one human-side process — it does what a
   `veracage`-uid process can't (`pkexec`, host-file dialogs).
 - **Root helper** (`helper-rs`, seconds, via pkexec): `cryptsetup open` →
-  idmap-mount in a private NS → drop to `veracage` → exec the per-vault leader;
-  also spawns the compositor on first open. Does not trust its caller (§6).
+  idmap-mount in a private NS → drop to `veracage` → exec the per-vault leader.
+  Does not trust its caller (§6).
 - **`veracage`-uid compositor** (`veracage-compositor`, Rust/smithay): ONE
   persistent instance; renders every vault's apps into one host (kwin) window, owns
   the clipboard, hosts the egui toolbar. Our own — not weston/cage — so the process

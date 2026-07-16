@@ -24,15 +24,24 @@ sudo apt install python3-pytest bubblewrap cryptsetup veracrypt
 make install-dev    # polkit policy
 ```
 
-The nested compositor and clipboard bridge are our own Rust binaries
+The nested compositor and the human-side agent are our own Rust binaries
 (`veracage-compositor` / `veracage-agent`), built by `make install` — no
 `weston` or `wl-clipboard` needed.
 
-Create a 50 MB test vault (password: `veracage-test`):
+Create a 50 MB test vault (password: `vvv`):
 
 ```
-make test-vault         # follow printed instructions
+make test-vault
 ```
+
+Enable the apps the tests launch (no fixed catalog — any installed binary):
+
+```
+src/bin/veracage configure --add kate --add okular --add dolphin
+```
+
+The test vault has no filesystem label, so it mounts in the sandbox at
+`/vaults/veracage-test` (the source's file stem). Substitute your label below.
 
 ## Test 1 — Mount NS isolation (req 1.1.1)
 
@@ -55,9 +64,9 @@ findmnt --no-truncate | grep -E 'veracage|tcrypt'   # expect: NO output
 ## Test 2 — Network blocked (`--unshare-net`)
 
 ```bash
-# Inside the sandbox app, open a "Run command" or terminal-emulator that
-# the catalog includes (or temporarily edit apps.py to add `bash`):
-src/bin/veracage open /tmp/veracage-test.vc <terminal-app>
+# Enable a terminal-emulator app, then open the vault with it:
+src/bin/veracage configure --add konsole
+src/bin/veracage open /tmp/veracage-test.vc konsole
 
 # In the sandbox:
 $ ip a                              # expect: only "lo"
@@ -67,6 +76,10 @@ $ python3 -c 'import socket; socket.create_connection(("1.1.1.1",80),2)'
 ```
 
 ## Test 3 — Wayland clipboard isolation (req 1.1.2)
+
+The compositor owns a **separate** clipboard; a plain Ctrl+C in the sandbox
+does not reach the host clipboard (crossing is user-triggered only —
+Ctrl+Alt+C sandbox→host / Ctrl+Alt+V host→sandbox, or the toolbar buttons).
 
 ```bash
 # Inside the sandbox kate:
@@ -79,9 +92,10 @@ Expected: paste yields whatever was on the host clipboard before;
           "secret-text-from-vault" is NOT pasted.
 ```
 
-Repeat in reverse: copy in host, paste in sandbox — should also fail.
+Repeat in reverse: copy in host, paste in sandbox — should also fail without
+the explicit Ctrl+Alt+V.
 
-✅ Pass if the two clipboards are independent.
+✅ Pass if the two clipboards are independent until an explicit transfer.
 
 ## Test 4 — Klipper does not scrape the sandbox
 
@@ -100,118 +114,77 @@ Expected: `trigger-string-vault-001` does NOT appear in Klipper's history.
 
 ```bash
 src/bin/veracage open /tmp/veracage-test.vc kate
-# Inside kate: New file → write "hello" → save as /vault/note.txt → quit.
+# Inside kate: New file → write "hello" → save as /vaults/veracage-test/note.txt → quit.
 
 src/bin/veracage open /tmp/veracage-test.vc kate
-# Inside kate: open /vault/note.txt → expect "hello".
+# Inside kate: open /vaults/veracage-test/note.txt → expect "hello".
 ```
 
 ## Test 6 — Cleanup
 
-After closing the sandbox app:
+After closing the vault (`veracage close /tmp/veracage-test.vc`, or File → Close
+vault in the toolbar):
 
 ```bash
 ls /dev/mapper/ | grep veracage    # expect: NO output
-ls /run/veracage/                  # expect: empty (or dir absent)
+ls /run/veracage/                  # expect: no session-* state
 mount | grep veracage              # expect: NO output
 ```
 
-## Slice 3a — multi-app session
-
-### Test 7 — Add an app to a running session
+## Test 7 — Multi-app session
 
 ```bash
-src/bin/veracage open  /tmp/veracage-test.vc kate          # terminal A
-src/bin/veracage exec  /tmp/veracage-test.vc okular        # terminal B
-src/bin/veracage list  /tmp/veracage-test.vc
+src/bin/veracage open /tmp/veracage-test.vc kate
+# In the compositor's Apps menu, launch a second app (Okular).
+src/bin/veracage list  /tmp/veracage-test.vc      # expect: two apps
 src/bin/veracage close /tmp/veracage-test.vc
 ```
 
-✅ Pass if Okular appears in the same Weston window as Kate, no second
-password prompt, `list` shows two apps, and `close` cleanly terminates
-both + dismounts.
+✅ Pass if Okular appears in the same compositor window as Kate, no second
+password prompt, `list` shows two apps, and `close` cleanly terminates both +
+dismounts.
 
-### Test 8 — Clipboard between sandbox apps
+## Test 8 — Clipboard between sandbox apps
 
-In Kate (sandbox), copy text. Paste into Dolphin's address bar (also
-sandbox). Should work. Paste into a host editor — should fail.
+In Kate (sandbox), copy text. Paste into Dolphin's address bar (also sandbox) —
+should work (both connect to the same compositor clipboard). Paste into a host
+editor — should fail.
 
-## Slice 3b — agent + bridges
+## Test 9 — Exchange folder (host ↔ vault file transfer)
 
-### Test 9 — Tray icon present
+The shared folder replaces the old socket file bridge: `~/Veracage/Exchange` on
+the host is idmap-mounted into the sandbox at `/exchange`.
 
-After `veracage open`, a tray icon appears on the host panel with the
-"security-high" theme icon. Hover shows the vault filename.
-
-### Test 10 — Push host clipboard → sandbox
-
-```
-1. Copy "host-text-001" to host clipboard from any host app.
-2. Right-click the Veracage tray icon → "Push host clipboard → sandbox"
-3. In a sandbox app (Kate), Ctrl+V.
-```
-
-✅ Pass if "host-text-001" appears in Kate.
-
-### Test 11 — Pull sandbox clipboard → host
-
-```
-1. In Kate (sandbox), copy "vault-text-002".
-2. Tray → "Pull sandbox clipboard → host"
-3. In any host app, Ctrl+V.
+```bash
+# Host: drop a file in
+echo hi > ~/Veracage/Exchange/from_host.txt
+# Sandbox (Dolphin): navigate to /exchange → from_host.txt is there, owned by you.
+# Sandbox: save a file to /exchange/from_sandbox.txt
+# Host: ~/Veracage/Exchange/from_sandbox.txt appears, owned by you.
 ```
 
-✅ Pass if "vault-text-002" appears in the host app.
+✅ Pass if files cross both ways, owned by the human uid, with no dialogs.
 
-### Test 12 — Drop zone import
+## Crash-safe cleanup + suspend
 
-```
-1. Tray → "Show drop zone…" → small window appears on the host.
-2. Drag a host file onto it.
-3. In sandbox Dolphin, navigate to /vault/.veracage/in/
-```
-
-✅ Pass if the file is visible in the inbox with size + mtime preserved
-(`copy2`), permissions `0600`, and the original on the host is unchanged.
-
-### Test 13 — Outbox export
-
-```
-1. In sandbox Kate: write a file → save to /vault/.veracage/out/note.txt.
-2. Tray balloon notification appears within ~1s ("1 file(s) in outbox").
-3. Left-click the tray icon → file dialog asks where to save.
-4. Pick a host path, accept.
-```
-
-✅ Pass if the file moves to the host path and `out/note.txt` no longer
-exists.
-
-## Slice 4 — crash-safe cleanup + suspend
-
-### Test 14 — SIGKILL the launcher, dm-crypt is still cleaned up
+### Test 10 — SIGKILL the session, dm-crypt is still cleaned up
 
 ```bash
 # Terminal A
 src/bin/veracage open /tmp/veracage-test.vc kate
 
-# Terminal B — find the launcher PID
-pgrep -a -f 'veracage open'
+# Terminal B — kill the whole session unit, simulating a crash
+systemctl --user stop 'veracage-*.service'
 
-# Terminal B — kill the *entire unit*, simulating a crash
-loginctl kill-session $(loginctl | awk '$3=="'$USER'"{print $1; exit}') --signal=SIGKILL
-# OR more targeted:
-systemctl --user stop veracage-*.service
-
-# Terminal B — verify
-ls /dev/mapper/ | grep veracage    # expect: NO output
-ls /run/veracage/*.lock 2>/dev/null # expect: NO output
-mount | grep veracage              # expect: NO output
+# Terminal B — verify (ExecStopPost cleanup ran)
+ls /dev/mapper/ | grep veracage         # expect: NO output
+ls /run/veracage/session-*.lock 2>/dev/null   # expect: NO output
+mount | grep veracage                   # expect: NO output
 ```
 
-✅ Pass if no veracage state leaks after the kill. (Without Slice 4, the
-dm-crypt device would remain.)
+✅ Pass if no veracage state leaks after the kill.
 
-### Test 15 — Suspend dismounts the vault
+### Test 11 — Suspend dismounts the vault
 
 ```bash
 # Open a vault, then suspend the laptop:
@@ -222,11 +195,3 @@ ls /dev/mapper/ | grep veracage    # expect: NO output
 ```
 
 ✅ Pass if waking up requires re-entering the vault password.
-
-### Test 16 — Klipper still excluded after agent transfer
-
-After Test 11, open Klipper history. The pulled-to-host text is now on
-the host clipboard — that's correct (the user explicitly pulled it).
-Confirm that text the sandbox has **not** had pulled is **absent** from
-Klipper. In other words: clipboard isolation is per-explicit-action,
-not all-or-nothing.

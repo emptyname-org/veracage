@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import hashlib
 import os
 import re
@@ -28,9 +29,14 @@ import sys
 from pathlib import Path
 
 VAULT_HASH_RE = re.compile(r"^[0-9a-f]{16}$")
-SID_RE = re.compile(r"^[0-9a-f]{16}$")
+# The session id is the human uid (cli.py passes str(os.getuid())). Must accept
+# exactly what the Rust helper's session_id_ok accepts (1-16 ASCII digits) — the
+# two sides validate the SAME id, and a mismatch would dead-letter the
+# ExecStopPost crash teardown.
+SID_RE = re.compile(r"^[0-9]{1,16}$")
 
 LOCKS_DIR = Path("/run/veracage")
+SESSIONS_BASE = Path("/run/user")   # <base>/<uid>/veracage/sessions/<hash>.sock
 DM_NAME_RE = re.compile(r"^veracage-[0-9a-f]{12}$")
 
 
@@ -55,7 +61,7 @@ def lock_path(vault: str) -> Path:
 #     volume=veracage-<12hex>\t<label>
 #     volume=veracage-<12hex>\t<label>
 #
-# `session-<sid>.lock`, root-owned 0600. `<sid>` is a 16-hex session id.
+# `session-<sid>.lock`, root-owned 0600. `<sid>` is the human uid (digits).
 
 def session_lock_path(sid: str) -> Path:
     return LOCKS_DIR / f"session-{sid}.lock"
@@ -63,7 +69,9 @@ def session_lock_path(sid: str) -> Path:
 
 def parse_session_lock(p: Path) -> tuple[str, list[tuple[str, str]]]:
     """Return (user_uid, [(dm_name, label), ...]) from a session lock. Malformed
-    `volume=` lines are skipped; the caller validates each dm_name before acting."""
+    `volume=` lines are skipped; the caller validates each dm_name before acting.
+    Volume lines may carry extra tab-separated fields after the label (the helper
+    records the source vault's hash there); they are ignored here."""
     user_uid = ""
     volumes: list[tuple[str, str]] = []
     for line in p.read_text().splitlines():
@@ -72,8 +80,9 @@ def parse_session_lock(p: Path) -> tuple[str, list[tuple[str, str]]]:
         if k == "user_uid":
             user_uid = v.strip()
         elif k == "volume":
-            dm, _, label = v.partition("\t")
-            dm = dm.strip()
+            fields = v.split("\t")
+            dm = fields[0].strip()
+            label = fields[1] if len(fields) > 1 else ""
             if dm:
                 volumes.append((dm, label))
     return user_uid, volumes
@@ -201,6 +210,27 @@ def session_leader_alive(pid_path: Path) -> bool:
     return len(parts) < 2 or st == parts[1]
 
 
+def _remove_stale_session_sockets(owner: str) -> None:
+    """Remove leftover control sockets in the owner's sessions dir. The helper
+    keys the session's control socket by the BOOTSTRAP VAULT's hash (not the
+    session id), which the session lock does not record — but there is exactly
+    one session per uid, so once that session is dead every socket in the dir is
+    stale. Runs as root under a human-writable tree, so: refuse a dir path any
+    component of which is a symlink, and unlink only actual socket inodes."""
+    d = SESSIONS_BASE / owner / "veracage" / "sessions"
+    try:
+        if d.resolve(strict=True) != d:
+            print(f"veracage-cleanup: {d} has symlinked components; "
+                  "not removing sockets", file=sys.stderr)
+            return
+    except OSError:
+        return  # dir gone — nothing to clean
+    for sp in d.glob("*.sock"):
+        with contextlib.suppress(OSError):
+            if stat.S_ISSOCK(sp.lstat().st_mode):
+                sp.unlink()
+
+
 def cleanup_session(p: Path) -> int:
     """Close EVERY volume's dm device named in a session lock, then unlink the
     lock + control socket. The vault mounts died with the leader's namespace, so
@@ -214,6 +244,24 @@ def cleanup_session(p: Path) -> int:
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
         print(f"veracage-cleanup: refusing non-regular lock {p}", file=sys.stderr)
         return 2
+    # Serialize with the helper's open/teardown paths (they flock the same
+    # sidecar, `session-<sid>.flock`): without this, a cleanup firing while a
+    # successor session bootstraps the same sid could close a dm the successor
+    # just opened, or delete its freshly written lock. Best-effort — if the
+    # sidecar can't be locked we still clean up (never leave a key in RAM).
+    try:
+        _lockf = open(p.with_suffix(".flock"), "w")
+        fcntl.flock(_lockf, fcntl.LOCK_EX)
+    except OSError:
+        _lockf = None
+    try:
+        return _cleanup_session_locked(p)
+    finally:
+        if _lockf is not None:
+            _lockf.close()
+
+
+def _cleanup_session_locked(p: Path) -> int:
     try:
         owner, volumes = parse_session_lock(p)
     except OSError as e:
@@ -257,14 +305,20 @@ def cleanup_session(p: Path) -> int:
     # recovery trail rather than orphan a running dm device.
     if rc == 0:
         if owner.isdigit():
-            with contextlib.suppress(OSError):
-                (Path(f"/run/user/{owner}/veracage/sessions") / f"{p.stem}.sock").unlink()
+            # The control socket is keyed by the bootstrap vault's hash (see
+            # helper-rs run_session_bootstrap), NOT by the session id — sweep the
+            # sessions dir rather than guess a name that never existed.
+            _remove_stale_session_sockets(owner)
         # Drop the session pidfile and the host-side vault-runtime scratch too
-        # (the workspace tmpfs itself died with the leader's namespace).
+        # (the workspace tmpfs itself died with the leader's namespace). The
+        # `.x` exchange-mount target is an empty host-visible dir by now — its
+        # idmap mount was NS-private; rmdir (never rmtree) in case it isn't.
         with contextlib.suppress(OSError):
             p.with_suffix(".pid").unlink()
         with contextlib.suppress(OSError):
             shutil.rmtree(p.with_suffix(".run"), ignore_errors=True)
+        with contextlib.suppress(OSError):
+            p.with_suffix(".x").rmdir()
         with contextlib.suppress(FileNotFoundError):
             p.unlink()
     return rc
@@ -280,7 +334,8 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--vault-hash",
                    help="16-hex vault hash; cleans /run/veracage/<hash>.lock")
     g.add_argument("--session",
-                   help="16-hex session id; cleans /run/veracage/session-<sid>.lock")
+                   help="numeric session id (the human uid); "
+                        "cleans /run/veracage/session-<sid>.lock")
     args = p.parse_args(argv)
 
     if os.geteuid() != 0:

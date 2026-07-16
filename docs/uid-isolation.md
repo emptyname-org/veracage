@@ -95,8 +95,7 @@ of apps loaded into it. A thin **human-uid launcher** does the one thing a
                      │ pkexec
                      ▼
   root        helper (seconds): cryptsetup open (LUKS|VeraCrypt) → idmap-mount as
-              the vault uid in a private mount NS → drop to veracage → exec leader;
-              also spawns the compositor (as veracage) on first open.
+              the vault uid in a private mount NS → drop to veracage → exec leader.
                      │
   veracage    compositor (persistent, ONE): renders every vault's apps into one
   uid         kwin window, owns the clipboard, hosts the egui toolbar.

@@ -114,9 +114,18 @@ def load() -> Config:
                 # Migrate pre-shared-workspace configs: the sandbox binds the
                 # /vaults tree now, so an app pointed at the old single /vault
                 # would open a non-existent path. Retarget /vault[/…] -> /vaults.
+                # Only STRING elements migrate — a non-str arg (a crafted config
+                # can hold one; TOML allows mixed arrays) is passed through
+                # untouched rather than crashing load() on `.startswith` (that
+                # AttributeError isn't caught below, and load() promises to
+                # degrade, not crash, on a malformed file).
                 raw_args = list(entry.get("args", []))
-                args = [("/vaults" + a[len("/vault"):]) if a == "/vault" or a.startswith("/vault/")
-                        else a for a in raw_args]
+                args = [
+                    ("/vaults" + a[len("/vault"):])
+                    if isinstance(a, str) and (a == "/vault" or a.startswith("/vault/"))
+                    else a
+                    for a in raw_args
+                ]
                 apps[key] = App(
                     key=key,
                     name=entry["name"],

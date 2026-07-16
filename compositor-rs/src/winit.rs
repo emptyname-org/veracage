@@ -229,6 +229,9 @@ pub fn init_winit(
                     crate::toolbar::ToolbarAction::CloseVolume(label) => {
                         crate::toolbar::request_command(&format!("close-volume:{label}"))
                     }
+                    crate::toolbar::ToolbarAction::CloseAll(labels) => {
+                        crate::toolbar::request_command(&format!("close-all:{}", labels.join("\t")))
+                    }
                     crate::toolbar::ToolbarAction::Quit => state.loop_signal.stop(),
                     crate::toolbar::ToolbarAction::None => {}
                 }

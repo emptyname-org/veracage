@@ -25,6 +25,7 @@ use std::env;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -282,15 +283,18 @@ fn vault_hash(p: &Path) -> String {
     h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
-/// "veracage-" + 12 lowercase hex, matching DM_NAME_RE in cleanup.py.
-fn random_dm_name() -> String {
+fn random_hex(bytes: usize) -> String {
     use std::io::Read;
-    let mut buf = [0u8; 6];
+    let mut buf = vec![0u8; bytes];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut buf))
         .unwrap_or_else(|e| fail(&format!("/dev/urandom: {e}"), 1));
-    let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
-    format!("veracage-{hex}")
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// "veracage-" + 12 lowercase hex, matching DM_NAME_RE in cleanup.py.
+fn random_dm_name() -> String {
+    format!("veracage-{}", random_hex(6))
 }
 
 fn set_mode<P: AsRef<Path>>(p: P, mode: u32) {
@@ -406,17 +410,62 @@ fn workspace_path(label: &str, source: &Path) -> PathBuf {
         .unwrap_or(first)
 }
 
-/// Append a volume to the session lock (`session-<sid>.lock`, root-owned 0600):
-/// `user_uid=<uid>` once, then a `volume=<dm_name>\t<label>` line per open
-/// volume. cleanup.py `cleanup_session` walks these to close every dm on teardown.
-/// Written BEFORE the mount (with the dm_name we pre-generated) so an early crash
-/// still leaves the ExecStopPost a device to close.
-fn write_session_lock(sid: &str, dm_name: &str, label: &str, uid: u32) {
+/// Serialize session-state transitions for `sid`: the bootstrap-vs-add decision,
+/// session-lock writes, and teardown. A dedicated sidecar file (never deleted —
+/// deleting a held flock path lets a second opener lock a NEW inode and both
+/// "hold" it) because the session lock itself is atomically REPLACED by
+/// `session_lock_remove`, which would break flock identity. cleanup.py takes the
+/// same flock (its sibling `.flock` of the lock path). Blocks; released on drop.
+fn session_flock(sid: &str) -> std::fs::File {
+    let path = format!("/run/veracage/session-{sid}.flock");
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .unwrap_or_else(|e| fail(&format!("session flock {path}: {e}"), 1));
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        fail_errno("flock(session)");
+    }
+    f
+}
+
+/// The `generation=` header of a session-lock body: a random nonce each
+/// bootstrap writes so its own teardown can tell "this lock is still mine" from
+/// "a successor session reused my sid while I was tearing down".
+fn lock_generation(body: &str) -> Option<&str> {
+    body.lines().find_map(|l| l.strip_prefix("generation=")).map(str::trim)
+}
+
+/// Create the session lock fresh (`session-<sid>.lock`, root-owned 0600) with
+/// its `user_uid=` and `generation=` headers. The caller holds the session
+/// flock and has already recovered/removed any stale predecessor lock.
+fn create_session_lock(sid: &str, uid: u32, gen: &str) {
     let path = format!("/run/veracage/session-{sid}.lock");
     use std::io::Write;
-    // Create-or-append: the first volume creates it (with the uid header); later
-    // volumes (Phase 3, via setns) append their own `volume=` line.
-    let fresh = !Path::new(&path).exists();
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .unwrap_or_else(|e| fail(&format!("session lock {path}: {e}"), 1));
+    f.write_all(format!("user_uid={uid}\ngeneration={gen}\n").as_bytes())
+        .unwrap_or_else(|e| fail(&format!("write session lock {path}: {e}"), 1));
+}
+
+/// Append a volume to the session lock: a `volume=<dm_name>\t<label>\t<vault_hash>`
+/// line per open volume. cleanup.py `cleanup_session` walks these to close every
+/// dm on teardown; the vault hash is what lets a later open detect "this source
+/// is already open" (the duplicate-open guard in `run_session_add`). Written
+/// BEFORE the mount (with the dm_name we pre-generated) so an early crash still
+/// leaves the ExecStopPost a device to close.
+fn append_session_volume(sid: &str, dm_name: &str, label: &str, vhash: &str) {
+    let path = format!("/run/veracage/session-{sid}.lock");
+    use std::io::Write;
+    // create(true): if the lock somehow vanished under a live leader, a headerless
+    // (generation-less) lock still tracks the dm for the ExecStopPost cleanup.
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -424,11 +473,23 @@ fn write_session_lock(sid: &str, dm_name: &str, label: &str, uid: u32) {
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .unwrap_or_else(|e| fail(&format!("session lock {path}: {e}"), 1));
-    if fresh {
-        let _ = f.write_all(format!("user_uid={uid}\n").as_bytes());
-    }
-    f.write_all(format!("volume={dm_name}\t{label}\n").as_bytes())
+    f.write_all(format!("volume={dm_name}\t{label}\t{vhash}\n").as_bytes())
         .unwrap_or_else(|e| fail(&format!("write session lock {path}: {e}"), 1));
+}
+
+/// dm names of the volumes a session-lock body records for `vhash` (the third
+/// tab field of a `volume=` line). Pure, for unit tests; the caller decides
+/// which of them are still live by checking /dev/mapper.
+fn lock_dms_for_vhash(body: &str, vhash: &str) -> Vec<String> {
+    body.lines()
+        .filter_map(|l| l.strip_prefix("volume="))
+        .filter_map(|v| {
+            let mut f = v.split('\t');
+            let dm = f.next().unwrap_or("").trim().to_string();
+            let _label = f.next();
+            (f.next() == Some(vhash) && !dm.is_empty()).then_some(dm)
+        })
+        .collect()
 }
 
 /// Record the session leader's pid + start-time (`session-<sid>.pid`, root 0600):
@@ -566,6 +627,8 @@ fn run_close_volume(args: &Args, vault_uid: u32) -> ! {
     if !label_ok(label) {
         fail(&format!("invalid --close-volume label {label:?}"), 2);
     }
+    // Serialize the lock rewrite (session_lock_remove) with opens/teardowns.
+    let _flock = session_flock(sid);
     let leader_pid = verify_session_leader(sid, vault_uid)
         .unwrap_or_else(|| fail("no live session to close a volume from", 1));
 
@@ -589,7 +652,21 @@ fn run_close_volume(args: &Args, vault_uid: u32) -> ! {
         let cmp = CString::new(mp.clone()).unwrap();
         unsafe { libc::umount2(cmp.as_ptr(), libc::MNT_DETACH) };
         let _ = Command::new(tool("cryptsetup")).args(["close", "--deferred", &dm]).status();
-        session_lock_remove(sid, &dm);
+        // A deferred close completes only once the last holder (a running app's
+        // own NS copy of the mount) lets go. Drop the lock line only when the
+        // device is really gone: the line is what the duplicate-open guard reads,
+        // and while an app still holds the fs a reopen MUST keep being refused.
+        // If it stays busy, the line remains and teardown retries the close.
+        let dm_path = format!("/dev/mapper/{dm}");
+        for _ in 0..40 {
+            if !Path::new(&dm_path).exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !Path::new(&dm_path).exists() {
+            session_lock_remove(sid, &dm);
+        }
         let _ = std::fs::remove_dir(&mp);
         std::process::exit(0);
     }
@@ -600,28 +677,12 @@ fn run_close_volume(args: &Args, vault_uid: u32) -> ! {
 /// there is no crypt/mount/idmap and no fork: connect the host Wayland fd, prep
 /// the shared runtime dir, drop to the vault uid, and exec the pinned
 /// continuation (which execs the compositor). The surviving process IS the
-/// compositor, so the human's systemd/pkexec chain tracks it directly.
-/// Liveness of the shared compositor (mirrors wayland.py::compositor_is_up): the
-/// recorded pid is alive AND its socket exists. Both, so a stale pidfile or a
-/// half-started compositor reads as down.
-fn compositor_is_up() -> bool {
-    let rt = Path::new(COMPOSITOR_RUNTIME);
-    let pid = std::fs::read_to_string(rt.join("compositor.pid"))
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok());
-    match pid {
-        Some(p) => {
-            // Identity-check the pid so a reused pid (the compositor crashed and
-            // its number was recycled) can't fool us into skipping the spawn and
-            // leaving the leader with a dead socket. comm is truncated to 15
-            // chars: "veracage-compositor" -> "veracage-compos".
-            let comm = std::fs::read_to_string(format!("/proc/{p}/comm")).unwrap_or_default();
-            comm.trim_end().starts_with("veracage") && rt.join("wl-vc").exists()
-        }
-        None => false,
-    }
-}
-
+/// compositor, so its OWN systemd --user transient unit (created by the CLI's
+/// `veracage _up`) tracks it directly — decoupled from any vault session's unit,
+/// so a session ending never takes the shared compositor down with it. Liveness
+/// is checked CLI-side by wayland.py::compositor_is_up (which correctly rejects a
+/// zombie pid); there is no in-helper liveness check because the helper no longer
+/// decides whether to spawn (the CLI does, before the mount pkexec).
 fn spawn_compositor(vault_uid: u32, vault_gid: u32, args: &Args, cont_rest: &[String]) -> ! {
     let rt = Path::new(COMPOSITOR_RUNTIME);
     std::fs::create_dir_all(rt).unwrap_or_else(|e| fail(&format!("mkdir {}: {e}", rt.display()), 1));
@@ -954,7 +1015,17 @@ fn mount_volume_at_workspace(
         source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Vault".into())
     });
     let mountpoint = workspace_path(&label, source);
-    let raw = PathBuf::from(format!("{}.raw", mountpoint.display()));
+    // Staging mount target: a DOT-prefixed sibling of the volume dir under the
+    // workspace (`<WORKSPACE>/.<label>.raw`). The leading dot means the leader's
+    // scan_volumes skips it, so a transient staging dir — or one leaked by an
+    // error below — never surfaces as a phantom "volume" in the title / Places /
+    // Close menu. Cleaned up on EVERY exit path (all three below).
+    let raw = {
+        let parent = mountpoint.parent().unwrap_or(Path::new(WORKSPACE));
+        let base = mountpoint.file_name().map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| label.clone());
+        parent.join(format!(".{base}.raw"))
+    };
 
     // Stage-mount the decrypted fs to read its on-disk owner, then idmap-clone it
     // to the workspace path (identical dance to the per-vault `child`).
@@ -966,6 +1037,7 @@ fn mount_volume_at_workspace(
         .status()
         .unwrap_or_else(|e| fail(&format!("spawn mount: {e}"), 1));
     if !st.success() {
+        let _ = std::fs::remove_dir(&raw);
         let _ = crypt::close(dm_name);
         fail(&format!("mount failed: {}", st.code().unwrap_or(-1)), st.code().unwrap_or(1));
     }
@@ -975,6 +1047,7 @@ fn mount_volume_at_workspace(
     set_mode(&mountpoint, 0o755);
     if let Err(e) = idmap::idmap_mount(&raw, &mountpoint, human_uid, human_gid, vault_uid, vault_gid, 0) {
         let _ = Command::new(tool("umount")).arg(&raw).status();
+        let _ = std::fs::remove_dir(&raw);
         let _ = crypt::close(dm_name);
         fail(&format!("idmap_mount: {e}"), 1);
     }
@@ -1026,11 +1099,17 @@ fn session_child(
     let vault_run = PathBuf::from(format!("/run/veracage/session-{sid}.run"));
 
     // Shared exchange folder (idmap a human-owned host dir), same as the per-vault
-    // path — bound at /exchange, top-level, presented as veracage-owned.
+    // path — bound at /exchange, top-level, presented as veracage-owned. The mount
+    // lives OUTSIDE the workspace (a `session-<sid>.x` sibling, like the legacy
+    // path's `<mountpoint>.x`): the sandbox binds the whole workspace at /vaults
+    // recursively, and /vaults is HOME, so a mount under it would surface the
+    // host-plaintext folder inside HOME and break the "everything in HOME is
+    // encrypted at rest" invariant (an app writing under ~/.exchange, or any
+    // recursive copy of ~, would land plaintext on the host disk).
     if let Some(xpath) = args.exchange.as_deref() {
         match validated_exchange(xpath, human_uid) {
             Some(x) => {
-                let xmp = PathBuf::from(format!("{WORKSPACE}/.exchange"));
+                let xmp = PathBuf::from(format!("/run/veracage/session-{sid}.x"));
                 let _ = std::fs::create_dir_all(&xmp);
                 set_mode(&xmp, 0o700);
                 match idmap::idmap_mount(
@@ -1097,6 +1176,7 @@ fn run_session_bootstrap(
     vault_uid: u32,
     vault_gid: u32,
     source: &Path,
+    flock: std::fs::File,
 ) -> ! {
     let sid = args.session.as_deref().unwrap();
     if !session_id_ok(sid) {
@@ -1123,12 +1203,33 @@ fn run_session_bootstrap(
     }
     set_mode(WORKSPACE, 0o755);
 
-    let dm_name = random_dm_name();
-    // Pre-fork lock (empty label; the dm_name is what teardown needs). The child
-    // knows the real label but the lock only has to name the device to close.
-    write_session_lock(sid, &dm_name, "", human_uid);
+    let lock_path = format!("/run/veracage/session-{sid}.lock");
 
-    ensure_compositor_running(args, vault_uid, vault_gid);
+    // Serialized with any concurrent open/teardown for this sid (main() took the
+    // flock before the bootstrap-vs-add decision and passed it down). A stale
+    // lock here (crashed predecessor whose ExecStopPost failed) is recovered
+    // first: close its orphan dms and start from a clean slate.
+    if Path::new(&lock_path).exists() {
+        eprintln!("veracage-helper: recovering a stale session lock for sid {sid}");
+        let _ = close_all_session_dms(sid);
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    // Each bootstrap gets a random GENERATION nonce in the lock header. Our
+    // teardown only touches the session files if the lock still carries OUR
+    // generation — a successor session that reused the sid while we were still
+    // tearing down must not have its lock/pidfile/dms clobbered.
+    let gen = random_hex(8);
+    create_session_lock(sid, human_uid, &gen);
+    let dm_name = random_dm_name();
+    // Pre-fork volume line (empty label; the dm_name is what teardown needs). The
+    // child knows the real label but the lock only has to name the device to close.
+    append_session_volume(sid, &dm_name, "", &vault_hash(source));
+
+    // The persistent compositor is brought up by the CLI (`veracage _up`, its own
+    // systemd --user unit) BEFORE this mount pkexec — NOT forked here, which would
+    // put it in this session's cgroup and let its stop kill the shared compositor.
+    // The leader just verifies the socket is present.
 
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -1142,19 +1243,57 @@ fn run_session_bootstrap(
     // Parent (root, original NS): the session leader's pid (+ start-time) lets the
     // add-volume path find + verify the workspace NS holder.
     write_session_pidfile(sid, pid);
+    // Release the session flock for the leader's lifetime — add-volume and
+    // close-volume operations must be able to take it while we block in waitpid.
+    drop(flock);
     install_signal_forwarding(pid);
     let rc = wait_for(pid);
+
+    // TEST-ONLY fault injection (debug builds only; compiled out of `make install`
+    // release binaries): widen the teardown window so a spike can deterministically
+    // interleave a successor bootstrap for the SAME sid between the leader's death
+    // and this teardown, proving the generation guard below protects the successor.
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("VERACAGE_DEBUG_TEARDOWN_DELAY_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
 
     // The leader (holding the workspace NS) has exited: every /vaults/* mount is
     // gone with the NS, so close EVERY volume's dm from the session lock (this
     // volume plus any added later via setns). ExecStopPost `cleanup --session` is
     // the crash-safety backup (idempotent; it no-ops while the leader is alive).
+    // Re-serialized: a concurrent `veracage open` may be bootstrapping a NEW
+    // session for this sid right now — if the lock's generation is no longer
+    // ours, the successor already recovered our dms (its bootstrap closes every
+    // dm in the stale lock) and owns every session-<sid> file; touch nothing.
+    let _flock = session_flock(sid);
+    let ours = std::fs::read_to_string(&lock_path)
+        .map(|b| lock_generation(&b) == Some(gen.as_str()))
+        .unwrap_or(false);
+    if !ours {
+        std::process::exit(rc);
+    }
     let all_closed = close_all_session_dms(sid);
     let _ = std::fs::remove_dir_all(format!("/run/veracage/session-{sid}.run"));
+    // The exchange idmap mount died with the leader's NS; only its (host-visible)
+    // empty target dir remains.
+    let _ = std::fs::remove_dir(format!("/run/veracage/session-{sid}.x"));
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(format!("/run/veracage/session-{sid}.pid"));
+    // Belt on top of the generation check: only drop the pidfile if it still
+    // names OUR leader.
+    let pid_path = format!("/run/veracage/session-{sid}.pid");
+    let pid_is_ours = std::fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|b| b.split_whitespace().next().map(|p| p == pid.to_string()))
+        .unwrap_or(false);
+    if pid_is_ours {
+        let _ = std::fs::remove_file(&pid_path);
+    }
     if all_closed {
-        let _ = std::fs::remove_file(format!("/run/veracage/session-{sid}.lock"));
+        let _ = std::fs::remove_file(&lock_path);
     }
     std::process::exit(rc);
 }
@@ -1172,12 +1311,35 @@ fn run_session_add(
     vault_gid: u32,
     source: &Path,
     leader_pid: i32,
+    // Held (not used) for our whole lifetime: serializes the lock append + mount
+    // against a concurrent teardown/bootstrap for the same sid. Released on exit.
+    _flock: std::fs::File,
 ) -> ! {
     let sid = args.session.as_deref().unwrap();
+
+    // Duplicate-open guard: refuse a source that is ALREADY open in this session.
+    // Without it a second `veracage open <same vault>` would cryptsetup-open the
+    // same backing file again (a fresh loop device) and rw-mount the same
+    // filesystem twice at `<label>-2` — filesystem corruption. The lock records
+    // each volume's source hash; a line whose dm still exists means the volume is
+    // genuinely open (a per-volume close drops the line once its dm is gone, so a
+    // closed volume can be reopened).
+    let vhash = vault_hash(source);
+    let lock_body = std::fs::read_to_string(format!("/run/veracage/session-{sid}.lock"))
+        .unwrap_or_default();
+    for dm in lock_dms_for_vhash(&lock_body, &vhash) {
+        if Path::new(&format!("/dev/mapper/{dm}")).exists() {
+            fail(&format!(
+                "{} is already open in the running workspace; close that volume \
+                 first (Close volume in the toolbar, or `veracage close-volume \
+                 <label>`)", source.display()), 2);
+        }
+    }
+
     let dm_name = random_dm_name();
     // Append to the session lock BEFORE the mount (crash safety): the dm_name is
     // pre-generated, so even an early kill leaves teardown a device to close.
-    write_session_lock(sid, &dm_name, "", human_uid);
+    append_session_volume(sid, &dm_name, "", &vhash);
 
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -1217,37 +1379,6 @@ fn run_session_add(
         }
     }
     std::process::exit(rc);
-}
-
-/// One prompt: if the shared compositor isn't running, bring it up (detached) as
-/// part of THIS pkexec so `veracage open` needs no second authorization. The
-/// forked child setsid()s and execs the compositor (outlives the session); the
-/// caller doesn't wait on it. Shared by the per-vault and session-bootstrap paths.
-fn ensure_compositor_running(args: &Args, vault_uid: u32, vault_gid: u32) {
-    if compositor_is_up() {
-        return;
-    }
-    let cpid = unsafe { libc::fork() };
-    if cpid < 0 {
-        fail_errno("fork(compositor)");
-    }
-    if cpid == 0 {
-        unsafe { libc::setsid() };
-        let rest = [
-            "_compositor".to_string(),
-            "--socket".to_string(),
-            "wl-vc".to_string(),
-        ];
-        spawn_compositor(vault_uid, vault_gid, args, &rest); // execs; never returns
-    }
-    // Give it a moment to create its socket so the leader finds it.
-    let sock = Path::new(COMPOSITOR_RUNTIME).join("wl-vc");
-    for _ in 0..120 {
-        if sock.exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
 }
 
 fn main() {
@@ -1312,12 +1443,21 @@ fn main() {
         if !session_id_ok(sid) {
             fail(&format!("invalid --session {sid:?}"), 2);
         }
+        // Serialize the bootstrap-vs-add decision (and everything it leads to)
+        // against concurrent opens/teardowns for the same sid: without this, an
+        // open racing a slow teardown appends to a lock the teardown is about to
+        // act on, and the teardown then deletes the NEW session's pidfile / closes
+        // its dm. The callee decides when to release (bootstrap: before waiting
+        // out the leader; add: on exit).
+        let flock = session_flock(sid);
         match verify_session_leader(sid, vault_uid) {
             Some(leader_pid) => {
-                run_session_add(&args, human_uid, human_gid, vault_uid, vault_gid, &source, leader_pid)
+                run_session_add(&args, human_uid, human_gid, vault_uid, vault_gid, &source,
+                                leader_pid, flock)
             }
             None => {
-                run_session_bootstrap(&args, human_uid, human_gid, vault_uid, vault_gid, &source)
+                run_session_bootstrap(&args, human_uid, human_gid, vault_uid, vault_gid, &source,
+                                      flock)
             }
         }
     }
@@ -1344,7 +1484,8 @@ fn main() {
     let lock = format!("/run/veracage/{}.lock", vault_hash(&source));
     write_lock(&lock, &dm_name, &mountpoint, human_uid);
 
-    ensure_compositor_running(&args, vault_uid, vault_gid);
+    // Compositor is brought up by the CLI as its own unit (see the session path);
+    // this legacy per-vault flow just relies on it already being present.
 
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -1500,5 +1641,41 @@ mod tests {
         assert!(!label_ok(".."));
         assert!(!label_ok("a/b"));
         assert!(!label_ok("../../etc"));
+    }
+
+    #[test]
+    fn lock_dms_for_vhash_matches_third_field() {
+        let body = "user_uid=1000\n\
+                    volume=veracage-aaaaaaaaaaaa\tWork\t0631c55cceb0614f\n\
+                    volume=veracage-bbbbbbbbbbbb\t\tdeadbeefdeadbeef\n\
+                    volume=veracage-cccccccccccc\tX\t0631c55cceb0614f\n";
+        assert_eq!(
+            lock_dms_for_vhash(body, "0631c55cceb0614f"),
+            vec!["veracage-aaaaaaaaaaaa".to_string(), "veracage-cccccccccccc".to_string()]
+        );
+        assert_eq!(lock_dms_for_vhash(body, "deadbeefdeadbeef"),
+                   vec!["veracage-bbbbbbbbbbbb".to_string()]);
+        assert!(lock_dms_for_vhash(body, "0000000000000000").is_empty());
+    }
+
+    #[test]
+    fn lock_generation_parses_header() {
+        assert_eq!(
+            lock_generation("user_uid=1000\ngeneration=00aabbccddeeff11\nvolume=x\ty\tz\n"),
+            Some("00aabbccddeeff11")
+        );
+        // legacy / headerless locks have no generation — teardown must then
+        // treat the lock as not-ours and leave it to the ExecStopPost cleanup
+        assert_eq!(lock_generation("user_uid=1000\nvolume=x\ty\tz\n"), None);
+        assert_eq!(lock_generation(""), None);
+    }
+
+    #[test]
+    fn lock_dms_for_vhash_ignores_legacy_two_field_lines() {
+        // Pre-guard locks had no vault-hash field: those lines must never match
+        // (no false "already open" refusals after an upgrade mid-session).
+        let body = "user_uid=1000\nvolume=veracage-aaaaaaaaaaaa\tWork\n";
+        assert!(lock_dms_for_vhash(body, "0631c55cceb0614f").is_empty());
+        assert!(lock_dms_for_vhash("", "0631c55cceb0614f").is_empty());
     }
 }
