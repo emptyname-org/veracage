@@ -1,9 +1,8 @@
-//! egui config picker — manage which apps are enabled against the vault (replaces
-//! `configure.py`'s Qt window). Host-sensed default apps appear as tick-boxes to
-//! enable; every enabled app is listed with an ✖ to remove; "Add another app…"
-//! takes ANY installed binary (a name on `$PATH`, or an absolute path). Closing
-//! the window (titlebar or Save) SAVES; Cancel discards. Layout follows the user's
-//! design: wide margins, Save/Cancel bottom-right (same house style as settings).
+//! egui config picker: manage which apps are enabled inside Veracage (replaces
+//! `configure.py`'s Qt window). One unified list: enabled apps are checked,
+//! host-sensed suggestions are unchecked; ticking enables, unticking removes.
+//! "Add another app" takes ANY installed binary (a name on `$PATH`, or an
+//! absolute path). Closing the window (titlebar or Save) SAVES; Cancel discards.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -23,7 +22,7 @@ pub fn run_configure() -> Result<Outcome, eframe::Error> {
     let app = ConfigApp::new(outcome.clone());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Veracage — apps")
+            .with_title("Veracage Apps")
             .with_app_id("veracage")
             .with_inner_size([620.0, 640.0])
             .with_min_inner_size([500.0, 420.0]),
@@ -33,7 +32,7 @@ pub fn run_configure() -> Result<Outcome, eframe::Error> {
         "veracage-configure",
         options,
         Box::new(move |cc| {
-            crate::theme::apply(&cc.egui_ctx, &config::load().theme);
+            crate::theme::apply_config(&cc.egui_ctx, &config::load());
             Ok(Box::new(app) as Box<dyn eframe::App>)
         }),
     )?;
@@ -42,18 +41,21 @@ pub fn run_configure() -> Result<Outcome, eframe::Error> {
 }
 
 struct ConfigApp {
-    cfg: config::Config, // existing config — non-apps fields preserved on save
+    cfg: config::Config, // existing config, non-apps fields preserved on save
     apps: Vec<apps::App>,
-    suggested: Vec<detect::Suggestion>, // host defaults (xdg-mime) — quick tick-boxes
+    suggested: Vec<detect::Suggestion>, // host defaults (xdg-mime)
     new_exec: String,
     error: String,
     cancelled: bool,
     outcome: Arc<Mutex<Outcome>>,
+    /// Per-exec installed-state, memoized for the dialog's lifetime so the
+    /// `$PATH` stat-walk in `is_installed` runs once per exec, not per repaint.
+    installed: std::collections::HashMap<String, bool>,
 }
 
 impl ConfigApp {
     fn new(outcome: Arc<Mutex<Outcome>>) -> Self {
-        let cfg = config::load();
+        let cfg = config::load(); // load() dedupes by exec basename
         let apps = cfg.apps.clone();
         ConfigApp {
             cfg,
@@ -63,29 +65,40 @@ impl ConfigApp {
             error: String::new(),
             cancelled: false,
             outcome,
+            installed: std::collections::HashMap::new(),
         }
     }
 
-    fn enabled(&self, exec: &str) -> bool {
-        self.apps.iter().any(|a| a.exec == exec)
+    /// Installed-state for `exec`, computed once and cached (stable for the
+    /// short dialog session).
+    fn is_installed(&mut self, exec: &str) -> bool {
+        if let Some(&v) = self.installed.get(exec) {
+            return v;
+        }
+        let v = apps::is_installed(exec);
+        self.installed.insert(exec.to_string(), v);
+        v
     }
 
-    /// Enable a suggested app (tick-box) — it then leaves the suggestions and
-    /// appears in the enabled list below.
+    fn enabled_basename(&self, exec: &str) -> bool {
+        let base = config::exec_basename(exec);
+        self.apps.iter().any(|a| config::exec_basename(&a.exec) == base)
+    }
+
+    /// Enable an app (ticked suggestion): it moves into the enabled set.
     fn enable(&mut self, name: &str, exec: &str) {
-        if self.enabled(exec) {
+        if self.enabled_basename(exec) {
             return;
         }
         let taken: HashSet<String> = self.apps.iter().map(|a| a.key.clone()).collect();
         self.apps.push(apps::App {
             key: key_for(exec, &taken),
-            name: name.to_string(),
+            name: config::capitalize_first(name),
             exec: exec.to_string(),
-            args: vec!["/vaults".to_string()],
         });
     }
 
-    /// Add ANY installed binary (name defaults to its basename, opened at /vaults).
+    /// Add ANY installed binary (name defaults to its basename).
     fn add_custom(&mut self) {
         let exec = self.new_exec.trim().to_string();
         if exec.is_empty() {
@@ -96,17 +109,32 @@ impl ConfigApp {
             self.error = format!("'{exec}' is not installed / not on $PATH.");
             return;
         }
+        if self.enabled_basename(&exec) {
+            self.error = format!("'{}' is already enabled.", basename(&exec));
+            return;
+        }
         let taken: HashSet<String> = self.apps.iter().map(|a| a.key.clone()).collect();
-        let key = self
-            .apps
-            .iter()
-            .find(|a| a.exec == exec)
-            .map(|a| a.key.clone())
-            .unwrap_or_else(|| key_for(&exec, &taken));
-        self.apps.retain(|a| a.exec != exec);
-        self.apps.push(apps::App { key, name: basename(&exec), exec, args: vec!["/vaults".into()] });
+        let name = config::capitalize_first(&basename(&exec));
+        self.apps.push(apps::App { key: key_for(&exec, &taken), name, exec });
         self.new_exec.clear();
         self.error.clear();
+    }
+
+    /// The gray annotation for an app: its detected category, else its path
+    /// (for a custom absolute-path binary), else nothing.
+    fn note_for(&self, a: &apps::App) -> Option<String> {
+        let base = config::exec_basename(&a.exec);
+        if let Some(s) = self
+            .suggested
+            .iter()
+            .find(|s| config::exec_basename(&s.exec) == base)
+        {
+            return Some(s.category.to_string());
+        }
+        if is_file_manager(&a.exec) {
+            return Some("file manager".into());
+        }
+        a.exec.contains('/').then(|| a.exec.clone())
     }
 
     fn save(&mut self) {
@@ -131,8 +159,8 @@ fn basename(s: &str) -> String {
         .to_string()
 }
 
-/// Known file-manager binaries (keep in sync with FILE_MANAGERS in cli.py). Used
-/// to tag them with a folder glyph — a file manager is what opens the vault.
+/// Known file-manager binaries (keep in sync with FILE_MANAGERS in cli.py),
+/// annotated as such, and a file manager is what auto-opens a mounted volume.
 const FILE_MANAGERS: &[&str] = &[
     "dolphin", "nautilus", "nemo", "thunar", "pcmanfm", "pcmanfm-qt",
     "caja", "konqueror", "krusader", "nnn", "ranger",
@@ -156,81 +184,112 @@ fn key_for(exec: &str, taken: &HashSet<String>) -> String {
     (2..).map(|n| format!("{base}-{n}")).find(|k| !taken.contains(k)).unwrap()
 }
 
+/// One row's label: the app name, plus an optional gray "(note)" in the same
+/// widget so the whole line is one click target.
+fn row_label(ui: &egui::Ui, name: &str, note: Option<&str>) -> egui::text::LayoutJob {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        name,
+        0.0,
+        egui::TextFormat {
+            font_id: font.clone(),
+            color: ui.visuals().text_color(),
+            ..Default::default()
+        },
+    );
+    if let Some(n) = note {
+        job.append(
+            &format!("  ({n})"),
+            0.0,
+            egui::TextFormat {
+                font_id: font,
+                color: ui.visuals().weak_text_color(),
+                ..Default::default()
+            },
+        );
+    }
+    job
+}
+
 impl eframe::App for ConfigApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Closing the window (titlebar) SAVES; Cancel sets `cancelled` first so it
-        // discards. The config IS the state — there is no separate confirm step.
+        // discards. The config IS the state: there is no separate confirm step.
         if ctx.input(|i| i.viewport().close_requested()) && !self.cancelled {
             self.save();
         }
 
-        let mut do_save = false;
-        let mut do_cancel = false;
-
-        egui::TopBottomPanel::bottom("actions")
-            .frame(crate::theme::content_frame(ctx))
-            .show(ctx, |ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    crate::theme::pad_buttons(ui);
-                    if ui.button("Cancel").clicked() {
-                        do_cancel = true;
-                    }
-                    if ui.button("Save").clicked() {
-                        do_save = true;
-                    }
-                    ui.label(
-                        egui::RichText::new(format!("{} enabled", self.apps.len())).weak(),
-                    );
-                });
-            });
+        let count = self.apps.len();
+        let (do_save, do_cancel) = crate::theme::action_bar(ctx, |ui| {
+            ui.label(egui::RichText::new(format!("{count} enabled")).weak());
+        });
 
         egui::CentralPanel::default()
             .frame(crate::theme::content_frame(ctx))
             .show(ctx, |ui| {
-                ui.heading("Pick the apps you want to use in Veracage");
-                ui.add_space(12.0);
+                ui.label(egui::RichText::new("Select apps to use in Veracage").weak());
+                ui.add_space(10.0);
+
+                // Warm the installed-state cache for every exec once, so the
+                // per-row reads below don't stat-walk $PATH each repaint.
+                let execs: Vec<String> = self
+                    .apps
+                    .iter()
+                    .map(|a| a.exec.clone())
+                    .chain(self.suggested.iter().map(|s| s.exec.clone()))
+                    .collect();
+                for e in execs {
+                    self.is_installed(&e);
+                }
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    // Host-sensed suggestions not yet enabled — tick to enable.
-                    // Collect the click and apply after the loop (can't call
-                    // &mut self.enable while iterating self.suggested).
+                    // Enabled apps first (config order): checked; unticking removes.
+                    let mut remove: Option<usize> = None;
+                    for (i, a) in self.apps.iter().enumerate() {
+                        let mut on = true;
+                        let installed = self.installed.get(&a.exec).copied().unwrap_or(true);
+                        let mut label = row_label(ui, &a.name, self.note_for(a).as_deref());
+                        if !installed {
+                            label = row_label(
+                                ui,
+                                &a.name,
+                                Some(&match self.note_for(a) {
+                                    Some(n) => format!("{n}, not installed"),
+                                    None => "not installed".to_string(),
+                                }),
+                            );
+                        }
+                        if ui.checkbox(&mut on, label).changed() && !on {
+                            remove = Some(i);
+                        }
+                    }
+                    if let Some(i) = remove {
+                        self.apps.remove(i);
+                    }
+
+                    // Host-sensed suggestions not yet enabled: unchecked; ticking
+                    // enables. Collect the click and apply after the loop (can't
+                    // call &mut self.enable while iterating self.suggested).
                     let mut enable_now: Option<(String, String)> = None;
-                    for s in self.suggested.iter().filter(|s| !self.enabled(&s.exec)) {
-                        let tag = if is_file_manager(&s.exec) { "\u{1F4C1} " } else { "" };
+                    for s in &self.suggested {
+                        if self.enabled_basename(&s.exec) {
+                            continue;
+                        }
                         let mut on = false;
-                        if ui
-                            .checkbox(&mut on, format!("{tag}{}  \u{2014}  {}", s.name, s.category))
-                            .changed()
-                        {
-                            enable_now = Some((s.name.clone(), s.exec.clone()));
+                        let name = config::capitalize_first(&s.name);
+                        let label = row_label(ui, &name, Some(s.category));
+                        if ui.checkbox(&mut on, label).changed() && on {
+                            enable_now = Some((name, s.exec.clone()));
                         }
                     }
                     if let Some((name, exec)) = enable_now {
                         self.enable(&name, &exec);
                     }
 
-                    // Every enabled app, with an ✖ to remove.
-                    let mut remove: Option<usize> = None;
-                    for (i, a) in self.apps.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            if ui.button("\u{2716}").on_hover_text("Remove").clicked() {
-                                remove = Some(i);
-                            }
-                            let args = if a.args.is_empty() { String::new() }
-                                       else { format!(" {}", a.args.join(" ")) };
-                            let missing = if apps::is_installed(&a.exec) { "" }
-                                          else { "  (not installed)" };
-                            let tag = if is_file_manager(&a.exec) { "\u{1F4C1} " } else { "" };
-                            ui.label(format!("{}{}  \u{2014}  {}{}{}", tag, a.name, a.exec, args, missing));
-                        });
-                    }
-                    if let Some(i) = remove {
-                        self.apps.remove(i);
-                    }
-
                     ui.add_space(14.0);
-                    ui.strong("Add another app\u{2026}");
-                    ui.add_space(4.0);
+                    ui.label("Add another app");
+                    ui.add_space(2.0);
                     ui.horizontal(|ui| {
                         let add_w = 64.0;
                         let field_w = (ui.available_width() - add_w - 8.0).max(120.0);
@@ -246,7 +305,7 @@ impl eframe::App for ConfigApp {
                         }
                     });
                     if !self.error.is_empty() {
-                        ui.colored_label(egui::Color32::from_rgb(200, 80, 80), &self.error);
+                        ui.colored_label(crate::theme::ERROR, &self.error);
                     }
                 });
             });

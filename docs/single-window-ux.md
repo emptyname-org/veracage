@@ -1,170 +1,140 @@
-# Single-window UX — one window, a menu bar, files in/out
+# Single-window UX
 
-**Status: design of record (2026-07-09). Implementation in progress.** Replaces the
-two-floating-window model (standalone launcher window + compositor window) with a
-single window whose controls live in a menu bar, plus a mechanism for host↔vault
-file transfer. Builds on `uid-isolation.md` (the deny-by-uid architecture).
+One persistent window, the compositor's, with a menu bar. The human side is
+a windowless broker. Builds on `uid-isolation.md`.
 
-## The two problems
+## The constraint that shapes it
 
-1. **Two floating windows.** Today the human-uid **launcher** (`veracage-agent`,
-   eframe) and the veracage-uid **compositor** are separate top-level windows. The
-   launcher lingers next to the compositor after a mount — clutter.
-2. **No file transfer.** The old `/vault/.veracage/{in,out}` bridge over the control
-   socket was removed (a pen test drove it to exfiltrate the whole vault). We still
-   need import/export.
-
-## The constraint that shapes everything
-
-The two windows are separate **processes** *and* separate **uids** (human vs
-`veracage`), by necessity: only a human-uid process can `pkexec` / open host files
-/ write `~/.config`, and only a veracage-uid process can hold the sealed vault
-content. Wayland has no cross-client surface embedding, and a process has one uid,
-so **the two cannot be merged into one window, docked, or shown as two frames.**
-The only path to one window: the process that *must* have a window — the
-compositor — hosts the UI, and delegates the host-side actions to the other.
+The compositor and the human-side agent are separate **processes** *and*
+separate **uids** (human vs `veracage`), by necessity: only a human-uid
+process can `pkexec`, open host files, or write `~/.config`, and only a
+veracage-uid process can hold the sealed volume content. Wayland has no
+cross-client surface embedding, and a process has one uid, so the two cannot
+be merged into one window, docked, or shown as two frames. The one-window
+path: the process that *must* have a window, the compositor, hosts the UI
+and delegates host-side actions to the broker.
 
 ## The model
 
-- **The compositor window is the only persistent window.** It gains a **menu bar**
-  (egui, drawn by the compositor) in place of the current button strip.
-- **The human side becomes a windowless broker.** No standing window; it pops only
-  transient dialogs (volume picker, passphrase prompt) and runs `pkexec` /
-  `veracage open`, driven by commands from the compositor.
-- **The front door is the empty compositor window.** Launching Veracage brings up
-  the compositor with its menu bar and no vault; **File → Open vault…** then runs
-  the volume picker → passphrase → `veracage open`. (Interim in the current build:
-  the broker pops the picker at launch instead; the empty-window front door — and
-  removing that startup picker — lands in the UI pass, see below.) A `.vc`
-  "Open with" opens straight to the passphrase, skipping the picker.
+- **The compositor window is the only persistent window**, with an egui menu
+  bar in its chrome.
+- **The human side is a windowless broker** (`veracage-agent`): no standing
+  window. It pops only transient dialogs (volume picker, passphrase prompt)
+  and runs `pkexec` / `veracage open`, driven by commands from the compositor.
+- **Front door**: launching Veracage brings up the compositor **and an empty
+  session** - a session leader with no volume (`veracage _up` runs
+  `ensure_compositor_up` then `ensure_empty_session`, two pkexecs coalesced
+  into one prompt). So apps are launchable immediately, sandboxed against an
+  empty workspace plus `/exchange` - a secure scratchpad (open an editor, work
+  with no network or host filesystem, then clipboard-out or save to the
+  shared directory). File > Mount volume adds a volume to that same session via
+  the add-volume path. Apps launched after the mount see it (a fixed-at-launch
+  mount namespace, same rule as multi-volume). If the empty session can't
+  bootstrap, the Apps menu falls back to showing the configured apps disabled
+  until a volume is mounted (the compositor reads `pub/config.apps`).
 
 ### Menu layout
 
 | Menu | Items |
 |---|---|
-| **File** | Open vault… · Import file… · Export file… · Close vault · Quit |
-| **Edit** | Paste → sandbox (Ctrl+Alt+V) · Copy → host (Ctrl+Alt+C) |
-| **Apps** | one item per enabled app of each open vault (launch) |
-| **Settings** | Configure apps… · GPU passthrough ☑ · On suspend: Dismount/Ignore |
-| **Help** | Keybinds · About |
+| **File** | Mount volume... / Shared directory / Unmount > (one item per mounted volume) / Quit |
+| **Clipboard** | Copy out / Paste in (configurable shortcuts, defaults Ctrl+Alt+C / Ctrl+Alt+V) |
+| **Apps** | one item per app, with its host icon / Configure apps... |
+| **Settings** | Settings... (theme, window size, font, clipboard clear, shared directory, suspend, GPU) / Configure shortcuts... |
+| **Help** | Help... / About Veracage... |
 
-- **Edit** and **Apps** act **in-process** in the compositor (clipboard is
-  compositor-owned; app launch goes to the leader over the veracage-owned socket —
-  both already exist).
-- **File** and **Settings** items that need host-side work emit a **command** to the
-  broker (below).
+**Clipboard** and **Apps** (launch, with a volume mounted) act in-process in the
+compositor: the clipboard is compositor-owned, and an app launch goes to the
+leader over the veracage-owned socket. Everything needing host-side work
+(open, exchange, configure, settings, help, about, unmount) emits a command
+to the broker.
 
-## Compositor → broker command channel
+## Compositor -> broker command channel
 
-Generalizes the existing `configure.req` mtime signal into a small verb channel.
+On a menu selection needing the broker, the compositor writes
+`/run/veracage/rt/cmd.req`, one verb line (verbs: `open`, `configure`,
+`settings`, `shortcuts`, `exchange`, `help`, `about`, `close-volume:<label>`.
+Apps launch in-process over the leader socket, not through the broker),
+mode 0644 (`/run/veracage/rt` is `0711 veracage`, so the broker traverses
+and reads by exact path). The broker polls the file's mtime and dispatches
+new verbs.
 
-- On a menu selection needing the broker, the compositor writes
-  `/run/veracage/rt/cmd.req` — one line: `<counter> <verb> [payload]` (verbs:
-  `open`, `configure`, `settings`, `close-all`, `import`, `export`). Mode `0644` so the
-  human broker can read the verb (`/run/veracage/rt` is `0711 veracage`; the broker
-  traverses + reads by exact path). The counter makes each write a distinct event.
-- The broker polls the file's mtime (as it already does for `configure.req`) and,
-  on a new counter, reads and dispatches the verb.
+**Why this is safe.** The authority lives in the compositor: a click on its
+menu is a real user action a same-uid attacker cannot forge. The attacker is
+a different uid than `veracage`, can't be a client of the compositor, and the
+host compositor won't grant it input synthesis. It cannot write `cmd.req`
+either: `/run/veracage/rt` is `0711 veracage`, so it can't create files
+there. The verbs themselves aren't secret (0644-readable is fine, at most an
+observer learns "an open was requested"). The broker only ever acts on
+genuine compositor-issued commands.
 
-**Why this is safe.** The authority lives in the **compositor**: a click on its
-menu is a real user action a same-uid attacker (Mallory) cannot forge — Mallory is
-a different uid, can't be a client of the compositor, and KWin won't grant him
-input-synthesis. Mallory **cannot write `cmd.req`** either: `/run/veracage/rt` is
-`0711 veracage`, so he can't create files there. The verbs themselves aren't secret
-(0644-readable is fine — at most Mallory learns "an import was requested"). So the
-broker only ever acts on genuine compositor-issued commands.
+## Publishing the app list (front-door Apps menu)
+
+The compositor runs as the veracage uid and cannot read the human's
+`~/.config`, so the human side publishes the configured apps for it: the
+helper creates `/run/veracage/pub` (root-created inside root-owned
+`/run/veracage`, then handed to the human uid, mode 0755) at compositor
+spawn, and the broker/CLI write `config.apps` (`<key>\t<name>` per line)
+plus `icons/<key>.rgba` menu icons resolved from the host icon theme. The
+broker republishes whenever config.toml changes. Trust level: the dir is
+writable only by the human uid, the same trust as config.toml itself. The
+compositor validates everything it reads from there (sizes, key shapes,
+icon dimensions).
 
 ## Prompt flow
 
-Cold open shows **two** dialogs, in VeraCrypt order:
+Cold open shows two dialogs, in VeraCrypt order:
 
-1. **Volume passphrase** — a **transient egui dialog** the broker pops, reusing the
-   existing hardened field (`Zeroizing<String>`, wiped on every exit path, egui
-   undo-history reset). *`systemd-ask-password` was evaluated and ruled out:* its
-   agent mode writes a query into `/run/systemd/ask-password/`, which is root-owned
-   and not user-writable, so a human-uid process gets `Permission denied` — it is a
-   root/system prompt only. Our own dialog is also the more secure choice (we
-   control zeroization end-to-end rather than routing the secret through
-   `kdialog`/`zenity`).
-2. **polkit auth** — the desktop's polkit agent asks for the user's **login
-   password** to authorize the root mount helper (`auth_self_keep`, cached ~5 min;
-   the compositor bring-up and the mount are **two** pkexecs that `auth_self_keep`
-   coalesces into a **single** prompt). Not `sudo`, not root's password.
+1. **Volume passphrase**, collected by the broker: `kdialog --password` when
+   available (it matches the desktop's polkit prompt look), else a transient
+   egui dialog with a hardened field (`Zeroizing<String>`, wiped on every
+   exit path, egui undo-history reset). A wrong passphrase does not fail
+   silently: the helper exits with a dedicated code (4, "decrypt failed")
+   and the broker re-opens the prompt with a "wrong passphrase" line until
+   it succeeds or the user cancels.
+2. **polkit auth**: the desktop's polkit agent asks for the user's **login
+   password** to authorize the root mount helper (`auth_self_keep`, cached
+   ~5 min, so the compositor bring-up and the mount are two pkexecs coalesced
+   into a **single** prompt). Not `sudo`, not root's password.
 
-Subsequent opens while a session is up: **only** the passphrase dialog (polkit
-cached), and the new vault's apps join the existing compositor window (no new
-window).
+Subsequent opens while a session is up: **only** the passphrase dialog
+(polkit cached), and the new volume joins the existing compositor window (no
+new window).
 
-## File transfer — the idmapped Exchange folder (DONE, replaces the io-helper)
+## File transfer, the shared directory
 
-**Decision (2026-07-09): a shared folder, not dialogs.** Dialog-driven import/export
-was rejected as bad UX. Instead, host↔vault transfer is a **reverse-idmapped shared
-directory** — the same mechanism we use to map the vault and to map `/usr` for apps,
-just pointed at a plain host dir. (Proven: `prototype/spike10` + `spike11`, VPS.)
+Host-to-Veracage transfer is a **reverse-idmapped shared directory**, the
+same mechanism used to map the volume, pointed at a plain host dir. Not
+dialogs, not a daemon.
 
-- **Host side:** `~/Veracage/Exchange` — a plain folder you own, created by
-  `cli.py` on open. Nothing is mounted host-side; it's just a directory.
-- **Vault side:** the helper idmap-mounts it (`idmap_mount(exchange, …,
-  human→veracage)` + `nosuid,nodev,noexec`) into the private NS; the sandbox binds
-  it at **`/exchange`** (top-level, NOT under `/vault`, so the "everything in HOME
-  is encrypted" invariant holds), with a seeded "Exchange (host-shared)" Place.
-- **UX:** drop a file in `~/Veracage/Exchange` on the host → it's instantly in
-  `/exchange` in the sandbox, owned by whoever looks (the idmap reverse-maps the
-  sandbox's writes back to `1000:1000` on disk, so you own them natively). No
-  dialogs, no copies, no daemon. The File menu's Import/Export become "open the
-  exchange folder" conveniences, and the whole token-gated `veracage-io` plan is
-  **deleted** — this is net-negative code.
+- **Host side:** `~/Veracage/Exchange`, a plain directory owned by the user,
+  created on open. Nothing is mounted host-side. File > Shared
+  directory opens it in the host file manager.
+- **Veracage side:** the helper idmap-mounts it (human to veracage,
+  `nosuid,nodev,noexec`) into the private NS. The sandbox binds it at
+  **`/exchange`** (top-level, NOT under `/vaults`, so the "everything in
+  HOME is encrypted" invariant holds), with a seeded "Exchange (host-shared)"
+  Place.
+- **UX:** a file dropped on either side appears instantly on the other,
+  owned natively by the user. The idmap reverse-maps the sandbox's writes
+  back to the human uid on disk. No dialogs, no copies, no daemon.
 
-This is exactly how VirtualBox shared folders / Podman `--volume :idmap` /
-systemd-nspawn `:rootidmap` work; we already shipped the syscall sequence in
-`idmap.rs`.
+This is how VirtualBox shared folders, Podman `--volume :idmap`, and
+systemd-nspawn `:rootidmap` work. The syscall sequence is the helper's
+existing `idmap.rs`.
 
-**Security.** The vault is never exposed: `/exchange` is a *separate* mount (a
-different superblock from the vault), so `link()` across is `EXDEV`, symlinks
-dangle across the boundary, and no vault mount becomes host-visible — the deny-by-
-uid seal, the hidden NS, and (critically) the suspend/crash dm-teardown path are all
-untouched. What's exposed is exactly what's *in* the exchange — declassified,
-in-transit files the user consciously moved there (a same-uid host attacker reading
-them is not a vault breach). A *compromised sandboxed app* could copy the vault into
-the exchange, but **that is outside the primary threat model** (design §10) — we do
-not defend the vault against the apps the user chose to run, so no per-app policy is
-needed. Two cheap in-scope guards remain: the helper validates the caller-supplied
-exchange path (`O_NOFOLLOW`, owner == human — stops `--exchange /etc`), and the
-mount is `nosuid,nodev,noexec`. Per-vault/global `exchange = false` turns it off.
-It's independent of any vault (session-level, like the clipboard) and RAM-backing is
-a future config knob for no-plaintext-at-rest.
-
-## What changes in code
-
-- **Deleted:** the launcher's persistent menu/settings window (`ui_launcher.rs`
-  view machinery). The `configure.req`-specific signal is generalized into `cmd.req`.
-- **Compositor:** `toolbar.rs` becomes a menu bar; `winit.rs` dispatches menu
-  actions (in-process for clipboard/launch, `request_command` for the rest);
-  `request_configure` → `request_command(verb)`.
-- **Agent:** the no-args path becomes the headless broker (single-instance guard +
-  initial open flow + `cmd.req` watch loop); the hardened passphrase field is
-  extracted into a standalone transient window; Settings becomes a transient window.
-- **helper-rs:** `--import`/`--export` mode + a polkit action; the compositor issues
-  the io token.
-
-## Phases (each gated on `tests/regression.sh`)
-
-1. **DONE (2026-07-09).** Compositor menu bar + generalized `cmd.req` channel — the
-   visible "File/Edit menu" change; `request_configure` → `request_command`;
-   dropdown input-capture via `wants_pointer`.
-2. **DONE (2026-07-09).** Agent → windowless broker + transient one-shot dialogs
-   (`_passphrase`, `_settings`, `configure` as fresh processes since winit can't
-   reopen an EventLoop); `ui_launcher.rs` deleted; single-instance pid guard. Front
-   door is *interim* the broker's `rfd` picker at launch (the empty-compositor front
-   door is the target — see Deferred).
-3. **DONE (2026-07-09).** File transfer = the idmapped **Exchange folder** (above),
-   which *replaced* the token-gated `veracage-io` plan entirely (net deletion).
-   Proven by `spike10` (idmap on a plain host dir, both-way rw + write-back owner)
-   and `spike11` (end-to-end through the real helper, incl. `--exchange /etc`
-   refused). Wired through helper (`--exchange`, `idmap.rs` gained an `extra_attr`
-   param), `cli.py`/`config.py` (`exchange = true`), `leader.py`/`sandbox.py`
-   (`/exchange` bind + Place). Menu Import/Export can become "open exchange" helpers.
-
-Visual/interactive verification (menu feel, dropdown input capture over the sandbox,
-the transient dialogs, the open flow) needs the user's KDE box; the build + the
-headless compositor smoke are VPS-tested.
+**Security.** The volume is never exposed: `/exchange` is a *separate* mount
+(a different superblock from the volume), so `link()` across is `EXDEV`,
+symlinks dangle across the boundary, and no volume mount becomes
+host-visible. The deny-by-uid seal, the hidden NS, and the suspend/crash
+dm-teardown path are untouched. What's exposed is exactly what is *in* the
+exchange: declassified, in-transit files the user consciously moved there (a
+same-uid host attacker reading them is not a volume breach). A *compromised
+sandboxed app* could copy volume files into the exchange, but that is
+outside the primary threat model (`veracage-design.md` section 10). Veracage
+does not defend the volume against the apps the user chose to run. Two cheap
+in-scope guards: the helper validates the caller-supplied exchange path
+(`O_NOFOLLOW`, owner == human, which stops `--exchange /etc`), and the mount
+is `nosuid,nodev,noexec`. Per-volume/global `exchange = false` turns it off.
+It is session-level (like the clipboard), independent of any volume.
+RAM-backing is a future config knob for no-plaintext-at-rest.

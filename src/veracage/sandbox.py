@@ -14,7 +14,7 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
 
     `workspace` is the shared-workspace root (the leader's tmpfs holding every
     open volume at `<workspace>/<label>`); it is recursively bound at `/vaults`,
-    so a single app sees ALL open volumes side by side (`/vaults/<label>`) — the
+    so a single app sees ALL open volumes side by side (`/vaults/<label>`) - the
     basis for cross-volume drag-and-drop. Apps see the volumes mounted **at launch
     time** (their mount namespace is fixed then); open the volumes first, then
     launch.
@@ -25,13 +25,13 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
     runtime dir is hidden behind a tmpfs.
 
     `gpu` opts into /dev/dri passthrough (per-volume `gpu = true`). Off by
-    default — Okular/Kate render fine on CPU and a shared GPU is a documented
+    default - Okular/Kate render fine on CPU and a shared GPU is a documented
     side channel.
     """
     uid = os.getuid()
     argv = [
         "bwrap",
-        # Namespaces — full isolation
+        # Namespaces - full isolation
         "--unshare-pid", "--unshare-uts", "--unshare-ipc",
         "--unshare-cgroup-try",
         "--unshare-net",
@@ -78,9 +78,9 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
         # every volume side by side. App config/cache/data go to an ephemeral tmpfs
         # (via XDG_*), so nothing app-generated is written into any volume. Files
         # the user saves under /vaults/<label> persist; a stray save to ~ itself
-        # (the tmpfs workspace root) would not — but that is not a volume.
+        # (the tmpfs workspace root) would not - but that is not a volume.
         "--perms", "0700", "--tmpfs", "/xdg",
-        # Env — start from EMPTY (`--clearenv`) so the possibly-hostile app does
+        # Env - start from EMPTY (`--clearenv`) so the possibly-hostile app does
         # NOT inherit the leader's environment (host DISPLAY, session tokens, auth
         # sockets, etc.); set only what it needs below. Inheriting was inert today
         # (--unshare-net kills the X11/abstract-socket paths) but left isolation
@@ -96,6 +96,10 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
         "--setenv", "XDG_STATE_HOME",  "/xdg/state",
         "--setenv", "WAYLAND_DISPLAY", "wayland-0",
         "--setenv", "XDG_SESSION_TYPE", "wayland",
+        # The sandbox runs as the veracage uid, whose passwd shell is nologin.
+        # Terminals (Konsole) launch the login shell and exit immediately with
+        # it, so hand them a real shell explicitly.
+        "--setenv", "SHELL", "/bin/bash",
         "--chdir", "/vaults",
     ]
     # Preserve locale (an explicit allowlist, not blanket inheritance) so dates,
@@ -117,9 +121,9 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
         argv += ["--dev-bind-try", "/dev/dri", "/dev/dri"]
     if exchange is not None:
         # The idmapped host<->vault shared folder (helper mounted it in this NS,
-        # presented as veracage-owned). Bind it at /exchange — a top-level path,
+        # presented as veracage-owned). Bind it at /exchange - a top-level path,
         # NOT under /vaults, so the "everything in HOME is encrypted" invariant
         # holds. The underlying mount already carries nosuid,nodev,noexec.
         argv += ["--bind", exchange, "/exchange"]
-    argv += ["--", app.exec, *app.args]
+    argv += ["--", app.exec]
     return argv

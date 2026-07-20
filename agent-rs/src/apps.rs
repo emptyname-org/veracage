@@ -8,18 +8,26 @@ pub struct App {
     pub key: String,
     pub name: String,
     pub exec: String,
-    pub args: Vec<String>,
 }
 
 /// True if `binary` is runnable: a bare name found on `$PATH`, or a path that
 /// points at an existing executable.
 pub fn is_installed(binary: &str) -> bool {
+    path_of(binary).is_some()
+}
+
+/// The full path of an installed binary: a bare name resolved on `$PATH`, or a
+/// given path checked for an executable. None when not installed.
+pub fn path_of(binary: &str) -> Option<std::path::PathBuf> {
     if binary.contains('/') {
-        return is_executable(Path::new(binary));
+        let p = std::path::PathBuf::from(binary);
+        return is_executable(&p).then_some(p);
     }
-    std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).any(|dir| is_executable(&dir.join(binary))))
-        .unwrap_or(false)
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(binary))
+            .find(|p| is_executable(p))
+    })
 }
 
 fn is_executable(p: &Path) -> bool {

@@ -1,6 +1,6 @@
 """Config file at ~/.config/veracage/config.toml.
 
-Schema (slice 1.5):
+Schema:
 
     [default]
     last_used_app = "kate"
@@ -8,14 +8,18 @@ Schema (slice 1.5):
     [apps.kate]
     name     = "Kate"
     exec     = "kate"
-    args     = ["/vaults"]
 
-The `apps.*` table is the user's enabled list — any installed binary they added.
+The `apps.*` table is the user's enabled list - any installed binary they added.
 Anything not in the config is not shown as a toolbar launcher by `veracage open`.
+A legacy `args` key (the old "open at /vaults" launch argument) is ignored on
+load and dropped on save: apps always launch bare.
 """
 from __future__ import annotations
 
+import contextlib
+import math
 import os
+import struct
 import sys
 import tomllib
 from dataclasses import dataclass, field
@@ -27,6 +31,12 @@ from .apps import App
 def config_path() -> Path:
     base = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
     return base / "veracage" / "config.toml"
+
+
+def _capitalize_first(s: str) -> str:
+    """Capitalize the first character so a bare basename name like 'kate' shows
+    as 'Kate'. Leaves the rest of the string as-is."""
+    return s[:1].upper() + s[1:] if s else s
 
 
 _VALID_BACKENDS = ("auto", "luks", "veracrypt")
@@ -47,6 +57,217 @@ def _norm_vault(p: str) -> str:
     return str(Path(p).expanduser().resolve())
 
 
+_VALID_FONTS = ("system", "noto", "liberation", "dejavu", "dejavu-mono")
+
+# fontconfig family for each ui_font key ("system" -> the host desktop font).
+_FONT_FAMILIES = {
+    "noto": "Noto Sans",
+    "liberation": "Liberation Sans",
+    "dejavu": "DejaVu Sans",
+    "dejavu-mono": "DejaVu Sans Mono",
+}
+
+# Base POINT size when the host size can't be read (matches agent fonts.rs).
+FALLBACK_FONT_PT = 10.0
+
+
+def _font_dpi() -> float:
+    """The font DPI Qt/KDE renders points at. KDE's forceFontDPI override if set,
+    else the CSS/logical 96 (physical HiDPI scaling is handled separately by the
+    compositor's pixels_per_point, so this stays the logical DPI)."""
+    for tool in ("kreadconfig6", "kreadconfig5"):
+        v = _run(tool, ["--group", "General", "--key", "forceFontDPI"])
+        if v:
+            try:
+                dpi = float(v)
+            except ValueError:
+                dpi = 0.0
+            if dpi > 0:
+                return dpi
+    return 96.0
+
+
+def _pt_to_px(pt: float) -> float:
+    """Convert a typographic point size to logical pixels (egui's unit)."""
+    return round(pt * _font_dpi() / 72.0)
+
+
+def _valid_font_size(s: str) -> bool:
+    """'system' or an integer point size in a sane range."""
+    if s == "system":
+        return True
+    try:
+        return 6 <= int(s) <= 48
+    except (TypeError, ValueError):
+        return False
+
+
+def _run(bin_: str, args: list[str]) -> str | None:
+    """Run a command, return trimmed stdout, or None on any failure."""
+    import subprocess
+    try:
+        r = subprocess.run([bin_, *args], capture_output=True, text=True)
+    except OSError:
+        return None
+    if r.returncode != 0:
+        return None
+    out = r.stdout.strip()
+    return out or None
+
+
+def host_ui_font() -> tuple[str | None, float | None]:
+    """The host desktop's UI font family + point size, if detectable: KDE
+    (kreadconfig), then GNOME (gsettings), then fontconfig's sans-serif."""
+    for tool in ("kreadconfig6", "kreadconfig5"):
+        v = _run(tool, ["--group", "General", "--key", "font"])
+        if v:
+            fam, _, rest = v.partition(",")
+            fam = fam.strip()
+            if fam:
+                size = None
+                sz = rest.split(",")[0].strip() if rest else ""
+                try:
+                    size = float(sz) if sz else None
+                except ValueError:
+                    size = None
+                return fam, size
+    v = _run("gsettings", ["get", "org.gnome.desktop.interface", "font-name"])
+    if v:
+        v = v.strip().strip("'\"")
+        if "," in v:
+            fam, _, sz = v.partition(",")
+            try:
+                return fam.strip(), float(sz.strip())
+            except ValueError:
+                return fam.strip() or None, None
+        fam, _, sz = v.rpartition(" ")
+        try:
+            return (fam.strip() or v), float(sz)
+        except ValueError:
+            return (v or None), None
+    v = _run("fc-match", ["--format=%{family}", "sans-serif"])
+    if v:
+        return v.split(",")[0].strip() or None, None
+    return None, None
+
+
+def font_file(ui_font: str) -> str:
+    """Resolve the configured font key to a system font FILE path via fontconfig.
+    Empty string for the host font that can't be pinned or a family that isn't
+    installed - the UI then keeps its built-in face."""
+    family = host_ui_font()[0] if ui_font == "system" else _FONT_FAMILIES.get(ui_font)
+    if not family:
+        return ""
+    v = _run("fc-match", ["--format=%{family}|%{file}", f"{family}:style=Regular"])
+    if not v or "|" not in v:
+        return ""
+    matched, _, path = v.partition("|")
+    if family.lower() not in matched.lower():   # substituted -> not installed
+        return ""
+    return path.strip()
+
+
+def _hinted_ascent_factor(path: str, px: float) -> float:
+    """Qt/FreeType hint the font's ascender UP to the pixel grid; egui does not
+    hint at all, so at the same nominal size its text renders one pixel shorter
+    than every Qt app. Derive Qt's rounding from the font's own head/hhea
+    tables: scale so the unhinted ascender lands on the hinted integer. 1.0
+    when the tables can't be read."""
+    try:
+        data = Path(path).read_bytes()
+        base = struct.unpack(">I", data[12:16])[0] if data[:4] == b"ttcf" else 0
+        num = struct.unpack(">H", data[base + 4:base + 6])[0]
+        head = hhea = None
+        for i in range(min(num, 64)):
+            e = base + 12 + 16 * i
+            tag = data[e:e + 4]
+            off = struct.unpack(">I", data[e + 8:e + 12])[0]
+            if tag == b"head":
+                head = off
+            elif tag == b"hhea":
+                hhea = off
+        if head is None or hhea is None:
+            return 1.0
+        upem = struct.unpack(">H", data[head + 18:head + 20])[0]
+        ascender = struct.unpack(">h", data[hhea + 4:hhea + 6])[0]
+        if upem <= 0 or ascender <= 0:
+            return 1.0
+        ascent_px = px * ascender / upem
+        return min(max(math.ceil(ascent_px) / ascent_px, 1.0), 1.25)
+    except (OSError, struct.error, IndexError, ZeroDivisionError):
+        return 1.0
+
+
+def base_font_size(ui_font_size: str, ui_font: str = "system") -> float:
+    """The base body size for egui, in LOGICAL PIXELS. The configured/host size is
+    in typographic points ('system' -> the host point size, else the number);
+    this converts points -> pixels via the font DPI so Veracage matches the
+    desktop (a 12pt/96dpi UI renders at 16px, not 12), then applies the hinting
+    correction of the resolved font so the optical height matches Qt's."""
+    if ui_font_size == "system":
+        pt = host_ui_font()[1]
+        pt = pt if pt is not None else FALLBACK_FONT_PT
+    else:
+        try:
+            pt = float(ui_font_size)
+        except (TypeError, ValueError):
+            pt = FALLBACK_FONT_PT
+    px = min(max(_pt_to_px(pt), 6.0), 72.0)
+    path = font_file(ui_font)
+    if path:
+        px = min(px * _hinted_ascent_factor(path, px), 72.0)
+    return px
+
+
+def _window_size_valid(s: str) -> bool:
+    """Accept 'default', 'max', or '<w>x<h>' within sane bounds."""
+    if s in ("default", "max"):
+        return True
+    parts = s.split("x")
+    if len(parts) != 2:
+        return False
+    try:
+        w, h = int(parts[0]), int(parts[1])
+    except ValueError:
+        return False
+    return 320 <= w <= 16384 and 240 <= h <= 16384
+
+
+# User-configurable Veracage keyboard shortcuts (the compositor-level clipboard
+# transfers; the apps' own Cut/Copy/Paste are not Veracage bindings).
+_DEFAULT_SHORTCUTS = {"copy_out": "Ctrl+Alt+C", "paste_in": "Ctrl+Alt+V"}
+_SHORTCUT_ACTIONS = ("copy_out", "paste_in")
+
+
+def _default_shortcuts() -> dict[str, str]:
+    return dict(_DEFAULT_SHORTCUTS)
+
+
+def _valid_keybind(s: str) -> bool:
+    """A '+'-joined combo whose final part is a non-empty key token."""
+    if not isinstance(s, str) or not s:
+        return False
+    parts = [p for p in s.split("+") if p]
+    return len(parts) >= 1 and bool(parts[-1])
+
+
+# Host-clipboard auto-clear (KeePassXC-style): default on, 30s, clamped in range.
+DEFAULT_CLIP_CLEAR_TIMEOUT = 30
+_CLIP_CLEAR_TIMEOUT_MIN = 1
+_CLIP_CLEAR_TIMEOUT_MAX = 3600
+
+
+def _coerce_clip_timeout(val: object) -> int:
+    """Clamp the auto-clear timeout (seconds) into range. A non-int (bool counts
+    as non-int here) or out-of-range value falls back to / is clamped to a sane
+    value, so a crafted config can't wedge the timer (0 = clear instantly)."""
+    if isinstance(val, bool) or not isinstance(val, int):
+        print(f"veracage: invalid clip_clear_timeout {val!r}, using "
+              f"{DEFAULT_CLIP_CLEAR_TIMEOUT}", file=sys.stderr)
+        return DEFAULT_CLIP_CLEAR_TIMEOUT
+    return max(_CLIP_CLEAR_TIMEOUT_MIN, min(val, _CLIP_CLEAR_TIMEOUT_MAX))
+
+
 @dataclass
 class Config:
     apps: dict[str, App]
@@ -54,8 +275,14 @@ class Config:
     gpu: bool = False                     # /dev/dri passthrough default (off)
     suspend_action: str = "dismount"      # "dismount" | "ignore"
     theme: str = "light"                  # compositor/agent egui theme: light|dark|system
-    exchange: bool = True                 # host<->vault shared folder
+    ui_font: str = "system"               # UI font key (see _VALID_FONTS); system = host
+    ui_font_size: str = "system"          # "system" (host size) | a point size
+    window_size: str = "default"          # compositor default window size
+    exchange: bool = True                 # host<->volume shared folder
     exchange_dir: str | None = None       # default ~/Veracage/Exchange when unset
+    clip_clear: bool = True               # auto-clear host clipboard after Copy out
+    clip_clear_timeout: int = DEFAULT_CLIP_CLEAR_TIMEOUT   # seconds before it fires
+    shortcuts: dict[str, str] = field(default_factory=_default_shortcuts)
     volumes: dict[str, VolumeConfig] = field(default_factory=dict)
 
     def exchange_path(self) -> Path:
@@ -96,44 +323,37 @@ def load() -> Config:
         with open(p, "rb") as f:
             raw = tomllib.load(f)
     except (tomllib.TOMLDecodeError, OSError) as e:
-        print(f"veracage: cannot read {p}: {e}; using empty config",
+        print(f"veracage: cannot read {p}: {e}, using empty config",
               file=sys.stderr)
         return Config(apps={})
     if not isinstance(raw, dict):
         return Config(apps={})
 
     apps: dict[str, App] = {}
+    seen_basenames: set[str] = set()
     apps_raw = raw.get("apps")
     if isinstance(apps_raw, dict):
         for key, entry in apps_raw.items():
             if not isinstance(entry, dict):
-                print(f"veracage: [apps.{key}] is not a table; skipping",
+                print(f"veracage: [apps.{key}] is not a table, skipping",
                       file=sys.stderr)
                 continue
             try:
-                # Migrate pre-shared-workspace configs: the sandbox binds the
-                # /vaults tree now, so an app pointed at the old single /vault
-                # would open a non-existent path. Retarget /vault[/…] -> /vaults.
-                # Only STRING elements migrate — a non-str arg (a crafted config
-                # can hold one; TOML allows mixed arrays) is passed through
-                # untouched rather than crashing load() on `.startswith` (that
-                # AttributeError isn't caught below, and load() promises to
-                # degrade, not crash, on a malformed file).
-                raw_args = list(entry.get("args", []))
-                args = [
-                    ("/vaults" + a[len("/vault"):])
-                    if isinstance(a, str) and (a == "/vault" or a.startswith("/vault/"))
-                    else a
-                    for a in raw_args
-                ]
+                # A legacy `args` key is ignored (apps launch bare). Dedupe by
+                # exec basename, first entry wins: older configs could hold the
+                # same app twice (e.g. `dolphin` and `/usr/bin/dolphin`).
+                exec_ = entry["exec"]
+                base = os.path.basename(str(exec_))
+                if base in seen_basenames:
+                    continue
+                seen_basenames.add(base)
                 apps[key] = App(
                     key=key,
-                    name=entry["name"],
-                    exec=entry["exec"],
-                    args=args,
+                    name=_capitalize_first(str(entry["name"])),
+                    exec=exec_,
                 )
             except (KeyError, TypeError) as e:
-                print(f"veracage: config entry [apps.{key}] invalid ({e}); skipping",
+                print(f"veracage: config entry [apps.{key}] invalid ({e}), skipping",
                       file=sys.stderr)
 
     default = raw.get("default")
@@ -145,14 +365,31 @@ def load() -> Config:
     gpu = _coerce_bool(default.get("gpu", False), "default.gpu")
     exchange = _coerce_bool(default.get("exchange", True), "default.exchange")
     exchange_dir = default.get("exchange_dir") or None
+    clip_clear = _coerce_bool(default.get("clip_clear", True), "default.clip_clear")
+    clip_clear_timeout = _coerce_clip_timeout(
+        default.get("clip_clear_timeout", DEFAULT_CLIP_CLEAR_TIMEOUT))
     theme = default.get("theme", "light")
     if theme not in ("light", "dark", "system"):
-        print(f"veracage: invalid theme {theme!r}; using 'light'", file=sys.stderr)
+        print(f"veracage: invalid theme {theme!r}, using 'light'", file=sys.stderr)
         theme = "light"
+    ui_font = default.get("ui_font", "system")
+    if ui_font not in _VALID_FONTS:
+        print(f"veracage: invalid ui_font {ui_font!r}, using 'system'", file=sys.stderr)
+        ui_font = "system"
+    ui_font_size = str(default.get("ui_font_size", "system"))
+    if not _valid_font_size(ui_font_size):
+        print(f"veracage: invalid ui_font_size {ui_font_size!r}, using 'system'",
+              file=sys.stderr)
+        ui_font_size = "system"
+    window_size = default.get("window_size", "default")
+    if not isinstance(window_size, str) or not _window_size_valid(window_size):
+        print(f"veracage: invalid window_size {window_size!r}, using 'default'",
+              file=sys.stderr)
+        window_size = "default"
     suspend_action = default.get("suspend_action", "dismount")
     if suspend_action not in ("dismount", "ignore"):
         print(f"veracage: invalid suspend_action {suspend_action!r} "
-              f"(want 'dismount' or 'ignore'); using 'dismount'", file=sys.stderr)
+              f"(want 'dismount' or 'ignore'), using 'dismount'", file=sys.stderr)
         suspend_action = "dismount"
 
     volumes: dict[str, VolumeConfig] = {}
@@ -168,7 +405,7 @@ def load() -> Config:
             gval = entry.get("gpu")
             bval = entry.get("backend")
             if bval is not None and bval not in _VALID_BACKENDS:
-                print(f'veracage: volumes."{key}".backend {bval!r} invalid; ignoring',
+                print(f'veracage: volumes."{key}".backend {bval!r} invalid, ignoring',
                       file=sys.stderr)
                 bval = None
             volumes[nk] = VolumeConfig(
@@ -177,31 +414,53 @@ def load() -> Config:
                 display_name=entry.get("display_name"),
                 backend=bval,
             )
+    shortcuts = _default_shortcuts()
+    sc_raw = raw.get("shortcuts")
+    if isinstance(sc_raw, dict):
+        for action in _SHORTCUT_ACTIONS:
+            v = sc_raw.get(action)
+            if isinstance(v, str) and _valid_keybind(v):
+                shortcuts[action] = v
+            elif v is not None:
+                print(f"veracage: invalid shortcut [shortcuts].{action} {v!r}; "
+                      f"using {shortcuts[action]!r}", file=sys.stderr)
+
     return Config(apps=apps, last_used_app=last, gpu=gpu,
-                  suspend_action=suspend_action, theme=theme, exchange=exchange,
-                  exchange_dir=exchange_dir, volumes=volumes)
+                  suspend_action=suspend_action, theme=theme, ui_font=ui_font,
+                  ui_font_size=ui_font_size, window_size=window_size,
+                  exchange=exchange, exchange_dir=exchange_dir,
+                  clip_clear=clip_clear, clip_clear_timeout=clip_clear_timeout,
+                  shortcuts=shortcuts, volumes=volumes)
 
 
 def save(cfg: Config) -> Path:
     p = config_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    lines: list[str] = ["# Veracage config — edit carefully, see `veracage configure`",
+    lines: list[str] = ["# Veracage config - edit carefully, see `veracage configure`",
                         "", "[default]"]
     if cfg.last_used_app:
         lines += [f'last_used_app  = "{_esc(cfg.last_used_app)}"']
     lines += [f'theme          = "{_esc(cfg.theme)}"',
+              f'ui_font        = "{_esc(cfg.ui_font)}"',
+              f'ui_font_size   = "{_esc(cfg.ui_font_size)}"',
+              f'window_size    = "{_esc(cfg.window_size)}"',
               f"gpu            = {_toml_bool(cfg.gpu)}",
               f"exchange       = {_toml_bool(cfg.exchange)}",
-              f'suspend_action = "{_esc(cfg.suspend_action)}"']
+              f'suspend_action = "{_esc(cfg.suspend_action)}"',
+              f"clip_clear     = {_toml_bool(cfg.clip_clear)}",
+              f"clip_clear_timeout = {int(cfg.clip_clear_timeout)}"]
     if cfg.exchange_dir:
         lines += [f'exchange_dir   = "{_esc(cfg.exchange_dir)}"']
     lines += [
               ""]
+    lines += ["[shortcuts]"]
+    for action in _SHORTCUT_ACTIONS:
+        lines += [f'{action:<9} = "{_esc(cfg.shortcuts.get(action, _DEFAULT_SHORTCUTS[action]))}"']
+    lines += [""]
     for key, a in cfg.apps.items():
         lines += [f"[apps.{key}]",
                   f'name     = "{_esc(a.name)}"',
                   f'exec     = "{_esc(a.exec)}"',
-                  f"args     = {_toml_list(a.args)}",
                   ""]
     for key, vc in cfg.volumes.items():
         lines += [f'[volumes."{_esc(key)}"]']
@@ -226,6 +485,59 @@ def save(cfg: Config) -> Path:
     return p
 
 
+# --------------------------------------------------- compositor publish ----
+
+# The human-published dir the compositor's Apps menu reads (created by the
+# helper at compositor spawn, owned by the human uid). Must match PUB_DIR in
+# toolbar.rs / broker.rs. Overridable via VERACAGE_PUB_DIR (read at call time, so
+# tests redirect it away from a running session's real dir).
+_PUB_DIR_DEFAULT = "/run/veracage/pub"
+
+
+def _pub_dir() -> Path:
+    return Path(os.environ.get("VERACAGE_PUB_DIR") or _PUB_DIR_DEFAULT)
+
+
+def publish_apps(cfg: Config) -> None:
+    """Publish the enabled app list to `pub/config.apps` (`<key>\\t<name>` per
+    line) so the compositor's Apps menu has content before any volume is
+    mounted. Best-effort: the dir exists only once the compositor has been
+    spawned, and the menu degrades gracefully without the file. The broker
+    (veracage-agent) writes the same file and adds menu icons."""
+    pub = _pub_dir()
+    if not pub.is_dir():
+        return
+    sc = cfg.shortcuts
+    apps = "".join(
+        f"{a.key}\t{a.name}\n" for a in cfg.apps.values()
+        if a.key and len(a.key) <= 64 and "/" not in a.key and a.key != ".."
+    )
+    # Each file the compositor reads on its scan: the app list, the default
+    # window size (it resizes live), the UI font (path + base size), and the
+    # keyboard shortcuts. All published atomically (temp + replace).
+    _publish_atomic(pub, "config.apps", apps)
+    _publish_atomic(pub, "window.size", cfg.window_size + "\n")
+    _publish_atomic(pub, "font",
+                    f"{font_file(cfg.ui_font)}\n{base_font_size(cfg.ui_font_size, cfg.ui_font)}\n")
+    _publish_atomic(pub, "shortcuts",
+                    "".join(f"{a}\t{sc.get(a, _DEFAULT_SHORTCUTS[a])}\n" for a in _SHORTCUT_ACTIONS))
+    _publish_atomic(pub, "clipclear",
+                    f"{1 if cfg.clip_clear else 0}\n{cfg.clip_clear_timeout}\n")
+
+
+def _publish_atomic(pub: Path, name: str, body: str) -> None:
+    """Write `body` to `pub/<name>` atomically (pid-tagged temp + replace).
+    Best-effort but NOT silent: a failure is logged, and the temp is removed."""
+    tmp = pub / f"{name}.{os.getpid()}.tmp"
+    try:
+        tmp.write_text(body)
+        tmp.replace(pub / name)
+    except OSError as e:
+        print(f"veracage: could not publish {name}: {e}", file=sys.stderr)
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
 _ESC_MAP = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\t": "\\t",
             "\r": "\\r", "\f": "\\f", "\b": "\\b"}
 
@@ -245,20 +557,16 @@ def _esc(s: str) -> str:
     return "".join(out)
 
 
-def _toml_list(xs: list[str]) -> str:
-    return "[" + ", ".join(f'"{_esc(x)}"' for x in xs) + "]"
-
-
 def _toml_bool(b: bool) -> str:
     return "true" if b else "false"
 
 
 def _coerce_bool(val: object, where: str) -> bool:
     """Strict bool: only a real TOML bool counts. Anything else (e.g. the
-    string "false", which is truthy) warns and is treated as False — so a
+    string "false", which is truthy) warns and is treated as False - so a
     bad gpu value fails *closed*, not open."""
     if isinstance(val, bool):
         return val
-    print(f"veracage: {where} should be true/false, got {val!r}; using false",
+    print(f"veracage: {where} should be true/false, got {val!r}, using false",
           file=sys.stderr)
     return False

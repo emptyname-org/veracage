@@ -1,4 +1,4 @@
-"""CLI argv plumbing — pkexec command shape, env-forwarding, validation."""
+"""CLI argv plumbing: pkexec command shape, env-forwarding, validation."""
 from __future__ import annotations
 
 import argparse
@@ -26,6 +26,10 @@ def _no_active_session(monkeypatch):
     # real systemd-run/pkexec from the argv tests. (A dedicated test asserts the
     # bring-up happens.)
     monkeypatch.setattr("veracage.cli.ensure_compositor_up", lambda: 0)
+    # publish_apps resolves fonts via fc-match/kreadconfig and writes the live
+    # /run/veracage/pub dir; neutralise it so the argv tests neither shell out
+    # (subprocess.run is mocked here) nor mutate a running session's state.
+    monkeypatch.setattr("veracage.cli.config.publish_apps", lambda _c: None)
 
 
 @pytest.fixture
@@ -38,7 +42,7 @@ def fake_vault(tmp_path):
 @pytest.fixture
 def configured(tmp_xdg_config):
     cfg = config.Config(
-        apps={"kate": apps.App("kate", "Kate", "kate", ["/vault"]),
+        apps={"kate": apps.App("kate", "Kate", "kate"),
               "okular": apps.App("okular", "Okular", "okular")},
         last_used_app="kate",
     )
@@ -49,7 +53,7 @@ def configured(tmp_xdg_config):
 def _run_open(monkeypatch, vault, app=None):
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
     monkeypatch.setenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-    ns = argparse.Namespace(vault=str(vault), app=app, passphrase_stdin=False)
+    ns = argparse.Namespace(volume=str(vault), app=app, passphrase_stdin=False)
     with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
         run.return_value.returncode = 0
         popen.return_value.poll.return_value = 0  # agent "exited" -> skip teardown
@@ -77,10 +81,10 @@ def test_open_wraps_in_systemd_transient_service(monkeypatch, configured, fake_v
 
 def test_open_passphrase_stdin_uses_pipe(monkeypatch, configured, fake_vault):
     """The GUI path (--passphrase-stdin) uses systemd-run --pipe, not --pty, so
-    the piped passphrase reaches the helper — and forwards --passphrase-stdin."""
+    the piped passphrase reaches the helper, and forwards --passphrase-stdin."""
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
     monkeypatch.setenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-    ns = argparse.Namespace(vault=str(fake_vault), app=None, passphrase_stdin=True)
+    ns = argparse.Namespace(volume=str(fake_vault), app=None, passphrase_stdin=True)
     with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen"):
         run.return_value.returncode = 0
         cli.cmd_open(ns)
@@ -140,14 +144,14 @@ def test_open_forwards_xdg_runtime_dir(monkeypatch, configured, fake_vault):
 
 def test_open_omits_compositor_flag(monkeypatch, configured, fake_vault):
     """Phase 2: the leader no longer spawns a compositor, so cmd_open threads no
-    --compositor to it — it attaches to the shared /run/veracage socket."""
+    --compositor to it. It attaches to the shared /run/veracage socket."""
     _, argv = _run_open(monkeypatch, fake_vault, "kate")
     sep = argv.index("--")
     assert "--compositor" not in argv[sep + 1:]
 
 
 def test_open_without_app_launches_nothing(monkeypatch, configured, fake_vault):
-    """`veracage open <vault>` (no app) auto-launches nothing — it publishes all
+    """`veracage open <vault>` (no app) auto-launches nothing: it publishes all
     enabled apps to the toolbar via --apps and passes no --first."""
     _, argv = _run_open(monkeypatch, fake_vault, app=None)
     sep = argv.index("--")
@@ -189,14 +193,14 @@ def test_open_rejects_missing_vault(monkeypatch, configured, tmp_path, capsys):
 
 def test_open_mounts_even_with_no_apps_configured(monkeypatch, tmp_xdg_config, fake_vault):
     """Shared-workspace model: apps and volumes are independent, so an empty app
-    config no longer blocks a mount — the vault opens with nothing launched
+    config no longer blocks a mount. The vault opens with nothing launched
     (--apps [], no --first), and the user enables/launches apps afterwards."""
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
     monkeypatch.setenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen"):
         run.return_value.returncode = 0
         cli.cmd_open(argparse.Namespace(
-            vault=str(fake_vault), app=None, passphrase_stdin=False))
+            volume=str(fake_vault), app=None, passphrase_stdin=False))
     argv = run.call_args.args[0]
     assert "pkexec" in argv                      # a mount WAS attempted
     after = argv[argv.index("--") + 1:]
@@ -238,14 +242,14 @@ def test_open_refuses_when_bootstrap_volume_still_mounted(
     rc, argv = _run_open(monkeypatch, fake_vault, "kate")
     assert rc == 2
     assert argv is None                      # helper never invoked
-    assert "already open" in capsys.readouterr().err
+    assert "already mounted" in capsys.readouterr().err
 
 
 def test_open_proceeds_after_per_volume_close_of_bootstrap(
         monkeypatch, configured, fake_vault):
     """Regression: the leader keeps serving the bootstrap vault's socket for the
     whole session, so a bare ok:true reply used to make the vault unopenable
-    after its volume was closed via Close volume — until the session ended."""
+    after its volume was closed via Close volume, until the session ended."""
     monkeypatch.setattr(
         "veracage.cli.leader.send_request",
         mock.Mock(return_value={"ok": True, "bootstrap_open": False,
@@ -267,14 +271,54 @@ def test_open_still_refuses_on_legacy_reply_without_bootstrap_open(
 def test_open_into_live_session_tells_user_about_the_app(
         monkeypatch, configured, fake_vault, capsys):
     """Regression: the helper's add-volume path drops the leader argv, so
-    `veracage open B kate` on a live session mounts B but never launches kate —
-    the CLI must say so instead of exiting 0 silently."""
+    `veracage open B kate` on a live session mounts B but never launches kate.
+    The CLI must say so instead of exiting 0 silently."""
     monkeypatch.setattr("veracage.cli._any_live_session", lambda: True)
     rc, _ = _run_open(monkeypatch, fake_vault, "kate")
     assert rc == 0
     err = capsys.readouterr().err
     assert "added to the running workspace" in err
     assert "no app was auto-launched" in err
+
+
+# ------------------------------------------ empty session (front-door B) ---
+
+def test_empty_session_bootstraps_when_none_live(monkeypatch, configured):
+    """The front door stands up a session leader with --empty-session (no
+    --source, no passphrase) so apps are launchable before any mount."""
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    monkeypatch.setattr("veracage.cli._any_live_session", lambda: False)
+    with mock.patch("subprocess.run") as run:
+        run.return_value.returncode = 0
+        cli.ensure_empty_session()
+    argv = run.call_args.args[0]
+    assert "pkexec" in argv
+    assert "--empty-session" in argv
+    assert "--source" not in argv                     # no volume
+    assert "--passphrase-stdin" not in argv
+    after = argv[argv.index("--") + 1:]
+    assert "--first" not in after                      # nothing auto-launched
+    assert json.loads(dict(zip(after, after[1:]))["--apps"])  # app list forwarded
+    assert any(p.startswith("ExecStopPost=") for p in argv)   # crash-safe teardown
+
+
+def test_empty_session_skipped_when_one_is_live(monkeypatch, configured):
+    monkeypatch.setattr("veracage.cli._any_live_session", lambda: True)
+    with mock.patch("subprocess.run") as run:
+        cli.ensure_empty_session()
+    assert not run.called                              # idempotent no-op
+
+
+def test_up_brings_compositor_then_empty_session(monkeypatch):
+    order = []
+    monkeypatch.setattr("veracage.cli.ensure_compositor_up",
+                        lambda: order.append("compositor") or 0)
+    monkeypatch.setattr("veracage.cli.config.publish_apps", lambda _c: None)
+    monkeypatch.setattr("veracage.cli.ensure_empty_session",
+                        lambda: order.append("session"))
+    assert cli.cmd_up(argparse.Namespace()) == 0
+    assert order == ["compositor", "session"]          # compositor first
 
 
 def test_list_and_close_survive_a_stale_socket(monkeypatch, tmp_path, capsys):
@@ -286,7 +330,7 @@ def test_list_and_close_survive_a_stale_socket(monkeypatch, tmp_path, capsys):
                         mock.Mock(side_effect=ConnectionRefusedError))
     monkeypatch.setattr("veracage.cli.leader.session_socket_path",
                         lambda _v: stale)
-    ns = argparse.Namespace(vault=str(tmp_path / "x.vc"))
+    ns = argparse.Namespace(volume=str(tmp_path / "x.vc"))
     assert cli.cmd_list(ns) == 2
     assert not stale.exists()               # stale socket removed
     stale.write_text("")

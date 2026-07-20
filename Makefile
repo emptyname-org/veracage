@@ -1,4 +1,4 @@
-.PHONY: help build build-agent build-compositor install install-dev uninstall uninstall-dev test test-rs test-rs-root lint clean test-vault smoke veracage-user
+.PHONY: help build build-agent test-agent build-compositor test-compositor install install-dev uninstall uninstall-dev test test-rs test-rs-root lint clean test-vault smoke veracage-user
 
 PREFIX     ?= /usr/local
 BINDIR     ?= $(PREFIX)/bin
@@ -8,14 +8,17 @@ POLKIT_DIR ?= /usr/share/polkit-1/actions
 APPDIR     ?= $(PREFIX)/share/applications
 ICONDIR    ?= $(PREFIX)/share/icons/hicolor/256x256/apps
 PIXMAPDIR  ?= $(PREFIX)/share/pixmaps
-ICON_SRC   := Icons/veracage_icon_turquoise_transparent_corners.png
+# The installed hicolor/pixmap icon: a plain 256px scale of the master
+# (`convert <master> -resize 256x256 Icons/veracage_256.png`). Regenerate after
+# replacing the master art.
+ICON_SRC   := Icons/veracage_256.png
 UDEVDIR    ?= /usr/lib/udev/rules.d
 SLEEPDIR   ?= /usr/lib/systemd/system-sleep
 
 # Real install writes under $(PREFIX) / $(POLKIT_DIR) (root-owned), so the
 # file-install steps need root. A staged DESTDIR build (packaging) installs
 # into a user-writable tree, so no sudo. The `build` prerequisite always runs
-# as the invoking user (cached cargo index) — only these steps are privileged.
+# as the invoking user (cached cargo index) - only these steps are privileged.
 SUDO := $(if $(DESTDIR),,sudo)
 
 DEV_ROOT   := $(CURDIR)
@@ -43,7 +46,7 @@ help:
 	@echo '  test-rs       Run the Rust helper unit tests (cargo test)'
 	@echo '  lint          ruff + mypy (needs the .venv dev deps)'
 	@echo '  uninstall / uninstall-dev / clean'
-	@echo '  test-vault    Create a throwaway VeraCrypt vault for manual testing'
+	@echo '  test-vault    Create a throwaway VeraCrypt volume for manual testing'
 
 # --- build ---------------------------------------------------------------
 # CONT = the continuation path baked into the helper (the installed CLI).
@@ -54,15 +57,19 @@ build:
 
 # --- agent (GUI + CLI) ---------------------------------------------------
 # The human-side agent: egui control window + scriptable CLI, no vault access.
-# Static binary — the end user installs nothing extra to run it (no Qt).
+# Static binary - the end user installs nothing extra to run it (no Qt).
 build-agent:
 	$(AGENT_CARGO) build --release --manifest-path agent-rs/Cargo.toml
+
+# Agent unit tests (pure logic: config parse/clamp, font metrics). No GUI needed.
+test-agent:
+	$(AGENT_CARGO) test --release --manifest-path agent-rs/Cargo.toml
 
 # --- nested compositor ---------------------------------------------------
 # Our own minimal smithay compositor: renders the sandbox apps and owns the
 # private host<->sandbox clipboard channel. Needs a modern toolchain (rustup)
 # like the agent. It links libxkbcommon, whose linker symlink `libxkbcommon.so`
-# normally comes from libxkbcommon-dev — but every desktop already ships the
+# normally comes from libxkbcommon-dev - but every desktop already ships the
 # runtime `libxkbcommon.so.0`, so if the -dev symlink is absent we synthesize a
 # private one under target/ and point the linker at it. No -dev package needed;
 # the runtime binary links the standard soname either way.
@@ -78,6 +85,18 @@ build-compositor:
 	    $(AGENT_CARGO) build --release --manifest-path compositor-rs/Cargo.toml; \
 	else \
 	  $(AGENT_CARGO) build --release --manifest-path compositor-rs/Cargo.toml; \
+	fi
+
+# Compositor unit tests (pure logic: shortcuts, mono_icons, hint layout). Uses
+# the same libxkbcommon linker fallback as build-compositor.
+test-compositor:
+	@if [ -z "$(XKB_DEV)" ] && [ -n "$(XKB_RT)" ]; then \
+	  mkdir -p compositor-rs/target/xkblink; \
+	  ln -sf "$(XKB_RT)" compositor-rs/target/xkblink/libxkbcommon.so; \
+	  RUSTFLAGS="-L $(CURDIR)/compositor-rs/target/xkblink $$RUSTFLAGS" \
+	    $(AGENT_CARGO) test --release --manifest-path compositor-rs/Cargo.toml; \
+	else \
+	  $(AGENT_CARGO) test --release --manifest-path compositor-rs/Cargo.toml; \
 	fi
 
 # --- vault user ----------------------------------------------------------
@@ -155,7 +174,7 @@ install-dev: veracage-user build
 	@echo '*** SECURITY: dev install points polkit at a helper in this USER-WRITABLE'
 	@echo '*** checkout and runs it as ROOT. Any process running as you can overwrite'
 	@echo '*** it and gain root on the next `veracage open`. Use ONLY on a single-user'
-	@echo '*** or disposable box — NEVER on a shared/multi-user machine. Use `make'
+	@echo '*** or disposable box - NEVER on a shared/multi-user machine. Use `make'
 	@echo '*** install` (root-owned /usr/local) for anything real.'
 
 uninstall:
@@ -177,7 +196,7 @@ test-rs:
 	$(CARGO) test --manifest-path helper-rs/Cargo.toml
 
 # Root-only Rust tests (idmap mount). Build AS THE USER (cached crate index),
-# then run the test binary under sudo directly — never `sudo cargo`, which uses
+# then run the test binary under sudo directly - never `sudo cargo`, which uses
 # root's empty CARGO_HOME and re-fetches the ~900 MB index.
 test-rs-root:
 	$(CARGO) test --manifest-path helper-rs/Cargo.toml --no-run

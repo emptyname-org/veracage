@@ -2,7 +2,7 @@
 
 The helper runs as root via pkexec and is reachable by any active local
 user (polkit auth_self_keep). It must derive the target uid/gid from
-PKEXEC_UID — never from caller-supplied argv — and pin the continuation
+PKEXEC_UID, never from caller-supplied argv, and pin the continuation
 to its own install tree. Otherwise a direct
 
     pkexec veracage-helper --user 0 --continuation /bin/sh ...

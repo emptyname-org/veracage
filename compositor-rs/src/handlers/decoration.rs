@@ -1,6 +1,6 @@
 //! Decoration policy. We render no server-side decorations, so we advertise both
-//! decoration managers — the xdg one and the older `org_kde_kwin_server_decoration`
-//! that Qt5/KDE still probe — and force **client-side** in every case. The app
+//! decoration managers (the xdg one and the older `org_kde_kwin_server_decoration`
+//! that Qt5/KDE still probe) and force **client-side** in every case. The app
 //! then draws its own titlebar (Breeze CSD), which our interactive move/resize
 //! grabs rely on (there is no server titlebar for the user to drag otherwise).
 
@@ -23,7 +23,7 @@ impl XdgDecorationHandler for State {
     }
 
     fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: XdgMode) {
-        // Ignore what the client asked for — we can't draw SSD, so always CSD.
+        // Ignore what the client asked for, we can't draw SSD, so always CSD.
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(XdgMode::ClientSide);
         });

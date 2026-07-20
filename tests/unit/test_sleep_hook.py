@@ -1,4 +1,4 @@
-"""system-sleep hook logic — phase gating, ignore-honoring, teardown flow."""
+"""system-sleep hook logic: phase gating, ignore-honoring, teardown flow."""
 from __future__ import annotations
 
 import os
@@ -12,7 +12,7 @@ from veracage import cleanup, sleep_hook
 # ------------------------------------------------------------ phase gating --
 
 @pytest.mark.parametrize("argv", [
-    ["post", "suspend"],     # resume — nothing to do
+    ["post", "suspend"],     # resume: nothing to do
     ["pre", "shutdown"],     # not a sleep state
     ["pre"],                 # missing state
     [],                      # nothing
@@ -209,7 +209,7 @@ def test_find_leader_pid_matches_cmdline(tmp_path):
 
 def test_find_leader_pid_rejects_wrong_uid(tmp_path):
     # A cmdline match owned by the WRONG uid (an attacker's forged-argv decoy)
-    # must be rejected — this is the M3 fix.
+    # must be rejected. This is the M3 fix.
     proc = tmp_path / "proc"
     (proc / "100").mkdir(parents=True)
     (proc / "100" / "cmdline").write_bytes(
@@ -252,7 +252,7 @@ def test_pid_alive():
 # Regression for the redesign's primary path: every `veracage open` writes a
 # session-<sid>.lock (user_uid= + volume=<dm>\t<label> lines, NO dm_name=).
 # Routing it through the legacy parser read dm_name="" and silently skipped the
-# teardown — the machine slept with every dm-crypt key still in RAM.
+# teardown. The machine slept with every dm-crypt key still in RAM.
 
 def _session_lock(tmp_path, volumes=None):
     p = tmp_path / "session-1000.lock"

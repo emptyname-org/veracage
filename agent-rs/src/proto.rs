@@ -1,7 +1,7 @@
 //! Human-side control-socket client. Talks to the running leader over the
 //! per-vault UNIX socket (JSON + newline). The agent has **no vault access**;
 //! the socket exposes only status/lifecycle (ping/list/close). Launching and
-//! any file transfer deliberately do NOT go through this socket — it is
+//! any file transfer deliberately do NOT go through this socket: it is
 //! human-owned, so any same-uid process can reach it (see the pen-test finding).
 
 use std::io::{self, Read, Write};
@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn socket_path_matches_python_sha256_prefix() {
-        // sha256("/tmp/veracage-test.vc")[:16] — the hash the launcher logged
+        // sha256("/tmp/veracage-test.vc")[:16] - the hash the launcher logged
         // as `--vault-hash fff2a519a88710fa` for this vault.
         std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
         let p = socket_path("/tmp/veracage-test.vc").unwrap();

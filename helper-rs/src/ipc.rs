@@ -40,7 +40,7 @@ fn fchown(fd: RawFd, uid: u32, gid: u32) -> io::Result<()> {
 /// Open `dir` (an absolute path), creating any missing component as root, and
 /// return an `O_NOFOLLOW` directory fd for the FINAL component. Each component is
 /// created with `mkdirat` and re-opened with `openat(O_DIRECTORY|O_NOFOLLOW)`
-/// **relative to the previous fd** — never by full path. So a caller who owns an
+/// **relative to the previous fd**, never by full path. So a caller who owns an
 /// ancestor (their own `/run/user/<uid>`) cannot swap a component for a symlink
 /// between check and use to redirect the `fchmod`/`fchown`/`bind` that follow: a
 /// component that already exists as a symlink makes `openat` fail (ELOOP) and we

@@ -61,9 +61,9 @@ pub fn open_args(source: &Path, backend: Backend, dm_name: &str) -> Vec<String> 
 /// With `passphrase = Some(bytes)` the passphrase is fed on cryptsetup's **stdin**
 /// (NOT `--key-file=-`: for VeraCrypt/tcrypt `--key-file` is a *keyfile*, not the
 /// passphrase, so that would break GUI unlock of a VeraCrypt vault). When stdin
-/// isn't a tty cryptsetup reads the passphrase as a line — this works for both
+/// isn't a tty cryptsetup reads the passphrase as a line. This works for both
 /// LUKS and tcrypt and tolerates a trailing newline. With `None`, cryptsetup
-/// prompts interactively on the tty — the terminal CLI path.
+/// prompts interactively on the tty, the terminal CLI path.
 pub fn open(
     source: &Path,
     backend: Backend,

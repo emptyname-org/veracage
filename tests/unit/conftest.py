@@ -1,7 +1,7 @@
 """Shared fixtures for unit tests.
 
 Unit tests must not touch the user's real config, real Wayland, real bwrap,
-or real veracrypt — fixtures here redirect everything to tmp paths.
+or real veracrypt. Fixtures here redirect everything to tmp paths.
 """
 from __future__ import annotations
 
@@ -9,6 +9,13 @@ import tempfile
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_pub_dir(monkeypatch, tmp_path: Path) -> None:
+    """Redirect the compositor publish dir (config.publish_apps) to a tmp path so
+    tests can never overwrite a running session's real /run/veracage/pub."""
+    monkeypatch.setenv("VERACAGE_PUB_DIR", str(tmp_path / "pub-isolated"))
 
 
 @pytest.fixture

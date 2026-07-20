@@ -41,7 +41,7 @@ impl SeatHandler for State {
         let dh = &self.display_handle;
         let client = focused.and_then(|s| dh.get_client(s.id()).ok());
         set_data_device_focus(dh, seat, client.clone());
-        // Primary selection needs its OWN focus call — without it, middle-click
+        // Primary selection needs its OWN focus call: without it, middle-click
         // paste never crosses between windows (the primary offer isn't delivered
         // to the newly focused client).
         set_primary_focus(dh, seat, client);
@@ -55,7 +55,7 @@ impl SeatHandler for State {
 impl SelectionHandler for State {
     type SelectionUserData = ();
 
-    /// An app is pasting the selection the leader set — hand over the bytes.
+    /// An app is pasting the selection the leader set: hand over the bytes.
     /// Write on a thread so a slow reader can't stall the compositor.
     fn send_selection(
         &mut self,
@@ -71,7 +71,7 @@ impl SelectionHandler for State {
         // `clip_source` is an Arc, so this clone is a refcount bump, not a copy of
         // the (up to 16 MiB) buffer. The write runs on a bounded, non-panicking
         // worker: a hostile app looping `receive` can't exhaust threads/fds or
-        // panic the compositor — over the cap `fd` drops here and it sees an empty
+        // panic the compositor. Over the cap `fd` drops here and it sees an empty
         // paste.
         if let Some(text) = self.clip_source.clone() {
             crate::clipboard::spawn_clip_worker(move || {
@@ -94,7 +94,7 @@ impl PrimarySelectionHandler for State {
 }
 
 impl DndGrabHandler for State {
-    // Remove the drag icon once the drag ends (drop or cancel) — otherwise the
+    // Remove the drag icon once the drag ends (drop or cancel), otherwise the
     // ghost would linger under the cursor after the DnD completes.
     fn dropped(
         &mut self,
@@ -146,7 +146,7 @@ impl OutputHandler for State {}
 
 impl FractionalScaleHandler for State {
     fn new_fractional_scale(&mut self, surface: WlSurface) {
-        // Single nested output — hand every surface that output's scale.
+        // Single nested output, hand every surface that output's scale.
         let Some(scale) = self
             .space
             .outputs()

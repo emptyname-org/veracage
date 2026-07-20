@@ -1,4 +1,4 @@
-"""bwrap argv shape — the design's security flags must always be present."""
+"""bwrap argv shape: the design's security flags must always be present."""
 from __future__ import annotations
 
 import os
@@ -9,7 +9,7 @@ import pytest
 from veracage import sandbox
 from veracage.apps import App
 
-_KATE = App("kate", "Kate", "kate", ["/vaults"])
+_KATE = App("kate", "Kate", "kate")
 _OKULAR = App("okular", "Okular", "okular")
 
 
@@ -39,7 +39,7 @@ def test_no_exchange_bind_by_default(argv):
 
 
 REQUIRED_FLAGS = [
-    # namespace flags — required for isolation
+    # namespace flags: required for isolation
     "--unshare-pid",
     "--unshare-uts",
     "--unshare-ipc",
@@ -63,7 +63,6 @@ def test_starts_with_bwrap(argv):
 def test_app_command_appears_after_double_dash(argv):
     sep = argv.index("--")
     assert argv[sep + 1] == "kate"
-    assert "/vaults" in argv[sep + 1:]
 
 
 def test_vault_is_bound_at_slash_vault(argv):
@@ -76,8 +75,8 @@ def test_vault_is_bound_at_slash_vault(argv):
 
 
 def test_runtime_dir_is_tmpfs(argv):
-    """The host's $XDG_RUNTIME_DIR must NOT be bound through wholesale —
-    instead a tmpfs hides it, and only the wayland socket is bound."""
+    """The host's $XDG_RUNTIME_DIR must NOT be bound through wholesale.
+    Instead a tmpfs hides it, and only the wayland socket is bound."""
     uid = os.getuid()
     rt = f"/run/user/{uid}"
     pairs = list(zip(argv, argv[1:]))
@@ -94,7 +93,7 @@ def test_runtime_dir_is_tmpfs(argv):
         i for i, (a, b) in enumerate(pairs)
         if a in {"--bind", "--ro-bind"} and b == rt
     ]
-    assert not forbidden, "host runtime dir is wholesale-bound — clipboard leak risk"
+    assert not forbidden, "host runtime dir is wholesale-bound: clipboard leak risk"
 
 
 def test_only_wayland_socket_bound_into_runtime_dir(argv):
@@ -116,7 +115,7 @@ def test_wayland_display_is_wayland_0(argv):
 
 def test_home_is_vault_xdg_is_ephemeral_off_vault(argv):
     """HOME is the vault so open/save dialogs default to the user's documents,
-    while XDG config/cache/data live on an ephemeral tmpfs OUTSIDE the vault —
+    while XDG config/cache/data live on an ephemeral tmpfs OUTSIDE the vault,
     so nothing app-generated (not even an empty dotdir) is written into it."""
     triples = list(zip(argv, argv[1:], argv[2:]))
     pairs = list(zip(argv, argv[1:]))
@@ -139,9 +138,25 @@ def test_no_share_user_no_share_net_no_network(argv):
     assert "--share-user" not in argv
 
 
-def test_app_args_are_passed(argv):
-    # Kate's catalog entry is ["/vaults"]; the bwrap argv ends with `kate /vaults`.
-    assert argv[-2:] == ["kate", "/vaults"]
+def test_app_launches_bare(argv):
+    # Apps launch with no arguments (the launch-dir args feature was removed);
+    # the sandbox chdir (/vaults) is what places them in the workspace.
+    assert argv[-1] == "kate"
+    assert argv[-2] == "--"
+
+
+def test_bwrap_runs_exec_as_single_argv():
+    """Security invariant (set-apps confused-deputy containment): the app `exec`
+    is passed as ONE argv element after `--`, never split into a command +
+    args and never through a shell. So even if a same-uid `set-apps` swaps the
+    launch list, a swapped entry can only name a bare program (a nonexistent
+    multi-token string just fails to exec). It cannot inject arguments."""
+    sock = Path("/run/user/1000/wayland-0")
+    weird = App(key="x", name="X", exec="kate --evil; rm -rf ~")
+    argv = sandbox.bwrap_command("/run/veracage/abc", weird, sock)
+    sep = argv.index("--")
+    # Everything after `--` is exactly one element: the whole exec string.
+    assert argv[sep + 1:] == ["kate --evil; rm -rf ~"]
 
 
 def test_chdir_to_vault(argv):
@@ -149,7 +164,7 @@ def test_chdir_to_vault(argv):
 
 
 def test_etc_is_not_wholesale_bound(argv):
-    """Security: the whole host /etc must not be exposed — only curated paths."""
+    """Security: the whole host /etc must not be exposed, only curated paths."""
     pairs = list(zip(argv, argv[1:]))
     assert ("--ro-bind", "/etc") not in pairs
     assert ("--bind", "/etc") not in pairs

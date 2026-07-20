@@ -1,17 +1,17 @@
-"""Veracage suspend teardown — the logic behind the systemd system-sleep hook.
+"""Veracage suspend teardown - the logic behind the systemd system-sleep hook.
 
 Installed as `/usr/lib/systemd/system-sleep/veracage` (a thin shim generated
 from `install/veracage-sleep.in`). systemd runs it as root around every sleep
 transition with `argv = [pre|post, suspend|hibernate|hybrid-sleep|
 suspend-then-hibernate]` and **blocks the transition until the `pre` invocation
-returns** — so, unlike a D-Bus `PrepareForSleep` inhibitor, teardown is
+returns** - so, unlike a D-Bus `PrepareForSleep` inhibitor, teardown is
 guaranteed to complete before the machine sleeps with no inhibitor to acquire.
 This replaces the old `agent-rs/src/suspend.rs` zbus watcher, whose dismount
 silently stopped happening whenever `Inhibit` was unavailable.
 
 On `pre`, every active session's dm-crypt key must leave RAM.
 
-Shared-workspace sessions (`/run/veracage/session-<sid>.lock` — what every
+Shared-workspace sessions (`/run/veracage/session-<sid>.lock` - what every
 `veracage open` creates today):
 
   1. Skip if the session owner set `suspend_action = "ignore"`.
@@ -76,12 +76,12 @@ def owner_wants_dismount(uid: str) -> bool:
 
 
 def _leader_uid() -> int | None:
-    """The uid the real session leader runs as — the `veracage` system user.
+    """The uid the real session leader runs as - the `veracage` system user.
 
     The leader is spawned by the root helper, which drops to this uid; a same-uid
     (human) attacker cannot run a process as it. Requiring the /proc match to be
     owned by it defeats a decoy that forges a `_leader` argv to misdirect the
-    kill. Returns None only if the user can't be resolved (an unconfigured box) —
+    kill. Returns None only if the user can't be resolved (an unconfigured box) -
     then we fall back to the cmdline-only match rather than never tearing down.
     """
     try:
@@ -95,7 +95,7 @@ def find_leader_pid(mountpoint: str) -> int | None:
     """The `veracage _leader --mountpoint <mountpoint>` process, or None.
 
     Matches on `/proc/<pid>/cmdline` (the mountpoint is a per-session random
-    path) AND requires the process to be owned by the veracage uid — so a
+    path) AND requires the process to be owned by the veracage uid - so a
     same-uid attacker's forged-argv decoy is rejected before we signal it.
     """
     leader_uid = _leader_uid()
@@ -174,7 +174,7 @@ def teardown_shared_session(lock_path: Path) -> None:
         return
 
     if not owner_wants_dismount(owner):
-        print(f"veracage-sleep: {lock_path.stem}: suspend_action=ignore; "
+        print(f"veracage-sleep: {lock_path.stem}: suspend_action=ignore, "
               "leaving mounted.", file=sys.stderr)
         return
 
@@ -203,14 +203,14 @@ def teardown_shared_session(lock_path: Path) -> None:
     still = [dm for dm in dm_names if dm_present(dm)]
     if still:
         print(f"veracage-sleep: WARNING {lock_path.stem}: dm {', '.join(still)} "
-              "still present after force teardown; key may remain in RAM.",
+              "still present after force teardown. Key may remain in RAM.",
               file=sys.stderr)
 
 
 def teardown_session(lock_path: Path) -> None:
     """Tear one LEGACY per-vault session down so its dm-crypt key leaves RAM.
     Never raises. (Shared-workspace `session-*.lock` files take
-    `teardown_shared_session` instead — their format has no `dm_name=` field.)"""
+    `teardown_shared_session` instead - their format has no `dm_name=` field.)"""
     try:
         fields = cleanup.parse_lock(lock_path)
     except OSError as e:
@@ -222,7 +222,7 @@ def teardown_session(lock_path: Path) -> None:
     uid = fields.get("user_uid", "")
 
     if not owner_wants_dismount(uid):
-        print(f"veracage-sleep: {lock_path.stem}: suspend_action=ignore; "
+        print(f"veracage-sleep: {lock_path.stem}: suspend_action=ignore, "
               "leaving mounted.", file=sys.stderr)
         return
 
@@ -253,7 +253,7 @@ def teardown_session(lock_path: Path) -> None:
 
     if dm_present(dm_name):
         print(f"veracage-sleep: WARNING {lock_path.stem}: dm {dm_name} still "
-              "present after force teardown; key may remain in RAM.",
+              "present after force teardown. Key may remain in RAM.",
               file=sys.stderr)
 
 
@@ -279,13 +279,13 @@ def main(argv: list[str] | None = None) -> int:
     for lock in locks:
         try:
             # Shared-workspace session locks have their own format (volume=
-            # lines, no dm_name=) — routing one through the legacy parser would
+            # lines, no dm_name=) - routing one through the legacy parser would
             # read an empty dm_name and silently skip the teardown.
             if lock.name.startswith("session-"):
                 teardown_shared_session(lock)
             else:
                 teardown_session(lock)
-        except Exception as e:  # noqa: BLE001 — a hook must never abort a sleep
+        except Exception as e:  # noqa: BLE001 - a hook must never abort a sleep
             print(f"veracage-sleep: {lock.stem}: {e}", file=sys.stderr)
     return 0
 

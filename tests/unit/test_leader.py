@@ -53,6 +53,46 @@ def test_close_sets_closing():
     assert st.closing is True
 
 
+def test_set_apps_replaces_list_and_rewrites_apps_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(leader, "COMPOSITOR_RUNTIME", tmp_path)
+    st = leader._LeaderState(mountpoint="/run/veracage/deadbeef",
+                             app_specs=[{"name": "Kate", "exec": "kate"}])
+    r = leader._handle_request(
+        st, {"cmd": "set-apps",
+             "apps": [{"name": "Kate", "exec": "kate"},
+                      {"name": "Gimp", "exec": "gimp"}]})
+    assert r == {"ok": True}
+    assert [a["exec"] for a in st.app_specs] == ["kate", "gimp"]
+    lines = (tmp_path / "app-deadbeef.apps").read_text().splitlines()
+    assert lines[4:] == ["Kate", "Gimp"]
+
+
+def test_set_apps_rejects_malformed():
+    st = _state()
+    for bad in (None, "kate", [{"name": "x"}], [{"exec": ""}],
+                [{"exec": "x" * 600}], [{"exec": "kate", "name": "n" * 200}],
+                [{"exec": "kate"}] * 65,
+                # exec must be a BARE command: no args, whitespace, shell
+                # metacharacters, or control chars (confused-deputy hardening).
+                [{"exec": "kate --evil"}], [{"exec": "sh -c id"}],
+                [{"exec": "a;b"}], [{"exec": "a|b"}], [{"exec": "a$(id)"}],
+                [{"exec": "a\tb"}], [{"exec": "a\nb"}]):
+        r = leader._handle_request(st, {"cmd": "set-apps", "apps": bad})
+        assert r["ok"] is False
+    assert st.app_specs == []  # untouched on every rejection
+
+
+def test_set_apps_accepts_bare_paths(tmp_path, monkeypatch):
+    monkeypatch.setattr(leader, "COMPOSITOR_RUNTIME", tmp_path)
+    st = leader._LeaderState(mountpoint="/run/veracage/deadbeef")
+    r = leader._handle_request(st, {"cmd": "set-apps", "apps": [
+        {"name": "Kate", "exec": "kate"},
+        {"name": "App", "exec": "/opt/app/bin/app-1.2"},
+    ]})
+    assert r["ok"] is True
+    assert [a["exec"] for a in st.app_specs] == ["kate", "/opt/app/bin/app-1.2"]
+
+
 def test_unknown_cmd():
     r = leader._handle_request(_state(), {"cmd": "nope"})
     assert r["ok"] is False and "unknown" in r["error"]
@@ -176,7 +216,7 @@ def test_wire_roundtrip_via_accept_one(tmp_path):
 
 
 # The vault file bridge (import/export/outbox) and the clipboard channel are no
-# longer part of the leader's control socket — their former tests are gone. The
+# longer part of the leader's control socket. Their former tests are gone. The
 # bridge was removed as a same-uid exfiltration surface (see
 # test_control_socket_has_no_launch_or_bridge); clipboard is owned in-process by
 # the compositor.
@@ -271,11 +311,24 @@ def test_write_places_file_one_entry_per_volume(tmp_path, monkeypatch):
     assert "<title>Work</title>" in body and "<title>Photos</title>" in body
 
 
+def test_write_places_file_escapes_hostile_label(tmp_path, monkeypatch):
+    """A label with XML-special chars must produce well-formed, escaped XBEL
+    (the href/ID/title are all interpolated) - not broken or injected markup."""
+    import xml.etree.ElementTree as ET
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    p = leader._write_places_file(['a"<&\'>b'])
+    body = p.read_text()
+    # Raw specials must not appear unescaped in the title, and the doc must parse.
+    assert "<title>a\"<&'>b</title>" not in body
+    assert "&lt;" in body and "&amp;" in body
+    ET.fromstring(body)   # raises if the XBEL is malformed
+
+
 def test_scan_volumes_lists_dirs_skips_dotfiles(tmp_path):
     (tmp_path / "volA").mkdir()
     (tmp_path / "volB").mkdir()
-    (tmp_path / ".exchange").mkdir()          # dot entry — skipped
-    (tmp_path / "note.txt").write_text("x")   # not a dir — skipped
+    (tmp_path / ".exchange").mkdir()          # dot entry: skipped
+    (tmp_path / "note.txt").write_text("x")   # not a dir: skipped
     assert leader.scan_volumes(tmp_path) == ["volA", "volB"]
 
 

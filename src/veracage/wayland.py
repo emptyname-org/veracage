@@ -5,7 +5,7 @@ window, owns the clipboard, and (Phase 3) hosts the toolbar. It is brought up by
 the privileged helper (`veracage-helper --spawn-compositor`) on a fixed socket
 under `/run/veracage`; the CLI and each vault leader here only *observe* its
 liveness and wait for it to appear. There is no longer a per-vault compositor to
-spawn — the old `nested_compositor` context manager is gone.
+spawn - the old `nested_compositor` context manager is gone.
 
   * sandbox clipboard ≠ host clipboard  (the compositor bridges them in-process)
   * host clipboard managers (Klipper, GPaste) cannot scrape the sandbox
@@ -37,7 +37,7 @@ class CompositorStartFailed(RuntimeError):
 
 def compositor_pid() -> int | None:
     """The pid the helper recorded when it brought the compositor up (the
-    compositor's own pid — the helper execs it, so the pid survives), or None if
+    compositor's own pid - the helper execs it, so the pid survives), or None if
     there is no readable pidfile."""
     try:
         return int(COMPOSITOR_PIDFILE.read_text().strip())
@@ -48,12 +48,12 @@ def compositor_pid() -> int | None:
 def _pid_alive(pid: int) -> bool:
     """True iff pid exists and is not a zombie. A compositor that exited (e.g. its
     window was closed) but has not yet been reaped by its parent keeps a /proc
-    entry in state Z — functionally dead, so treat it as down."""
+    entry in state Z - functionally dead, so treat it as down."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
     except OSError:
         return False
-    # "pid (comm) STATE ..." — comm may contain ')', so scan past the last one.
+    # "pid (comm) STATE ..." - comm may contain ')', so scan past the last one.
     try:
         state = stat[stat.rindex(")") + 1:].split()[0]
     except (ValueError, IndexError):

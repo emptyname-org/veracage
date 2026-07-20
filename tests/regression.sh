@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Veracage regression suite — run after every change.
+# Veracage regression suite - run after every change.
 #
 #   bash tests/regression.sh            # full suite
 #   bash tests/regression.sh --no-smoke # skip the headless compositor smoke
@@ -7,7 +7,7 @@
 # Each component reports PASS / FAIL / SKIP. SKIP = tooling absent on this host
 # (not a failure). The script exits non-zero iff any component FAILs, so it is
 # safe to gate commits/CI on it. Designed to run both locally and on the dev VPS
-# (Debian 13, headless) — it auto-detects what it can run.
+# (Debian 13, headless) - it auto-detects what it can run.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -31,7 +31,7 @@ have(){ command -v "$1" >/dev/null 2>&1; }
 
 # ---------------------------------------------------------------- rust ------
 c_helper() { # privilege helper: pinned to DISTRO rustc (1.63 on Debian 12).
-  # Use distro cargo explicitly, not the rustup on PATH — else we'd mask MSRV
+  # Use distro cargo explicitly, not the rustup on PATH - else we'd mask MSRV
   # breakage the helper would hit on its target platform.
   local cargo=/usr/bin/cargo
   [ -x "$cargo" ] || cargo="$(command -v cargo)"
@@ -40,11 +40,11 @@ c_helper() { # privilege helper: pinned to DISTRO rustc (1.63 on Debian 12).
 }
 c_compositor_build() {
   have make || { echo "no make"; return 2; }
-  make build-compositor
+  make build-compositor && make test-compositor
 }
 c_agent_build() {
   have make || { echo "no make"; return 2; }
-  make build-agent
+  make build-agent && make test-agent
 }
 
 # -------------------------------------------------------------- python ------
@@ -74,7 +74,7 @@ c_py_lint() {
 # don't need human interaction: startup (no panic from any global/handler), every
 # advertised global, a real client mapping a toplevel, clean SIGTERM. (The
 # clipboard is in-process + focus-gated now, so its round-trip needs a real
-# session — not headless-testable.)
+# session - not headless-testable.)
 c_headless_smoke() {
   [ "$WANT_SMOKE" = 1 ] || { echo "disabled (--no-smoke)"; return 2; }
   have weston || { echo "no weston"; return 2; }
@@ -149,7 +149,7 @@ component "headless compositor smoke" c_headless_smoke
 
 # ------------------------------------------------------------- summary ------
 # A SKIP of a CORE component (a build or the unit tests) means the environment
-# can't actually run the gate — treat it as a failure, not a silent pass.
+# can't actually run the gate - treat it as a failure, not a silent pass.
 CORE_RE='helper build|compositor build|agent build|unit tests'
 printf '\n'; bold "================ SUMMARY ================"
 fails=0

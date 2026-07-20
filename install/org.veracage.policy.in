@@ -14,7 +14,7 @@
 
   <action id="org.veracage.helper">
     <description>Open an encrypted volume (LUKS or VeraCrypt) into an isolated workspace</description>
-    <message>Authentication is required to open a Veracage vault</message>
+    <message>Authentication is required to open a Veracage volume</message>
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>

@@ -1,55 +1,65 @@
 //! Phase 3 spike: an egui toolbar rendered INTO the compositor's own GL context.
 //!
 //! `egui_glow` shares smithay's EGL context via
-//! `smithay::backend::egl::get_proc_address` — this is the "one real UI unknown"
+//! `smithay::backend::egl::get_proc_address`. This is the "one real UI unknown"
 //! the plan flagged. We drive egui manually (no `egui-winit`): the compositor
 //! already decodes pointer events, so we feed those in and paint into the
 //! currently-bound framebuffer each Redraw, on top of the sandbox windows.
 //!
 //! What this module guarantees: it constructs against smithay's context, paints
-//! every frame, and NEVER crashes or hangs the compositor — if the GL painter
+//! every frame, and NEVER crashes or hangs the compositor: if the GL painter
 //! can't be created it returns `None` and the compositor runs on with no toolbar.
-//!
-//! What still needs a real box (visual iteration, not architecture): the output
-//! is rendered `Transform::Flipped180`, so egui's top-origin panel and the
-//! pointer hit-test may need a y-flip to line up; layout, spacing, fonts, and the
-//! feel of input routing are all things to tune once it's on screen.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Height of the toolbar strip, in logical points (== logical px for window
 /// placement, since a point and a logical pixel are the same size). The sandbox
 /// space is offset down by this much (see xdg_shell) so app titlebars aren't
 /// hidden under the overlay, and the strip is gated from sandbox input.
-pub const TOOLBAR_HEIGHT: i32 = 44;
+pub const TOOLBAR_HEIGHT: i32 = 40;
 
 /// What a menu selection maps to. Clipboard actions reuse the in-process bridge
-/// (identical to the Ctrl+Alt+V/C keybinds); LaunchApp asks a vault's leader (over
-/// its veracage-owned app socket) to launch enabled app `index`; Command signals
-/// the human-uid broker (the compositor can't spawn a human GUI / pkexec / open
-/// host files — see `request_command`); Quit stops the compositor loop.
+/// (identical to the Ctrl+Alt+V/C keybinds); LaunchApp asks a volume's leader
+/// (over its veracage-owned app socket) to launch enabled app `index`; Command
+/// signals the human-uid broker (the compositor can't spawn a human GUI /
+/// pkexec / open host files, see `request_command`); Quit stops the compositor.
 pub enum ToolbarAction {
     None,
     ClipPush, // host selection -> sandbox
     ClipPull, // sandbox selection -> host
     LaunchApp { sock: std::path::PathBuf, index: usize },
-    Command(&'static str), // broker verbs: open/configure/settings/import/export
-    CloseVolume(String),   // close ONE volume of the session (by label)
-    CloseAll(Vec<String>), // close EVERY open volume ("Close vault")
-    Quit,                  // stop the compositor loop (in-process)
+    Command(String),     // broker verbs: open/open-app:<key>/configure/settings/exchange/help/about
+    CloseVolume(String), // unmount ONE volume of the session (by label)
+    Quit,                // stop the compositor loop (in-process)
 }
 
-/// One open vault's launchers, discovered from `/run/veracage/rt/<id>.apps`:
-/// the app socket to poke, the volume label (window title), the enabled app
-/// names (button labels, in order), and the "opener" — the app index the desktop
-/// tile launches to open the vault (a file manager if enabled, else the first app;
-/// `None` if the vault has no enabled apps).
+/// One session's launchers, discovered from `/run/veracage/rt/<id>.apps`:
+/// the app socket to poke, the window-title label, the open-volume labels, the
+/// enabled app names (button labels, in order), and the "opener", the app index
+/// the desktop tile launches (kept in the wire format; currently unused here).
 pub struct LeaderApps {
     pub sock: std::path::PathBuf,
     pub label: String,
-    pub volumes: Vec<String>, // open-volume labels (for the per-volume Close menu)
+    pub volumes: Vec<String>, // open-volume labels (for the Unmount menu)
     pub opener: Option<usize>,
     pub names: Vec<String>,
+}
+
+/// One configured app, published by the human side to `/run/veracage/pub/
+/// config.apps` so the Apps menu is populated before any volume is mounted.
+/// Clicking one asks the broker to run the open flow with that app.
+#[derive(Clone, PartialEq)]
+pub struct ConfigApp {
+    pub key: String,
+    pub name: String,
+}
+
+/// A cached menu icon: the texture (None if the icon file is absent/invalid)
+/// plus the source file's mtime, so an updated icon reloads on the next scan.
+struct IconSlot {
+    mtime: u128,
+    tex: Option<egui::TextureHandle>,
 }
 
 pub struct Toolbar {
@@ -62,7 +72,71 @@ pub struct Toolbar {
     /// Dark vs light egui visuals. Default LIGHT; the human side passes
     /// `VERACAGE_THEME=dark` (from config) when it spawns the compositor.
     dark: bool,
+    /// Menu icons by config-app key, refreshed on the ~1s scan (never per frame).
+    icons: HashMap<String, IconSlot>,
+    /// Display name -> config key, to find icons for leader-published app names.
+    name_to_key: HashMap<String, String>,
+    /// Base UI point size (the host desktop's, or the configured override), and
+    /// the font file currently installed. Refreshed live from `pub/font`.
+    base_size: f32,
+    font_file: String,
+    /// Current clipboard-shortcut labels, shown in the Clipboard menu.
+    copy_out_label: String,
+    paste_in_label: String,
+    /// Menu-item icons: Veracage's own two-color glyphs (mono_icons), drawn
+    /// once at construction in the theme's ink. App icons stay host-colored.
+    menu_icons: HashMap<String, egui::TextureHandle>,
 }
+
+/// The shared app icon PNG (192px = 2x the 96pt display box, for HiDPI), the
+/// same file the About window uses. Regenerate with `convert
+/// Icons/veracage_icon_turquoise_transparent_corners.png -resize 192x192
+/// PNG32:Icons/veracage_icon.png` after new art.
+pub const DESKTOP_ICON_PNG: &[u8] = include_bytes!("../../Icons/veracage_icon.png");
+/// The icon PNG's pixel side, and thus its logical display side scale factor:
+/// the 192px art represents a 96pt icon, so its buffer scale is 2.
+pub const ICON_BUFFER_SCALE: i32 = 2;
+
+/// The hint icon's displayed square side, in LOGICAL points.
+pub const HINT_ICON_PX: i32 = 96;
+
+/// The hint icon's top-left origin in LOGICAL points: horizontally centered,
+/// ~30% down. Given the LOGICAL viewport size. Shared by the smithay render
+/// element (winit.rs, which draws the icon) and the egui text (centered under
+/// it); winit scales the result to physical for the render element.
+pub fn hint_icon_pos(w_logical: i32, h_logical: i32) -> (i32, i32) {
+    ((w_logical - HINT_ICON_PX) / 2, h_logical * 3 / 10)
+}
+
+/// Decode the embedded icon PNG to (width, height, straight-alpha RGBA bytes),
+/// for the smithay memory buffer that draws the desktop hint icon.
+pub fn decode_icon_rgba() -> Option<(u32, u32, Vec<u8>)> {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(DESKTOP_ICON_PNG)).read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    if info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    let rgba: Vec<u8> = match info.color_type {
+        png::ColorType::Rgba => buf[..info.buffer_size()].to_vec(),
+        png::ColorType::Rgb => buf[..info.buffer_size()]
+            .chunks_exact(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
+        _ => return None,
+    };
+    (rgba.len() as u32 == info.width * info.height * 4).then_some((info.width, info.height, rgba))
+}
+
+/// Menu-item icon keys (each names a glyph in mono_icons).
+pub(crate) const MENU_ICON_KEYS: &[&str] = &[
+    "mount", "exchange", "unmount", "quit", "copy_out", "paste_in",
+    "configure_apps", "settings", "shortcuts", "help", "about",
+];
+
+/// Fallback base size in LOGICAL PIXELS when none is provided (the human side
+/// passes the already-resolved pixel size via VERACAGE_FONT_SIZE / pub/font).
+const FALLBACK_SIZE: f32 = 13.0;
 
 impl Toolbar {
     /// Build the toolbar. MUST be called with smithay's EGL context CURRENT (e.g.
@@ -81,13 +155,48 @@ impl Toolbar {
                 return None;
             }
         };
+        let ctx = egui::Context::default();
+        // System UI font + base size, resolved by the human side and passed in
+        // VERACAGE_FONT_FILE / VERACAGE_FONT_SIZE; empty/unset keeps egui's face.
+        let font_file = std::env::var("VERACAGE_FONT_FILE").unwrap_or_default();
+        crate::fonts::install_from_file(&ctx, &font_file);
+        let base_size = std::env::var("VERACAGE_FONT_SIZE")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .map(|s| s.clamp(6.0, 48.0))
+            .unwrap_or(FALLBACK_SIZE);
+        let dark = std::env::var("VERACAGE_THEME").as_deref() == Ok("dark");
+        // Our own two-color menu glyphs, in the theme's icon ink.
+        let ink = if dark {
+            egui::Color32::from_gray(222)
+        } else {
+            egui::Color32::from_gray(35)
+        };
+        let mut menu_icons = HashMap::new();
+        for key in MENU_ICON_KEYS {
+            if let Some(img) = crate::mono_icons::icon(key, ink) {
+                let tex = ctx.load_texture(
+                    format!("veracage-menu-{key}"),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                );
+                menu_icons.insert((*key).to_string(), tex);
+            }
+        }
         Some(Self {
-            ctx: egui::Context::default(),
+            ctx,
             painter,
             events: Vec::new(),
             pointer: egui::Pos2::ZERO,
             height: TOOLBAR_HEIGHT as f32,
-            dark: std::env::var("VERACAGE_THEME").as_deref() == Ok("dark"),
+            dark,
+            icons: HashMap::new(),
+            name_to_key: HashMap::new(),
+            base_size,
+            font_file,
+            copy_out_label: crate::shortcuts::DEFAULT_COPY_OUT.to_string(),
+            paste_in_label: crate::shortcuts::DEFAULT_PASTE_IN.to_string(),
+            menu_icons,
         })
     }
 
@@ -107,7 +216,7 @@ impl Toolbar {
         });
     }
 
-    /// True if a logical-y coordinate falls within the toolbar strip — so the
+    /// True if a logical-y coordinate falls within the toolbar strip, so the
     /// compositor can withhold that event from the sandbox windows underneath.
     pub fn contains_y(&self, y_logical: f64) -> bool {
         (y_logical as f32) < self.height
@@ -116,17 +225,64 @@ impl Toolbar {
     /// True if the toolbar's OWN last-tracked pointer is over the strip. Used to
     /// gate clicks: the compositor returns early on toolbar motion (before it
     /// updates smithay's pointer), so smithay's location is stale for a click on
-    /// the strip — but egui's tracked pointer is always current.
+    /// the strip, but egui's tracked pointer is always current.
     pub fn over_strip(&self) -> bool {
         self.contains_y(self.pointer.y as f64)
     }
 
-    /// True if egui is currently using the pointer — i.e. a menu dropdown is open
+    /// True if egui is currently using the pointer, i.e. a menu dropdown is open
     /// or a widget is active. Menus extend BELOW the strip, so the compositor also
     /// withholds pointer events from the sandbox while this holds, so a click on a
     /// dropdown item reaches egui rather than the app underneath.
     pub fn wants_pointer(&self) -> bool {
         self.ctx.wants_pointer_input()
+    }
+
+    /// Update the clipboard-shortcut labels shown in the Clipboard menu.
+    pub fn refresh_shortcuts(&mut self, copy_out: String, paste_in: String) {
+        self.copy_out_label = copy_out;
+        self.paste_in_label = paste_in;
+    }
+
+    /// Apply a live font/size change (from `pub/font`). Re-installs the font only
+    /// when the file path actually changes (set_fonts rebuilds the atlas). Called
+    /// from the ~1s scan, never per frame.
+    pub fn refresh_font(&mut self, path: &str, base: f32) {
+        if path != self.font_file {
+            crate::fonts::install_from_file(&self.ctx, path);
+            self.font_file = path.to_string();
+        }
+        self.base_size = base;
+    }
+
+    /// Refresh the menu-icon cache for the configured apps. Called from the ~1s
+    /// discovery scan, NOT per frame, so the per-frame render never stats files.
+    pub fn refresh_icons(&mut self, cfg_apps: &[ConfigApp]) {
+        self.name_to_key = cfg_apps
+            .iter()
+            .map(|a| (a.name.clone(), a.key.clone()))
+            .collect();
+        // Drop cache entries for apps no longer configured.
+        let live: std::collections::HashSet<&str> =
+            cfg_apps.iter().map(|a| a.key.as_str()).collect();
+        self.icons.retain(|k, _| live.contains(k.as_str()));
+        for a in cfg_apps {
+            let path = std::path::Path::new(PUB_DIR).join("icons").join(format!("{}.rgba", a.key));
+            let mtime = file_mtime(&path);
+            if let Some(slot) = self.icons.get(&a.key) {
+                if slot.mtime == mtime {
+                    continue; // unchanged (or still absent)
+                }
+            }
+            let tex = load_icon_rgba(&path).map(|img| {
+                self.ctx.load_texture(
+                    format!("veracage-app-{}", a.key),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                )
+            });
+            self.icons.insert(a.key.clone(), IconSlot { mtime, tex });
+        }
     }
 
     /// Run the UI and paint it into the currently-bound framebuffer. `size_px` is
@@ -138,6 +294,7 @@ impl Toolbar {
         size_px: (i32, i32),
         scale: f64,
         leaders: &[LeaderApps],
+        cfg_apps: &[ConfigApp],
         has_windows: bool,
     ) -> ToolbarAction {
         let ppp = (scale as f32).max(1.0);
@@ -147,16 +304,17 @@ impl Toolbar {
         } else {
             egui::Visuals::light()
         });
-        // Fonts ~50% bigger, matching the agent windows (theme::bump_fonts).
-        // Absolute sizes, so calling every frame is idempotent.
+        // Text sizes derived from the base point size (the host desktop's, or the
+        // configured override), matching the agent windows. Idempotent per frame.
+        let base = self.base_size.clamp(6.0, 48.0);
         self.ctx.style_mut(|s| {
             use egui::FontFamily::{Monospace, Proportional};
             use egui::{FontId, TextStyle};
-            s.text_styles.insert(TextStyle::Small, FontId::new(14.0, Proportional));
-            s.text_styles.insert(TextStyle::Body, FontId::new(18.0, Proportional));
-            s.text_styles.insert(TextStyle::Button, FontId::new(18.0, Proportional));
-            s.text_styles.insert(TextStyle::Heading, FontId::new(28.0, Proportional));
-            s.text_styles.insert(TextStyle::Monospace, FontId::new(18.0, Monospace));
+            s.text_styles.insert(TextStyle::Small, FontId::new((base * 0.85).round(), Proportional));
+            s.text_styles.insert(TextStyle::Body, FontId::new(base, Proportional));
+            s.text_styles.insert(TextStyle::Button, FontId::new(base, Proportional));
+            s.text_styles.insert(TextStyle::Heading, FontId::new((base * 1.5).round(), Proportional));
+            s.text_styles.insert(TextStyle::Monospace, FontId::new(base, Monospace));
         });
         let (pw, ph) = (size_px.0.max(1) as f32, size_px.1.max(1) as f32);
         let raw = egui::RawInput {
@@ -170,75 +328,102 @@ impl Toolbar {
 
         let mut action = ToolbarAction::None;
         let height = self.height;
+        // Split borrows for the run() closure: the closure reads the icon caches
+        // while `self.ctx.run` holds the context.
+        let icons = &self.icons;
+        let name_to_key = &self.name_to_key;
+        let menu_icons = &self.menu_icons;
+        let dark = self.dark;
+        let copy_out_label = self.copy_out_label.as_str();
+        let paste_in_label = self.paste_in_label.as_str();
+        let icon_by_name = |name: &str| -> Option<&egui::TextureHandle> {
+            icons.get(name_to_key.get(name)?)?.tex.as_ref()
+        };
+        let icon_by_key = |key: &str| -> Option<&egui::TextureHandle> {
+            icons.get(key)?.tex.as_ref()
+        };
+        let mi = |key: &str| -> Option<&egui::TextureHandle> { menu_icons.get(key) };
         let full = self.ctx.run(raw, |ctx| {
             egui::TopBottomPanel::top("veracage_menu")
                 .exact_height(height)
                 .show(ctx, |ui| {
+                    // Center the one-line menu row vertically in the strip. The
+                    // row is as tall as its buttons (menu style: no vertical
+                    // button padding), never less than interact_size.
+                    let row_h = ui
+                        .text_style_height(&egui::TextStyle::Button)
+                        .max(ui.spacing().interact_size.y);
+                    ui.add_space(((ui.available_height() - row_h) * 0.5).max(0.0));
                     egui::menu::bar(ui, |ui| {
                         ui.menu_button("File", |ui| {
-                            if ui.button("Open vault\u{2026}").clicked() {
-                                action = ToolbarAction::Command("open");
+                            if ui.add(menu_item(mi("mount"), "Mount volume...")).clicked() {
+                                action = ToolbarAction::Command("open".into());
                                 ui.close_menu();
                             }
-                            if ui.button("Import file\u{2026}").clicked() {
-                                action = ToolbarAction::Command("import");
+                            if ui.add(menu_item(mi("exchange"), "Shared directory")).clicked() {
+                                action = ToolbarAction::Command("exchange".into());
                                 ui.close_menu();
                             }
-                            if ui.button("Export file\u{2026}").clicked() {
-                                action = ToolbarAction::Command("export");
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            // Per-volume close — one item per open volume across
-                            // the session (Phase 5). Shown only when >1 volume is
-                            // open; with a single volume "Close vault" already
-                            // closes it.
+                            // Unmount ▸ one item per mounted volume across the
+                            // session. Absent when nothing is mounted.
                             let vols: Vec<String> =
                                 leaders.iter().flat_map(|l| l.volumes.clone()).collect();
-                            if vols.len() > 1 {
-                                ui.menu_button("Close volume", |ui| {
+                            if !vols.is_empty() {
+                                ui.separator();
+                                ui.menu_button("Unmount", |ui| {
+                                    // One volume per line: don't wrap a long label.
+                                    ui.style_mut().wrap_mode =
+                                        Some(egui::TextWrapMode::Extend);
                                     for v in &vols {
-                                        if ui.button(v.as_str()).clicked() {
+                                        if ui.add(menu_item(mi("unmount"), v)).clicked() {
                                             action = ToolbarAction::CloseVolume(v.clone());
                                             ui.close_menu();
                                         }
                                     }
                                 });
                             }
-                            // "Close vault" closes EVERY open volume, by label —
-                            // the label path works regardless of which process
-                            // opened the vault (fixing the old close_last no-op
-                            // when the broker didn't do the open). Absent when the
-                            // workspace is empty (the front door). The compositor
-                            // stays up as the front door after the last close.
-                            if !vols.is_empty() && ui.button("Close vault").clicked() {
-                                action = ToolbarAction::CloseAll(vols.clone());
-                                ui.close_menu();
-                            }
-                            if ui.button("Quit").clicked() {
+                            ui.separator();
+                            if ui.add(menu_item(mi("quit"), "Quit")).clicked() {
                                 action = ToolbarAction::Quit;
                                 ui.close_menu();
                             }
                         });
-                        ui.menu_button("Edit", |ui| {
-                            if ui.button("Paste \u{2192} Veracage").clicked() {
-                                action = ToolbarAction::ClipPush;
+                        ui.menu_button("Clipboard", |ui| {
+                            if ui
+                                .add(menu_item(mi("copy_out"), "Copy out").shortcut_text(copy_out_label))
+                                .clicked()
+                            {
+                                action = ToolbarAction::ClipPull;
                                 ui.close_menu();
                             }
-                            if ui.button("Copy \u{2192} host").clicked() {
-                                action = ToolbarAction::ClipPull;
+                            if ui
+                                .add(menu_item(mi("paste_in"), "Paste in").shortcut_text(paste_in_label))
+                                .clicked()
+                            {
+                                action = ToolbarAction::ClipPush;
                                 ui.close_menu();
                             }
                         });
                         ui.menu_button("Apps", |ui| {
-                            // One item per enabled app of each open vault; clicking
-                            // asks that vault's leader to launch it.
                             if leaders.is_empty() {
-                                ui.add_enabled(false, egui::Button::new("(open a vault first)"));
+                                // No volume mounted: apps operate on volume
+                                // contents, so show the configured apps DISABLED
+                                // until a volume is mounted (File > Mount volume).
+                                if cfg_apps.is_empty() {
+                                    ui.add_enabled(
+                                        false,
+                                        egui::Button::new("(no apps configured)"),
+                                    );
+                                }
+                                for a in cfg_apps {
+                                    ui.add_enabled(false, app_button(icon_by_key(&a.key), &a.name));
+                                }
                             }
+                            // One item per enabled app of each mounted session;
+                            // clicking asks that session's leader to launch it.
                             for l in leaders {
                                 for (i, name) in l.names.iter().enumerate() {
-                                    if ui.button(name).clicked() {
+                                    if ui.add(app_button(icon_by_name(name), name)).clicked() {
                                         action = ToolbarAction::LaunchApp {
                                             sock: l.sock.clone(),
                                             index: i,
@@ -247,22 +432,30 @@ impl Toolbar {
                                     }
                                 }
                             }
-                            // Configure the enabled-app set — last line of Apps.
+                            // Configure the enabled-app set: last line of Apps.
                             ui.separator();
-                            if ui.button("Configure apps\u{2026}").clicked() {
-                                action = ToolbarAction::Command("configure");
+                            if ui.add(menu_item(mi("configure_apps"), "Configure apps...")).clicked() {
+                                action = ToolbarAction::Command("configure".into());
                                 ui.close_menu();
                             }
                         });
                         ui.menu_button("Settings", |ui| {
-                            if ui.button("Settings\u{2026}").clicked() {
-                                action = ToolbarAction::Command("settings");
+                            if ui.add(menu_item(mi("settings"), "Settings...")).clicked() {
+                                action = ToolbarAction::Command("settings".into());
+                                ui.close_menu();
+                            }
+                            if ui.add(menu_item(mi("shortcuts"), "Configure shortcuts...")).clicked() {
+                                action = ToolbarAction::Command("shortcuts".into());
                                 ui.close_menu();
                             }
                         });
                         ui.menu_button("Help", |ui| {
-                            if ui.button("About Veracage\u{2026}").clicked() {
-                                action = ToolbarAction::Command("about");
+                            if ui.add(menu_item(mi("help"), "Help...")).clicked() {
+                                action = ToolbarAction::Command("help".into());
+                                ui.close_menu();
+                            }
+                            if ui.add(menu_item(mi("about"), "About Veracage...")).clicked() {
+                                action = ToolbarAction::Command("about".into());
                                 ui.close_menu();
                             }
                         });
@@ -270,38 +463,134 @@ impl Toolbar {
                 });
 
             // The compositor backdrop IS the desktop (rendered first, behind every
-            // window) — there is no opaque egui desktop panel, so app windows open
+            // window), there is no opaque egui desktop panel, so app windows open
             // ON the desktop like any normal compositor. When nothing is open we
             // draw only a centred hint on a TRANSPARENT panel (so the backdrop shows
             // through); once a window maps it covers the hint, as a desktop should.
             if !has_windows {
+                // A mounted volume with no open windows is NOT "no volume
+                // mounted" - the leaders tell us what is actually mounted.
+                let mounted = leaders.iter().any(|l| !l.volumes.is_empty());
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none())
                     .show(ctx, |ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(ui.available_height() * 0.4);
-                            ui.label(
-                                egui::RichText::new("\u{1F512}  No vault open")
-                                    .size(28.0)
-                                    .weak(),
-                            );
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new("File \u{25B8} Open vault\u{2026}").weak(),
-                            );
-                        });
+                        // The icon itself is drawn by the smithay renderer
+                        // (winit.rs) at hint_icon_pos; here we draw only the
+                        // text, centered under it. All in LOGICAL points.
+                        let painter = ui.painter();
+                        let (w_l, h_l) = ((pw / ppp) as i32, (ph / ppp) as i32);
+                        let (_icon_x, icon_y) = crate::toolbar::hint_icon_pos(w_l, h_l);
+                        let icon_px = crate::toolbar::HINT_ICON_PX;
+                        let (big, small) = hint_colors(dark);
+                        let (line1, line2) = if mounted {
+                            (volumes_title(leaders), "Use the Apps menu to launch an app")
+                        } else {
+                            ("No volume mounted".to_string(), "File > Mount volume")
+                        };
+                        let cx = (w_l / 2) as f32;
+                        let ty = (icon_y + icon_px + 16) as f32;
+                        painter.text(
+                            egui::pos2(cx, ty),
+                            egui::Align2::CENTER_TOP,
+                            line1,
+                            egui::FontId::proportional(28.0),
+                            big,
+                        );
+                        painter.text(
+                            egui::pos2(cx, ty + 40.0),
+                            egui::Align2::CENTER_TOP,
+                            line2,
+                            egui::FontId::proportional(16.0),
+                            small,
+                        );
                     });
             }
         });
 
         let clipped = self.ctx.tessellate(full.shapes, full.pixels_per_point);
+        let mut textures_delta = full.textures_delta;
+        rebake_font_textures(&mut textures_delta);
         self.painter.paint_and_update_textures(
             [size_px.0.max(1) as u32, size_px.1.max(1) as u32],
             full.pixels_per_point,
             &clipped,
-            &full.textures_delta,
+            &textures_delta,
         );
         action
+    }
+}
+
+/// egui bakes its font atlas with alpha = coverage^0.55, a boost that reads as
+/// semibold in this GL pipeline next to the host's own text rendering. Rebake
+/// font-texture updates with linear coverage so the menu text weight matches
+/// the desktop's.
+fn rebake_font_textures(delta: &mut egui::TexturesDelta) {
+    for (_, d) in &mut delta.set {
+        if let egui::ImageData::Font(f) = &d.image {
+            let img = egui::ColorImage {
+                size: f.size,
+                pixels: f.srgba_pixels(Some(1.0)).collect(),
+            };
+            d.image = egui::ImageData::Color(Arc::new(img));
+        }
+    }
+}
+
+/// The "N volumes mounted (a, b)" summary of a session's open volumes, used for
+/// both the host window title and the desktop hint. "Veracage" when none.
+pub fn volumes_title(leaders: &[LeaderApps]) -> String {
+    let vols: Vec<&str> = leaders
+        .iter()
+        .flat_map(|l| l.volumes.iter().map(|s| s.as_str()))
+        .collect();
+    match vols.len() {
+        0 => "Veracage".to_string(),
+        1 => format!("1 volume mounted ({})", vols[0]),
+        n => format!("{n} volumes mounted ({})", vols.join(", ")),
+    }
+}
+
+/// Backdrop-hint text colors (big line, small line) for the theme. Solid, not
+/// weak, so the text reads as plain type rather than embossed on the backdrop.
+fn hint_colors(dark: bool) -> (egui::Color32, egui::Color32) {
+    if dark {
+        (egui::Color32::from_gray(150), egui::Color32::from_gray(120))
+    } else {
+        (egui::Color32::from_gray(105), egui::Color32::from_gray(130))
+    }
+}
+
+/// A menu item widget: a small host-theme icon (when cached) + text. Icon-less
+/// items fall back to text only.
+fn menu_item(icon: Option<&egui::TextureHandle>, text: &str) -> egui::Button<'static> {
+    const ICON_PT: f32 = 16.0;
+    match icon {
+        Some(tex) => {
+            let img = egui::Image::from_texture(egui::load::SizedTexture::new(
+                tex.id(),
+                egui::vec2(ICON_PT, ICON_PT),
+            ));
+            egui::Button::image_and_text(img, text.to_owned())
+        }
+        None => egui::Button::new(text.to_owned()),
+    }
+}
+
+/// A menu entry widget for an app: small icon (when one is cached) + name.
+/// Returned as a `Button` so the caller can add it enabled (a mounted session's
+/// launcher) or disabled (a configured app with nothing mounted yet). The
+/// texture id is Copy, so the button borrows nothing.
+fn app_button(icon: Option<&egui::TextureHandle>, name: &str) -> egui::Button<'static> {
+    const ICON_PT: f32 = 20.0;
+    match icon {
+        Some(tex) => {
+            let img = egui::Image::from_texture(egui::load::SizedTexture::new(
+                tex.id(),
+                egui::vec2(ICON_PT, ICON_PT),
+            ));
+            egui::Button::image_and_text(img, name.to_owned())
+        }
+        None => egui::Button::new(name.to_owned()),
     }
 }
 
@@ -310,6 +599,11 @@ impl Toolbar {
 /// The shared compositor runtime dir (must match COMPOSITOR_RUNTIME in wayland.py).
 const RUNTIME_DIR: &str = "/run/veracage/rt";
 
+/// The human-published dir (created by the helper, owned by the human uid):
+/// `config.apps` (the configured app list) + `icons/<key>.rgba` (menu icons).
+/// Writable only by the human uid, the same trust level as config.toml itself.
+const PUB_DIR: &str = "/run/veracage/pub";
+
 /// The file the human-side broker polls for commands (verb line). Must match
 /// CMD_REQ in agent-rs/src/broker.rs.
 const CMD_REQ: &str = "cmd.req";
@@ -317,10 +611,11 @@ const CMD_REQ: &str = "cmd.req";
 /// Emit a command to the human-uid broker. The compositor runs as the `veracage`
 /// uid and cannot spawn a human GUI / `pkexec` / open host files, so it drops a
 /// one-line verb into its own runtime dir; the broker (human uid) polls the file's
-/// mtime and dispatches the verb. Verbs: open/configure/settings/close/import/export.
+/// mtime and dispatches the verb. Verbs: open/open-app:<key>/configure/settings/
+/// exchange/help/about/close-volume:<label>.
 ///
 /// Security: `/run/veracage/rt` is `0711 veracage`, so a same-uid attacker CANNOT
-/// create/forge this file — only the compositor writes it, and a compositor menu
+/// create/forge this file, only the compositor writes it, and a compositor menu
 /// click is a genuine user action he can't inject. The verb isn't secret, so the
 /// file is world-readable (the broker reads it by exact path through the 0711 dir);
 /// at most an attacker learns a command was issued.
@@ -331,7 +626,7 @@ pub fn request_command(verb: &str) {
     // Write a temp file, make it broker-readable, THEN atomically rename it into
     // place. A plain write-then-chmod leaves a window where the file exists 0600
     // (the compositor's umask is 077): the broker polls the mtime and can read it
-    // during that window, get EACCES, and silently DROP the command — losing e.g.
+    // during that window, get EACCES, and silently DROP the command, losing e.g.
     // the very first menu click. rename() bumps the target's mtime (the broker's
     // signal) and the file is 0644 the instant it appears.
     let tmp = std::path::Path::new(RUNTIME_DIR).join(format!("{CMD_REQ}.tmp"));
@@ -349,7 +644,120 @@ pub fn request_command(verb: &str) {
     }
 }
 
-/// Scan `RUNTIME_DIR` for the `*.apps` files each vault's leader writes, building
+/// mtime of `p` in ns since epoch, 0 if it can't be read (absent file).
+fn file_mtime(p: &std::path::Path) -> u128 {
+    std::fs::symlink_metadata(p)
+        .ok()
+        .filter(|md| md.file_type().is_file())
+        .and_then(|md| md.modified().ok())
+        .and_then(|mt| mt.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// Load a published menu icon: `<w:u32 LE><h:u32 LE><rgba bytes>`, both sides
+/// 1..=128. The blob comes from a human-owned dir, so validate strictly and
+/// reject anything malformed rather than trusting it.
+fn load_icon_rgba(p: &std::path::Path) -> Option<egui::ColorImage> {
+    const MAX_SIDE: usize = 128;
+    let md = std::fs::symlink_metadata(p).ok()?;
+    if !md.file_type().is_file() || md.len() > (8 + MAX_SIDE * MAX_SIDE * 4) as u64 {
+        return None;
+    }
+    let body = std::fs::read(p).ok()?;
+    if body.len() < 8 {
+        return None;
+    }
+    let w = u32::from_le_bytes(body[0..4].try_into().ok()?) as usize;
+    let h = u32::from_le_bytes(body[4..8].try_into().ok()?) as usize;
+    if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE || body.len() != 8 + w * h * 4 {
+        return None;
+    }
+    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &body[8..]))
+}
+
+/// Read the human-published UI font from `PUB_DIR/font` (`<path>\n<size>`).
+/// Returns (file path or empty, base point size). None if the file is absent.
+pub fn scan_font() -> Option<(String, f32)> {
+    let path = std::path::Path::new(PUB_DIR).join("font");
+    let md = std::fs::symlink_metadata(&path).ok()?;
+    if !md.file_type().is_file() || md.len() > 4096 {
+        return None;
+    }
+    let body = std::fs::read_to_string(&path).ok()?;
+    let mut lines = body.lines();
+    let file = lines.next().unwrap_or("").trim().to_string();
+    let size = lines
+        .next()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .unwrap_or(11.0)
+        .clamp(6.0, 48.0);
+    Some((file, size))
+}
+
+/// Read the host-clipboard auto-clear policy from `PUB_DIR/clipclear`
+/// (`<0|1 enabled>\n<timeout secs>`). None if absent/unreadable, in which case
+/// the worker keeps its secure default (enabled, 30s). Timeout clamped 1..=3600.
+pub fn scan_clipclear() -> Option<(bool, u32)> {
+    let path = std::path::Path::new(PUB_DIR).join("clipclear");
+    let md = std::fs::symlink_metadata(&path).ok()?;
+    if !md.file_type().is_file() || md.len() > 64 {
+        return None;
+    }
+    let body = std::fs::read_to_string(&path).ok()?;
+    let mut lines = body.lines();
+    let enabled = lines.next()?.trim() == "1";
+    let secs = lines.next()?.trim().parse::<u32>().ok()?.clamp(1, 3600);
+    Some((enabled, secs))
+}
+
+/// Read the human-published desired window size from `PUB_DIR/window.size`
+/// ("default" | "max" | "<w>x<h>"). None if absent/unreadable. Validated by the
+/// caller before it touches the window.
+pub fn scan_window_size() -> Option<String> {
+    let path = std::path::Path::new(PUB_DIR).join("window.size");
+    let md = std::fs::symlink_metadata(&path).ok()?;
+    if !md.file_type().is_file() || md.len() > 64 {
+        return None;
+    }
+    let s = std::fs::read_to_string(&path).ok()?;
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// Scan the human-published configured-app list at `PUB_DIR/config.apps`
+/// (`<key>\t<name>` per line). Shown in the Apps menu when no volume is mounted;
+/// clicking runs the broker's open flow with that app. Size- and count-capped,
+/// and keys are validated (they become icon file names).
+pub fn scan_config_apps() -> Vec<ConfigApp> {
+    let path = std::path::Path::new(PUB_DIR).join("config.apps");
+    let Ok(md) = std::fs::symlink_metadata(&path) else {
+        return Vec::new();
+    };
+    if !md.file_type().is_file() || md.len() > 64 * 1024 {
+        return Vec::new();
+    }
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in body.lines().take(64) {
+        let Some((key, name)) = line.split_once('\t') else {
+            continue;
+        };
+        if key.is_empty() || key.len() > 64 || key.contains('/') || key == ".." {
+            continue;
+        }
+        let name = if name.is_empty() { key } else { name };
+        if name.len() > 128 {
+            continue;
+        }
+        out.push(ConfigApp { key: key.to_string(), name: name.to_string() });
+    }
+    out
+}
+
+/// Scan `RUNTIME_DIR` for the `*.apps` files each session leader writes, building
 /// the toolbar's launcher list. Cheap; called on a ~1s throttle from the redraw.
 /// Format per file: line 1 = the app socket's filename, lines 2.. = app names.
 pub fn scan_leaders() -> Vec<LeaderApps> {
@@ -363,7 +771,7 @@ pub fn scan_leaders() -> Vec<LeaderApps> {
         if path.extension().and_then(|e| e.to_str()) != Some("apps") {
             continue;
         }
-        // Only a real regular file, size-capped — never block on a FIFO or OOM on
+        // Only a real regular file, size-capped, never block on a FIFO or OOM on
         // a huge/looping file a same-uid process could plant in the runtime dir.
         let Ok(md) = std::fs::symlink_metadata(&path) else {
             continue;
@@ -383,8 +791,8 @@ pub fn scan_leaders() -> Vec<LeaderApps> {
         if sockname.contains('/') || sockname == ".." {
             continue;
         }
-        let label = lines.next().unwrap_or("Vault").to_string();
-        // Open-volume labels (tab-separated) for the per-volume Close menu.
+        let label = lines.next().unwrap_or("Volume").to_string();
+        // Open-volume labels (tab-separated) for the Unmount menu.
         let volumes: Vec<String> = lines
             .next()
             .unwrap_or("")
@@ -408,7 +816,7 @@ pub fn scan_leaders() -> Vec<LeaderApps> {
     out
 }
 
-/// Ask a vault's leader to launch enabled app `index` by poking its app socket
+/// Ask a session's leader to launch enabled app `index` by poking its app socket
 /// with a bare index line. The blocking connect+write runs on a short-lived
 /// thread so a stalled or missing leader socket can never freeze the compositor's
 /// single-threaded event loop (matching the clipboard bridge's discipline).
@@ -428,4 +836,21 @@ pub fn launch_app(sock: &std::path::Path, index: usize) {
                 Err(e) => tracing::warn!("toolbar: launch app {index}: {e}"),
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hint_icon_pos_is_centered() {
+        let (x, y) = hint_icon_pos(800, 600);
+        assert_eq!(x, (800 - HINT_ICON_PX) / 2); // horizontally centered
+        assert_eq!(y, 600 * 3 / 10); // ~30% down
+    }
+
+    #[test]
+    fn volumes_title_empty_is_veracage() {
+        assert_eq!(volumes_title(&[]), "Veracage");
+    }
 }

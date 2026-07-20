@@ -1,59 +1,79 @@
 # Veracage
 
-Runs apps against an encrypted volume (LUKS or VeraCrypt) in a sandbox, so the
-decrypted contents stay unreadable to the rest of the host. Full design in
-[`docs/veracage-design.md`](docs/veracage-design.md); security model in
-[`docs/SECURITY.md`](docs/SECURITY.md); the isolation core in
-[`docs/uid-isolation.md`](docs/uid-isolation.md).
+Mounts and decrypts VeraCrypt and LUKS volumes and isolates filesystem and clipboard from the rest of the Linux host.
+Design in [`docs/veracage-design.md`](docs/veracage-design.md)
+Security model in [`docs/SECURITY.md`](docs/SECURITY.md)
+Isolation core in [`docs/uid-isolation.md`](docs/uid-isolation.md).
 
-## How it works
+## The problem
 
-A small root helper (via `pkexec`) `cryptsetup open`s the vault and **idmap-mounts**
-it so its contents are owned by a dedicated `veracage` system uid, inside a **private
-mount namespace** — so the human and every other non-root uid are denied by
-ownership, and the mount never appears in `/proc/mounts`. Apps run as `veracage`
-under **bubblewrap** (no network, no host filesystem, curated `/etc`, `--clearenv`),
-rendered by our own persistent nested Wayland compositor (`veracage-compositor`),
-which owns the clipboard and hosts an in-window toolbar.
+Encrypting a volume protects it only while it stays unmounted. The moment you
+mount a VeraCrypt or LUKS volume on a normal Linux host, its decrypted contents
+belong to your user account, so every process running as you can read them. A
+background app, a careless script, or malware in your session can open the
+mounted files and watch your clipboard, and ordinary file permissions do nothing
+to stop it, because it is all the same user.
 
-## What works
+Veracage isolates the decrypted volume from the rest of your own session. It
+mounts the contents so that only a dedicated system user can read them, runs your
+chosen apps as that user with no network and no view of your other files, and
+keeps a separate clipboard that moves data only when you ask. A compromised or
+nosy program in your normal session cannot reach what is inside.
 
-- **One window: the compositor**, with a **File / Edit / Apps / Settings** menu bar
-  in its chrome. The human-side helper (`veracage-agent`) is a **windowless broker**
-  — it does the host-side things a `veracage`-uid process can't (`pkexec` the mount,
-  host file dialogs, write `~/.config`) and shows only transient dialogs. The front
-  door (app-menu icon, or "Open with" a `.vc`) is a volume picker + passphrase
-  dialog, not a standing window. (Design: `docs/single-window-ux.md`.)
-- **`veracage open <vault> [app]`** — bring up the compositor, then mount: two
-  pkexecs behind a **single** password prompt (polkit `auth_self_keep`);
-  launch apps from the compositor **Apps menu** (no second prompt).
-- **`veracage list <vault>` / `veracage close <vault>`** — inspect / tear down.
-- **Clipboard** — Ctrl+Alt+V (host→sandbox) / Ctrl+Alt+C (sandbox→host) or the
-  toolbar buttons; text-only, user-triggered, owned by the compositor.
-- **File transfer** — a shared **Exchange folder**: `~/Veracage/Exchange` on the
-  host is idmap-mounted into the sandbox at `/exchange`. Drop a file in on either
-  side and it's there on the other, owned by you — no dialogs, no copies. Off via
-  `exchange = false`. (Design: `docs/single-window-ux.md`.)
-- **Multi-volume shared workspace** — open several volumes at once and they share
-  **one private mount namespace**, appearing side by side at `/vaults/<label>`. One
-  set of apps sees them all, so a single file manager can **drag-and-drop between
-  volumes**. Subsequent opens `setns` into the running session; **Close volume ▸**
-  closes just one (the rest run on). Volumes are shown at an app's **launch time**
-  (open them first, then launch). (Design: `docs/shared-workspace-redesign.md`.)
-- **Enable any installed app** — `veracage configure` (GUI picker) or
+## Architecture
+
+A small root helper (via `pkexec`) opens the volume with `cryptsetup` and
+**idmap-mounts** it so its contents are owned by a dedicated `veracage` system
+uid, inside a **private mount namespace**. Every non-root uid is denied by
+ownership, and the mount never appears in `/proc/mounts`. Apps run as
+`veracage` under **bubblewrap** (no network, no host filesystem, curated
+`/etc`, `--clearenv`), rendered by a persistent nested Wayland compositor
+(`veracage-compositor`) that owns the clipboard and hosts the menu bar.
+
+## Features
+
+- **Single window** - the compositor window, with a File / Clipboard / Apps /
+  Settings / Help menu bar. The human-side broker (`veracage-agent`) is
+  windowless: it does the host-side work a `veracage`-uid process can't
+  (`pkexec`, host file dialogs, `~/.config`) and shows only transient dialogs
+  (volume picker, passphrase prompt). Design: `docs/single-window-ux.md`.
+- **CLI** - `veracage open <volume> [app]`, `list`, `close`, `close-volume`.
+  Mounting needs one password prompt (polkit `auth_self_keep`). Apps launch 
+  from the compositor's Apps menu.
+- **Apps menu** - lists the enabled apps with their host icons. The front door
+  is an empty session, so apps are launchable before any volume is mounted:
+  a sandboxed **scratchpad** (no network, no host filesystem) whose only ways
+  out are the clipboard and the shared directory. Mounting a volume joins the
+  same session. Apps launched after the mount see it.
+- **Clipboard** - user-triggered only: Clipboard > Paste in (host to sandbox)
+  and Clipboard > Copy out (sandbox to host), with configurable shortcuts
+  (defaults Ctrl+Alt+V / Ctrl+Alt+C). Text-only, owned by the compositor. After
+  a Copy out, the host clipboard is cleared automatically after a timeout
+  (default 30 seconds) and again when Veracage quits, so a copied secret does
+  not linger on the host. Both are configurable in Settings.
+- **Shared directory** - `~/Veracage/Exchange` on the host is idmap-mounted
+  into the sandbox at `/exchange`. Files dropped on either side appear on the
+  other, owned by the user. No dialogs, no copies. File > Shared
+  directory opens it on the host. Disable with `exchange = false`.
+- **Multi-volume workspace** - open several volumes and they share one private
+  mount namespace, side by side at `/vaults/<label>`. One app set sees them
+  all, so a single file manager can drag-and-drop between volumes. The title
+  bar counts the mounts ("2 volumes mounted (work, private)"). **File >
+  Unmount** unmounts one volume, the rest keep running. Apps see the volumes
+  mounted at their launch time. Design: `docs/shared-workspace.md`.
+- **Any installed app** - `veracage configure` (GUI picker) or
   `--add <binary>` / `--remove <key>` / `--list`. No fixed catalog.
-- **Crash-safe teardown** — the session is a `systemd --user` transient service
-  whose `ExecStopPost` `cryptsetup close`s the device on any exit
-  (SIGKILL/OOM/panic/logout).
-- **Suspend** — a static root `system-sleep` hook dismounts every session before
-  sleep (no D-Bus watcher).
-- **Privilege helper in Rust** (`helper-rs/`): derives the caller uid from
-  `PKEXEC_UID` (never argv), pins the continuation at build time, allowlists
-  forwarded env. See `docs/SECURITY.md`.
+- **Crash-safe teardown** - the session is a `systemd --user` transient
+  service whose `ExecStopPost` closes the dm device on any exit
+  (SIGKILL, OOM, panic, logout).
+- **Suspend** - a root `system-sleep` hook unmounts every session before
+  sleep.
+- **Hardened privilege helper** (Rust, `helper-rs/`) - caller uid from
+  `PKEXEC_UID` (never argv), continuation pinned at build time, forwarded env
+  allowlisted. See `docs/SECURITY.md`.
 
-Deferred: host-file import/export (the old socket file bridge was removed — see
-`docs/fixed-problems.md`) and GlobalShortcuts-portal integration for the clipboard
-keybinds. `wp_security_context_v1` (Mode A) was evaluated and **not** adopted
+Deferred: GlobalShortcuts-portal integration for the clipboard keybinds.
+`wp_security_context_v1` was evaluated and not adopted
 ([`docs/mode-a-security-context.md`](docs/mode-a-security-context.md)).
 
 ## Install
@@ -64,46 +84,47 @@ Debian 12 system packages:
 sudo apt install bubblewrap cryptsetup veracrypt python3
 ```
 
-`bubblewrap` + `cryptsetup` (+ `veracrypt` for VC volumes) are required. **No
-weston, no wl-clipboard, no Qt/GTK, no python3-gi** — the agent and compositor are
-self-contained Rust binaries that link only what a desktop session already has
-(Mesa GL, Wayland/X11, `libxkbcommon.so.0`).
+`bubblewrap` + `cryptsetup` (+ `veracrypt` for VeraCrypt volumes) are
+required. No weston, wl-clipboard, Qt/GTK, or python3-gi. The agent and
+compositor are self-contained Rust binaries linking only what a desktop
+session already has (Mesa GL, Wayland/X11, `libxkbcommon.so.0`).
 
 ### Toolchain (build only)
 
 - The privilege **helper** builds on Debian 12's stock `rustc` 1.63.
 - The **agent** and **compositor** need rustup + recent stable
-  (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`); `make install`
-  uses rustup's cargo for both. If `libxkbcommon-dev` is absent, `make` synthesises
-  a private linker symlink to `libxkbcommon.so.0` (no `-dev` package needed).
+  (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`).
+  `make install` uses rustup's cargo for both. If `libxkbcommon-dev` is
+  absent, `make` synthesises a private linker symlink to `libxkbcommon.so.0`.
 
 ```
 make install-dev     # build the helper + point a polkit policy at this checkout
 sudo make install    # system install to /usr/local (override with PREFIX=)
 ```
 
-`make install` lays down the package under `PREFIX/lib/veracage`; `veracage`,
-`veracage-agent`, and `veracage-compositor` in `PREFIX/bin`; the privileged helpers
-in `PREFIX/libexec/veracage`; a polkit policy, a `.desktop` + icon, a udev rule
-(hides the dm device from UDisks), and the `system-sleep` hook. It also creates the
-`veracage` system user.
+`make install` lays down the package under `PREFIX/lib/veracage`, with
+`veracage`, `veracage-agent`, and `veracage-compositor` in `PREFIX/bin` and
+the privileged helpers in `PREFIX/libexec/veracage`. It also installs a
+polkit policy, a `.desktop` + icon, a udev rule (hides the dm device from
+UDisks), and the `system-sleep` hook, and creates the `veracage` system user.
 
 ## Usage
 
 ```
 veracage configure                    # enable apps (GUI picker)
 veracage configure --add dolphin      # or by binary name
-veracage open /path/to/vault.vc       # mount into the shared workspace
-veracage open /path/to/vault.vc kate  # auto-launch an app too
+veracage open /path/to/volume.vc      # mount into the shared workspace
+veracage open /path/to/volume.vc kate # auto-launch an app too
 veracage open /path/to/other.vc       # a 2nd volume joins the same workspace
-veracage list  /path/to/vault.vc
-veracage close-volume <label>         # close one volume (or Close volume ▸ menu)
-veracage close /path/to/vault.vc      # tear the whole session down
+veracage list /path/to/volume.vc
+veracage close-volume <label>         # unmount one volume (File > Unmount)
+veracage close /path/to/volume.vc     # tear the whole session down
 ```
 
-`pkexec` prompts for your account password; the CLI then prompts for the vault
-passphrase on the terminal. The GUI launcher (`veracage-agent`, or the "Veracage"
-app-menu entry) collects the passphrase in a window and pipes it to `cryptsetup`.
+`pkexec` prompts for the account password, then the CLI prompts for the
+volume passphrase on the terminal. The GUI launcher (`veracage-agent`, or the
+"Veracage" app-menu entry) collects the passphrase in a window and asks again
+if it was wrong. Help > Help in the menu bar has the short usage notes.
 
 ## Config
 
@@ -112,32 +133,40 @@ app-menu entry) collects the passphrase in a window and pipes it to `cryptsetup`
 ```toml
 [default]
 last_used_app  = "kate"
-gpu            = false          # /dev/dri passthrough (side channel; off)
-suspend_action = "dismount"     # or "ignore" to keep mounted across suspend
+theme          = "light"        # light | dark
+ui_font        = "system"       # system (host font) | noto | liberation | dejavu | dejavu-mono
+ui_font_size   = "system"       # system (host size) | a point size, e.g. 12
+window_size    = "default"      # default | max | 1280x800 (WxH)
+gpu            = false          # /dev/dri passthrough (side channel, off)
+suspend_action = "dismount"     # unmount on suspend, or "ignore" to keep mounted
+clip_clear     = true           # auto-clear the host clipboard after Copy out
+clip_clear_timeout = 30         # seconds before the auto-clear fires
 
 [apps.kate]                     # the enabled-app allowlist (any installed binary)
 name     = "Kate"
-category = "text"
 exec     = "kate"
-args     = ["/vaults"]          # the app opens on the workspace (all open volumes)
 
-[volumes."/home/you/Documents/work.vc"]   # optional per-volume overrides
+[volumes."/path/to/work.vc"]    # optional per-volume overrides
 default_app  = "okular"
 gpu          = true
 ```
 
-Per-volume settings inherit from `[default]`. Only apps under `[apps.*]` launch —
-add one with `veracage configure --add <binary>` (there is no hardcoded catalog).
+Per-volume settings inherit from `[default]`. Only apps under `[apps.*]`
+launch. Add one with `veracage configure --add <binary>`.
 
 ## Tests
 
 ```
-make test        # Python unit suite (pytest) — 154 tests
+make test        # Python unit suite (pytest)
 make lint        # ruff + mypy
 make test-rs     # Rust helper unit tests (cargo)
 ```
 
-`tests/integration/test_helper_security.py` runs against the built helper;
-privileged/GUI integration steps are in `tests/integration/MANUAL.md`.
-`tests/regression.sh` runs the full gate (all three Rust crates + the Python suite +
-lint + a headless compositor smoke).
+`tests/integration/test_helper_security.py` runs against the built helper.
+Privileged/GUI integration steps are in `tests/integration/MANUAL.md`.
+`tests/regression.sh` runs the full gate (all three Rust crates + the Python
+suite + lint + a headless compositor smoke).
+
+## License
+
+[CC0 1.0 Universal](LICENSE) (public domain).

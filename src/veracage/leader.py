@@ -1,4 +1,4 @@
-"""Vault-side session leader — runs AS the vault uid (the helper dropped to it).
+"""Vault-side session leader: runs AS the vault uid (the helper dropped to it).
 
 The Rust helper has already opened the volume, idmap-mounted it at MOUNTPOINT as
 the vault uid (in a private mount NS), created the control listening socket, and
@@ -9,10 +9,10 @@ and execs us:
   VERACAGE_VAULT_RUNTIME  our XDG_RUNTIME_DIR (bwrap /run/user)
 
 We launch apps in bwrap wired to the ONE persistent compositor's shared socket
-(/run/veracage/rt/wl-vc, brought up separately by the helper — we do not spawn
+(/run/veracage/rt/wl-vc, brought up separately by the helper. We do not spawn
 it). The leader is a plain executor: it runs the command the human hands it,
 sandboxed, and outlives no compositor of its own. The
-security property — *external processes can't read the vault* — comes from the
+security property (*external processes can't read the vault*) comes from the
 idmap (the vault is owned by a uid no one else has) + the mount NS (hidden) +
 bwrap (apps have no net/host-FS, so they can't exfiltrate). The app allowlist is
 UX on the human side (which apps to offer); it is NOT a vault-side restriction,
@@ -33,6 +33,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from xml.sax.saxutils import quoteattr
 
 from .apps import App, is_file_manager
 from .sandbox import bwrap_command
@@ -47,10 +48,10 @@ WORKSPACE = Path("/run/veracage/vaults")
 
 
 def scan_volumes(root: Path | None = None) -> list[str]:
-    """The open volumes' labels — the directory names under the workspace root
+    """The open volumes' labels: the directory names under the workspace root
     (the helper already sanitised them to a single safe path component). Dot
     entries are skipped (defense in depth; nothing dot-named is expected under
-    the workspace — the exchange mount lives OUTSIDE it). Sorted."""
+    the workspace. The exchange mount lives OUTSIDE it). Sorted."""
     if root is None:
         root = WORKSPACE   # resolved at call time (tests monkeypatch WORKSPACE)
     try:
@@ -72,18 +73,19 @@ class _LeaderState:
     closing: bool = False
     app_specs: list = field(default_factory=list)  # enabled apps, for the toolbar
     places_file: Path | None = None  # seeded KDE Places (vault under its label)
-    volume_label: str = "Vault"      # joined labels for the window title
+    volume_label: str = "Volume"      # joined labels for the window title
     volumes: list = field(default_factory=list)  # per-volume labels (per-vol close)
     exchange: str | None = None      # idmapped host<->vault shared dir -> /exchange
 
 
 # ------------------------------------------------------------- protocol ----
 #
-# One line of JSON per request, one per reply. Status/lifecycle only — no launch
+# One line of JSON per request, one per reply. Status/lifecycle only: no launch
 # or file transfer (this socket is human-owned; any same-uid process can reach it).
 #   {"cmd": "ping"}                       -> {"ok": true, "uid": <vault uid>, ...}
 #   {"cmd": "list"}                       -> {"ok": true, "apps": [{"pid","app"}]}
 #   {"cmd": "close"}                      -> {"ok": true}
+#   {"cmd": "set-apps", "apps": [...]}    -> {"ok": true}   (replace enabled list)
 
 def _handle_request(state: _LeaderState, req: dict) -> dict:
     if not isinstance(req, dict):
@@ -109,22 +111,53 @@ def _handle_request(state: _LeaderState, req: dict) -> dict:
         state.closing = True
         return {"ok": True}
 
+    if cmd == "set-apps":
+        # Replace the enabled-app list live (Configure apps saved mid-session).
+        # This is UX data with the same trust as config.toml, its source: both
+        # are writable by the human uid, and the list only defines what a REAL
+        # compositor menu click will launch (by index, over the veracage-owned
+        # app socket). A peer here still cannot CAUSE a launch or read vault
+        # data, so the pen-test property (no exec/import/export) holds.
+        #
+        # Defence in depth against a same-uid confused-deputy that swaps the
+        # list before a click: every `exec` must be a bare command (no
+        # whitespace, no shell metacharacters, no control chars). bwrap already
+        # runs it as a SINGLE argv element under `--` (no shell, see
+        # test_bwrap_runs_exec_as_single_argv), so a swapped entry can at most
+        # launch an installed `/usr` binary bare, never inject args or a shell.
+        apps = req.get("apps")
+        if not isinstance(apps, list) or len(apps) > 64:
+            return {"ok": False, "error": "apps must be a list of at most 64 entries"}
+        specs = []
+        for a in apps:
+            exe = a.get("exec") if isinstance(a, dict) else None
+            if not isinstance(exe, str) or not _exec_ok(exe):
+                return {"ok": False, "error": "each app needs a bare exec command"}
+            name = a.get("name")
+            if name is not None and (not isinstance(name, str) or len(name) > 128):
+                return {"ok": False, "error": "bad app name"}
+            specs.append({"name": name or exe, "exec": exe})
+        state.app_specs = specs
+        _write_apps_file(state)
+        return {"ok": True}
+
     # There is deliberately NO exec / import / export / outbox here. The control
     # socket is human-owned, so ANY process running as the human uid can connect
     # to it. If it could make the leader run a command in the vault (exec) or
     # hand vault files back out (export), a same-uid attacker would have a full
-    # vault-exfiltration primitive (it did — see the pen test). Launching happens
+    # vault-exfiltration primitive (it did, see the pen test). Launching happens
     # only over the veracage-owned app socket, by index into the human's own
     # enabled list (`_accept_app_launch`), which other uids cannot reach.
     return {"ok": False, "error": f"unknown cmd: {cmd}"}
 
 
 def _launch_app(state: _LeaderState, spec) -> dict:
-    """Launch the command in `spec` (an {exec, args, name} dict) in bwrap against
-    the compositor; track its pid. `spec` only ever comes from the leader's OWN
-    enabled list — `first_app` (set at open) or `state.app_specs[idx]` on a
-    toolbar click — never from a control-socket peer, so a same-uid caller can't
-    make it run an arbitrary command. bwrap is what confines whatever does run."""
+    """Launch the command in `spec` (an {exec, name} dict; a legacy 'args' key is
+    ignored) in bwrap against the compositor; track its pid. `spec` only ever
+    comes from the leader's OWN enabled list, `first_app` (set at open) or
+    `state.app_specs[idx]` on a toolbar click, never from a control-socket peer,
+    so a same-uid caller can't make it run an arbitrary command. bwrap is what
+    confines whatever does run."""
     if state.wl_socket is None:
         return {"ok": False, "error": "compositor not ready"}
     if not isinstance(spec, dict):
@@ -132,13 +165,10 @@ def _launch_app(state: _LeaderState, spec) -> dict:
     command = spec.get("exec")
     if not isinstance(command, str) or not command:
         return {"ok": False, "error": "app spec needs a non-empty 'exec'"}
-    args = spec.get("args", [])
-    if not isinstance(args, list):
-        return {"ok": False, "error": "app 'args' must be a list"}
     name_val = spec.get("name")
     label = name_val if isinstance(name_val, str) else command
 
-    app = App(key=label, name=label, exec=command, args=[str(a) for a in args])
+    app = App(key=label, name=label, exec=command)
     # Open the seeded Places file and hand bwrap its fd: `--file` writes a
     # WRITABLE copy into the sandbox tmpfs (Dolphin rewrites it on startup, so a
     # read-only bind would error). None if there's no seed.
@@ -149,15 +179,15 @@ def _launch_app(state: _LeaderState, spec) -> dict:
         except OSError:
             places_fd = None
     try:
-        # Bind the whole workspace (/vaults tree), not one volume — the app sees
-        # every volume open at launch time (docs/shared-workspace-redesign.md).
+        # Bind the whole workspace (/vaults tree), not one volume: the app sees
+        # every volume open at launch time (docs/shared-workspace.md).
         argv = bwrap_command(str(WORKSPACE), app, state.wl_socket, state.gpu,
                              places_fd, state.exchange)
         # Detach the app's stdio. Inheriting the leader's stdin/out/err hands a
         # chatty viewer the session's terminal/journal: Qt/KF apps print the paths
         # of files they open on stderr, which would persist unencrypted in the
         # user journal, readable by any same-uid process after the vault closes
-        # (an accidental-leak channel in the threat model) — and hands the app an
+        # (an accidental-leak channel in the threat model), and hands the app an
         # fd to the human's pty. Nothing vault-side needs the app's stdio.
         proc = subprocess.Popen(
             argv,
@@ -232,8 +262,8 @@ def _control_fd() -> int:
 # expose a SECOND, veracage-owned socket under /run/veracage/rt and advertise the
 # enabled app names in a sibling `.apps` file the compositor reads. A toolbar
 # click sends a bare app index and we launch that app. Only the veracage uid can
-# reach the socket, and a launch only runs an app the human already enabled —
-# nothing here widens what the human (or the vault) can already do.
+# reach the socket, and a launch only runs an app the human already enabled.
+# Nothing here widens what the human (or the vault) can already do.
 
 def _session_id(state: _LeaderState) -> str:
     return Path(state.mountpoint).name
@@ -287,10 +317,12 @@ def _write_apps_file(state: _LeaderState) -> None:
     )
     # Format the compositor parses (see scan_leaders in toolbar.rs):
     #   <sock>\n<title>\n<vol1>\t<vol2>…\n<opener>\n<name>\n<name>…
-    # The volumes line (tab-separated) drives the per-volume Close menu.
-    volumes = "\t".join(state.volumes)
-    body = [_app_socket_path(state).name, state.volume_label or "Vault",
-            volumes, str(opener), *names]
+    # The volumes line (tab-separated) drives the per-volume Close menu. Sanitize
+    # the title AND every volume label (not just app names): a label with an
+    # embedded newline/tab would desync the newline- and tab-delimited protocol.
+    title = _sanitize_label(state.volume_label or "Volume")
+    volumes = "\t".join(_sanitize_label(v) for v in state.volumes)
+    body = [_app_socket_path(state).name, title, volumes, str(opener), *names]
     _apps_file_path(state).write_text("\n".join(body) + "\n")
 
 
@@ -324,22 +356,43 @@ def _accept_app_launch(app_srv: socket.socket, state: _LeaderState) -> None:
 def _sanitize_label(raw: str) -> str:
     """A safe volume label: no newlines (they'd desync the newline-delimited
     `.apps` protocol) and no control chars (they'd break the KDE XBEL / window
-    title); length-capped. Falls back to 'Vault' if nothing printable remains.
+    title), length-capped. Falls back to 'Volume' if nothing printable remains.
     Defends against a crafted filesystem label on an attacker-supplied volume."""
     cleaned = "".join(c if c.isprintable() else " " for c in raw).strip()
-    return cleaned[:64] or "Vault"
+    return cleaned[:64] or "Volume"
+
+
+# Characters that must not appear in an app `exec`: whitespace + shell
+# metacharacters. bwrap runs exec as a single argv element (no shell), so these
+# can't be interpreted, but rejecting them keeps a same-uid `set-apps` from
+# swapping a menu entry to anything but a bare command.
+_EXEC_META = set(" \t\n\r\f\v;|&$<>`'\"\\(){}[]*?!#~")
+
+
+def _exec_ok(exe: str) -> bool:
+    """True if `exe` is a plausible bare command / path: non-empty, length-
+    capped, no whitespace, shell metacharacters, or control characters."""
+    return (
+        bool(exe)
+        and len(exe) <= 512
+        and not any(c in _EXEC_META or ord(c) < 0x20 for c in exe)
+    )
 
 
 def _bookmark(href: str, title: str, icon: str, ident: str) -> str:
+    # Escape EVERY interpolated value (attributes with quoteattr, text with
+    # escape), so the seed stays well-formed XBEL regardless of what a volume
+    # label contains. Labels are already charset-restricted by the helper, but
+    # don't rely on that external rule to keep the XML safe.
     return (
-        f' <bookmark href="{href}">\n'
+        f' <bookmark href={quoteattr(href)}>\n'
         f'  <title>{html.escape(title)}</title>\n'
         '  <info>\n'
         '   <metadata owner="http://freedesktop.org">\n'
-        f'    <bookmark:icon name="{icon}"/>\n'
+        f'    <bookmark:icon name={quoteattr(icon)}/>\n'
         '   </metadata>\n'
         '   <metadata owner="http://www.kde.org">\n'
-        f'    <ID>{ident}</ID>\n'
+        f'    <ID>{html.escape(ident)}</ID>\n'
         '    <isSystemItem>false</isSystemItem>\n'
         '   </metadata>\n'
         '  </info>\n'
@@ -354,11 +407,11 @@ def _places_xbel(labels: list[str], with_exchange: bool) -> str:
     body = "".join(
         _bookmark(f"file:///vaults/{lbl}", lbl, "drive-harddisk-encrypted",
                   f"veracage-vault-{lbl}")
-        for lbl in (labels or ["Vault"])
+        for lbl in (labels or ["Volume"])
     )
     if with_exchange:
-        # The shared host<->vault folder, mounted at /exchange in the sandbox.
-        body += _bookmark("file:///exchange", "Exchange (host-shared)",
+        # The shared host<->vault directory, mounted at /exchange in the sandbox.
+        body += _bookmark("file:///exchange", "Shared directory",
                           "folder-publicshare", "veracage-exchange")
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -393,8 +446,8 @@ def run_leader(mountpoint: str, gpu: bool, app_specs: list, first_app: dict | No
     separately by the helper), publishes `app_specs` to the compositor toolbar,
     optionally launches `first_app`, then serves the control socket
     (ping/list/close) and the toolbar app socket until 'close', a signal, or
-    the compositor going away. The leader does NOT own the compositor — it
-    survives every app opening and closing — but when the compositor itself exits
+    the compositor going away. The leader does NOT own the compositor (it
+    survives every app opening and closing) but when the compositor itself exits
     (the user closed the vault window) the leader exits too, so the session tears
     down cleanly (unit stop → ExecStopPost → dm close + unmount) instead of
     leaving the vault mounted and blocking the next open.
@@ -406,20 +459,20 @@ def run_leader(mountpoint: str, gpu: bool, app_specs: list, first_app: dict | No
     state = _LeaderState(mountpoint=mountpoint, gpu=gpu, app_specs=app_specs or [])
 
     # The shared compositor must already be up (cli.py brings it up before the
-    # mount). We only observe its socket — we never spawn it.
+    # mount). We only observe its socket. We never spawn it.
     if not COMPOSITOR_SOCKET.exists():
-        print(f"veracage: compositor socket {COMPOSITOR_SOCKET} not found; "
-              "the persistent compositor is not running.", file=sys.stderr)
+        print(f"veracage: compositor socket {COMPOSITOR_SOCKET} not found. "
+              "The persistent compositor is not running.", file=sys.stderr)
         return 1
     state.wl_socket = COMPOSITOR_SOCKET
 
-    # The open volumes (there may be several — subsequent opens setns more into the
+    # The open volumes (there may be several: subsequent opens setns more into the
     # workspace). Their labels drive the window title + the Places entries; the
     # sandbox binds the whole /vaults tree so one app sees them all.
     state.exchange = os.environ.get("VERACAGE_EXCHANGE") or None
     labels = scan_volumes()
     state.volumes = labels
-    state.volume_label = ", ".join(labels) if labels else "Vault"
+    state.volume_label = ", ".join(labels) if labels else "Volume"
     state.places_file = _write_places_file(labels, state.exchange is not None)
 
     stop = threading.Event()
@@ -447,7 +500,7 @@ def run_leader(mountpoint: str, gpu: bool, app_specs: list, first_app: dict | No
         # Tie our lifetime to the compositor's: once it has been seen up, its
         # disappearance (the user closed the vault window → the compositor exits)
         # means the session is over. Exiting here lets the systemd unit stop and
-        # its ExecStopPost cleanup close the dm device + unmount — otherwise the
+        # its ExecStopPost cleanup close the dm device + unmount. Otherwise the
         # leader would keep the vault mounted forever and block the next open.
         comp_seen = False
         seen_labels = labels
@@ -457,26 +510,26 @@ def run_leader(mountpoint: str, gpu: bool, app_specs: list, first_app: dict | No
                 if state.closing:
                     break
                 # Pick up volumes added to the workspace (subsequent opens setns
-                # more in): refresh Places (for the NEXT app launch — a running
+                # more in): refresh Places (for the NEXT app launch: a running
                 # app's mount NS is fixed) and the compositor title.
                 cur = scan_volumes()
                 if cur != seen_labels:
                     seen_labels = cur
                     state.volumes = cur
-                    state.volume_label = ", ".join(cur) if cur else "Vault"
+                    state.volume_label = ", ".join(cur) if cur else "Volume"
                     state.places_file = _write_places_file(cur, state.exchange is not None)
                     _write_apps_file(state)
                 if compositor_is_up():
                     comp_seen = True
                 elif comp_seen:
-                    print("veracage: compositor gone (window closed) — "
+                    print("veracage: compositor gone (window closed) - "
                           "unmounting and exiting.", file=sys.stderr)
                     break
                 for key, _ in sel.select(timeout=1.0):
                     # A transient accept() error (ECONNABORTED/EAGAIN from a peer
                     # that aborts a queued connection) or an unexpected launch
                     # failure must NOT unwind into the finally and SIGKILL every
-                    # running app — log and keep serving.
+                    # running app: log and keep serving.
                     try:
                         if key.fileobj is srv:
                             _accept_one(srv, state)
@@ -519,7 +572,7 @@ def _terminate_children(state: _LeaderState, timeout: float = 3.0) -> None:
 # ------------------------------------- human-side control client (cli.py) --
 
 def session_socket_path(vault: str) -> Path:
-    """Path of the control socket for `vault` — the same location the helper
+    """Path of the control socket for `vault`: the same location the helper
     creates it (sha256(canonical path)[:16]). The caller must pass the resolved
     vault path so the hash matches the helper's."""
     import hashlib

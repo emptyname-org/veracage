@@ -4,7 +4,7 @@ use smithay::{
         KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
     },
     input::{
-        keyboard::{FilterResult, Keysym},
+        keyboard::FilterResult,
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
@@ -28,22 +28,19 @@ impl State {
                     serial,
                     time,
                     move |state, modifiers, keysym| {
-                        // Compositor clipboard shortcuts — also the backend the
-                        // toolbar buttons call: Ctrl+Alt+V = push host->sandbox,
-                        // Ctrl+Alt+C = pull sandbox->host. (Not Ctrl+V/Ctrl+C —
-                        // those are the apps' own paste/copy. Match both letter
-                        // cases: without Shift the keysym is lowercase.)
-                        if pressed && modifiers.ctrl && modifiers.alt {
-                            match keysym.modified_sym() {
-                                Keysym::v | Keysym::V => {
-                                    crate::clipboard::push_from_host(state);
-                                    return FilterResult::Intercept(());
-                                }
-                                Keysym::c | Keysym::C => {
-                                    crate::clipboard::pull_to_host(state);
-                                    return FilterResult::Intercept(());
-                                }
-                                _ => {}
+                        // Veracage clipboard shortcuts, user-configurable (defaults
+                        // Ctrl+Alt+C = Copy out sandbox->host, Ctrl+Alt+V = Paste in
+                        // host->sandbox). NOT plain Ctrl+C/V. Those are the apps'
+                        // own copy/paste. Read live from state.binds.
+                        if pressed {
+                            let sym = keysym.modified_sym();
+                            if state.binds.copy_out.as_ref().is_some_and(|b| b.matches(&modifiers, sym)) {
+                                crate::clipboard::pull_to_host(state);
+                                return FilterResult::Intercept(());
+                            }
+                            if state.binds.paste_in.as_ref().is_some_and(|b| b.matches(&modifiers, sym)) {
+                                crate::clipboard::push_from_host(state);
+                                return FilterResult::Intercept(());
                             }
                         }
                         FilterResult::Forward
@@ -60,7 +57,7 @@ impl State {
 
                 // Toolbar first, UNLESS a pointer grab is active (an interactive
                 // move/resize, or a button held on a sandbox window): during a grab
-                // every event must reach smithay so the release ends it — else the
+                // every event must reach smithay so the release ends it, else the
                 // grab sticks and the window stays glued to the cursor.
                 let grabbed = self.seat.get_pointer().map(|p| p.is_grabbed()).unwrap_or(false);
                 if !grabbed {
@@ -92,7 +89,7 @@ impl State {
                 pointer.frame(self);
             }
             InputEvent::PointerButton { event, .. } => {
-                // Toolbar click gating — but NOT while a pointer grab is active
+                // Toolbar click gating, but NOT while a pointer grab is active
                 // (see the motion arm): a release that ends a grab must reach
                 // smithay even if the pointer wandered into the strip. Gate on
                 // egui's OWN tracked pointer, not smithay's (motion over the strip

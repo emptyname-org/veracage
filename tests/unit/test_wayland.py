@@ -1,4 +1,4 @@
-"""Liveness of the ONE persistent compositor — pidfile read, up/down logic, wait.
+"""Liveness of the ONE persistent compositor: pidfile read, up/down logic, wait.
 
 The per-vault `nested_compositor` spawn is gone (Phase 2): the compositor is
 brought up by the privileged helper on a fixed socket, and this module only
@@ -101,7 +101,7 @@ def test_pid_alive_false_for_absent():
 
 
 def test_pid_alive_false_for_zombie():
-    """A defunct compositor keeps a /proc entry in state Z until reaped — it must
+    """A defunct compositor keeps a /proc entry in state Z until reaped. It must
     read as *down* so the leader tears the session down (the window-close bug)."""
     pid = os.fork()
     if pid == 0:  # child: exit immediately, become a zombie (parent won't reap yet)

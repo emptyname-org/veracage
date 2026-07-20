@@ -9,12 +9,13 @@ from veracage import apps
 
 
 def test_app_has_expected_fields():
-    a = apps.App(key="kate", name="Kate", exec="kate", args=["/vault"])
-    assert (a.key, a.name, a.exec, a.args) == ("kate", "Kate", "kate", ["/vault"])
+    a = apps.App(key="kate", name="Kate", exec="kate")
+    assert (a.key, a.name, a.exec) == ("kate", "Kate", "kate")
 
 
-def test_app_args_default_empty():
-    assert apps.App(key="x", name="X", exec="x").args == []
+def test_app_has_no_args_field():
+    """The launch-dir args feature was removed; apps always launch bare."""
+    assert not hasattr(apps.App(key="x", name="X", exec="x"), "args")
 
 
 def test_app_is_frozen():
@@ -24,6 +25,6 @@ def test_app_is_frozen():
 
 
 def test_no_catalog_symbols():
-    """The hardcoded whitelist is gone — nothing should reintroduce it silently."""
+    """The hardcoded whitelist is gone. Nothing should reintroduce it silently."""
     for gone in ("KNOWN_APPS", "detected", "CATEGORY_LABELS", "CATEGORY_ORDER"):
         assert not hasattr(apps, gone)

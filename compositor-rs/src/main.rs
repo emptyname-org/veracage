@@ -1,4 +1,4 @@
-//! Veracage nested compositor — fixed-function. Seeded from smithay's `smallvil`
+//! Veracage nested compositor, fixed-function. Seeded from smithay's `smallvil`
 //! reference; grown with a leader-only clipboard channel. Renders the sandbox
 //! apps into one window on the host (nested via the inherited WAYLAND_SOCKET fd),
 //! exposes NO `data-control` global (the host clipboard bridge is a private
@@ -6,9 +6,14 @@
 #![allow(irrefutable_let_patterns)]
 
 mod clipboard;
+mod clipio;
+mod fonts;
 mod grabs;
+mod hostclip;
 mod handlers;
 mod input;
+mod mono_icons;
+mod shortcuts;
 mod state;
 mod toolbar;
 mod winit;
@@ -21,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --socket <name>  the wayland socket name apps connect to (the leader picks
     //                  it, like `weston --socket=`, so it knows it). The clipboard
-    //                  is owned in-process now (clipboard.rs) — no clip socket.
+    //                  is owned in-process now (clipboard.rs), no clip socket.
     let mut socket: Option<String> = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -39,8 +44,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The host clipboard bridge is set up inside init_winit (needs the backend).
     crate::winit::init_winit(&mut event_loop, &mut state)?;
 
+    // Route SIGTERM/SIGINT to a clean loop stop so the clear-on-exit below runs
+    // when the leader tears the session down, not only on menu Quit / window close.
+    crate::state::install_exit_signals(&event_loop);
+
     event_loop.run(None, &mut state, move |_| {})?;
+
+    // Clear any sensitive text still on the host clipboard before we exit
+    // (KeePassXC-style clear-on-quit). No-op if nothing was pushed.
+    if let Some(hc) = &state.host_clipboard {
+        hc.clear_on_exit();
+    }
     Ok(())
+}
+
+/// Append a debug line to `/run/veracage/rt/compositor.log` (0644, so the human
+/// uid can read it through the 0711 rt dir). The compositor's stdio is swallowed
+/// by pkexec/privilege-drop, so the journal never sees its tracing - this is the
+/// reliable channel for live debugging. Kept for ad-hoc instrumentation.
+#[allow(dead_code)]
+pub fn vcdebug(msg: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let path = "/run/veracage/rt/compositor.log";
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
+        let _ = writeln!(f, "{msg}");
+    }
 }
 
 fn init_logging() {

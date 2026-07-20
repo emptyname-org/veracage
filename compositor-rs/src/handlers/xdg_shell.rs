@@ -39,7 +39,7 @@ impl XdgShellHandler for State {
 
         // Advertise output bounds so KDE dialogs size themselves sanely, and
         // cascade placement (deterministic, no `rand`) so a new window/dialog
-        // doesn't land exactly on top of the previous one — smallvil mapped
+        // doesn't land exactly on top of the previous one. Smallvil mapped
         // everything at (0,0).
         let output_geo = self
             .space
@@ -48,7 +48,7 @@ impl XdgShellHandler for State {
             .and_then(|o| self.space.output_geometry(o));
 
         // Reserve the toolbar strip. A main app window opens LARGE but NOT
-        // maximized — ~85% of the work area, centered — so it's comfortably big
+        // maximized (~85% of the work area, centered), so it's comfortably big
         // yet still a floating window (its own shadow reads naturally on the
         // backdrop, no maximized edge-to-edge fill). Transient toplevels (dialogs)
         // keep their own size and just cascade.
@@ -94,7 +94,7 @@ impl XdgShellHandler for State {
         // a co-hosted (possibly hostile) app map a toplevel mid-keystroke and
         // capture input meant for the app the user is actually typing into. Don't
         // steal focus from an existing surface; also never fight a grab (open
-        // popup/menu — A1). A launched app the user wasn't typing in still gets
+        // popup/menu, A1). A launched app the user wasn't typing in still gets
         // focus (nothing was focused); one that pops up while you type does not.
         if let Some(keyboard) = self.seat.get_keyboard() {
             if !keyboard.is_grabbed() && keyboard.current_focus().is_none() {
@@ -131,7 +131,7 @@ impl XdgShellHandler for State {
             return;
         };
         // A client can request a move for a surface we no longer track (just
-        // unmapped, or never mapped). Ignore it — never panic the compositor.
+        // unmapped, or never mapped). Ignore it. Never panic the compositor.
         let Some(window) = self.window_for_surface(wl_surface) else {
             return;
         };
@@ -191,7 +191,7 @@ impl XdgShellHandler for State {
         // an explicit grab and won't dismiss on click-outside. Cribbed from
         // anvil/src/shell/xdg.rs:380, simplified: our seat focus IS `WlSurface`
         // (and `From<PopupKind> for WlSurface` exists), so the popup root is just
-        // the surface — no `KeyboardFocusTarget` enum or layer-shell fallback.
+        // the surface: no `KeyboardFocusTarget` enum or layer-shell fallback.
         let Some(seat) = Seat::<State>::from_resource(&seat) else {
             return;
         };
@@ -227,7 +227,7 @@ impl XdgShellHandler for State {
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        // Single nested output — "maximize" = fill it. Without this handler the
+        // Single nested output, "maximize" = fill it. Without this handler the
         // Breeze titlebar's maximize button hits the no-op default and does nothing.
         let Some(window) = self.window_for_surface(surface.wl_surface()) else {
             return;
@@ -315,9 +315,12 @@ pub fn handle_commit(popups: &mut PopupManager, space: &Space<Window>, surface: 
         match popup {
             PopupKind::Xdg(ref xdg) => {
                 if !xdg.is_initial_configure_sent() {
-                    // NOTE: This should never fail as the initial configure is always
-                    // allowed.
-                    xdg.send_configure().expect("initial configure failed");
+                    // The initial configure is always allowed, so this shouldn't
+                    // fail - but don't panic the whole compositor (every volume's
+                    // apps) on a client-driven surface if it somehow does.
+                    if let Err(e) = xdg.send_configure() {
+                        tracing::warn!("popup initial configure failed: {e}");
+                    }
                 }
             }
             PopupKind::InputMethod(ref _input_method) => {}

@@ -1,4 +1,4 @@
-//! Idmapped-mount primitive — the heart of the UID-isolation core.
+//! Idmapped-mount primitive: the heart of the UID-isolation core.
 //!
 //! Presents an already-mounted filesystem at `target` as owned by the vault
 //! uid/gid, WITHOUT touching the data. Validated recipe (docs/uid-isolation.md,
@@ -25,7 +25,7 @@ const AT_RECURSIVE: libc::c_long = 0x8000;
 const MOVE_MOUNT_F_EMPTY_PATH: libc::c_long = 4;
 const MOUNT_ATTR_IDMAP: u64 = 0x0010_0000;
 
-/// `nosuid,nodev,noexec` as a `mount_setattr` attr_set — pass as `extra_attr` for
+/// `nosuid,nodev,noexec` as a `mount_setattr` attr_set, pass as `extra_attr` for
 /// the exchange folder (a host-shared dir the sandbox can write, so it must never
 /// carry setuid/device/executable semantics). The vault passes `0`.
 pub const ATTR_NOSUID_NODEV_NOEXEC: u64 = 0x2 | 0x4 | 0x8;
@@ -44,7 +44,7 @@ fn oserr(ctx: &str) -> io::Error {
 
 /// Create a transient user namespace mapping `inside = on-disk owner`,
 /// `outside = vault id` (one uid + one gid). Returns the held `/proc/.../ns/user`
-/// file — keep it alive until after `mount_setattr` consumes it.
+/// file. Keep it alive until after `mount_setattr` consumes it.
 fn make_userns(on_disk_uid: u32, vault_uid: u32, on_disk_gid: u32, vault_gid: u32) -> io::Result<File> {
     let mut sig = [0 as libc::c_int; 2];
     let mut hold = [0 as libc::c_int; 2];

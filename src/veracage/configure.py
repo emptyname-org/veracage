@@ -1,10 +1,10 @@
-"""`veracage configure` — manage the enabled app list.
+"""`veracage configure` - manage the enabled app list.
 
 There is no catalog / whitelist: you enable ANY installed binary. It is launched
-in the sandbox against the vault (bwrap-confined — no host filesystem, no
-network), so which binary it is doesn't widen what the vault can do.
+in the sandbox against the volume (bwrap-confined - no host filesystem, no
+network), so which binary it is doesn't widen what the volume can do.
 
-  veracage configure --add kate --arg /vaults   # enable `kate /vaults`
+  veracage configure --add kate                # enable kate
   veracage configure --add /opt/foo/bin/foo    # enable an arbitrary binary
   veracage configure --remove kate             # disable it
   veracage configure --list                    # show enabled apps
@@ -44,14 +44,18 @@ def _add(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
     cfg = config.load()
-    # Re-adding the same binary updates its entry rather than duplicating it.
-    existing = next((k for k, a in cfg.apps.items() if a.exec == args.add), None)
+    # Re-adding the same binary (by basename, so `dolphin` matches
+    # `/usr/bin/dolphin`) updates its entry rather than duplicating it.
+    base = Path(args.add).name
+    existing = next((k for k, a in cfg.apps.items()
+                     if Path(a.exec).name == base), None)
     key = args.key or existing or _key_for(args.add, set(cfg.apps))
-    name = args.name or Path(args.add).name
-    cfg.apps = {**cfg.apps, key: App(key=key, name=name, exec=args.add,
-                                     args=list(args.arg or []))}
+    apps = {k: a for k, a in cfg.apps.items() if k != existing}
+    name = args.name or base[:1].upper() + base[1:]
+    cfg.apps = {**apps, key: App(key=key, name=name, exec=args.add)}
     p = config.save(cfg)
-    print(f"veracage: enabled '{name}' ({args.add}) as [{key}] → {p}")
+    config.publish_apps(cfg)
+    print(f"veracage: enabled '{name}' ({args.add}) as [{key}] -> {p}")
     return 0
 
 
@@ -63,6 +67,7 @@ def _remove(args: argparse.Namespace) -> int:
         return 2
     cfg.apps = {k: a for k, a in cfg.apps.items() if k != args.remove}
     config.save(cfg)
+    config.publish_apps(cfg)
     print(f"veracage: removed '{args.remove}'.")
     return 0
 
@@ -75,8 +80,7 @@ def _list(_args: argparse.Namespace) -> int:
     print(f"{len(cfg.apps)} app(s) enabled:")
     for key, a in cfg.apps.items():
         missing = "" if _resolve(a.exec) else "  (not installed)"
-        argstr = (" " + " ".join(a.args)) if a.args else ""
-        print(f"  {key:<16} {a.exec}{argstr}{missing}")
+        print(f"  {key:<16} {a.exec}{missing}")
     return 0
 
 
@@ -109,7 +113,5 @@ def add_subparser(sub: argparse._SubParsersAction) -> None:
     g.add_argument("--remove", metavar="KEY", help="disable an app by its key")
     g.add_argument("--list", action="store_true", help="list enabled apps")
     p.add_argument("--name", help="display name for --add (default: the binary name)")
-    p.add_argument("--arg", action="append", metavar="ARG",
-                   help="argument to pass the app (repeatable), e.g. --arg /vaults")
     p.add_argument("--key", help="explicit config key for --add")
     p.set_defaults(func=main)

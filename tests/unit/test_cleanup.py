@@ -1,4 +1,4 @@
-"""Cleanup module — lock file handling, dm device validation, idempotency."""
+"""Cleanup module: lock file handling, dm device validation, idempotency."""
 from __future__ import annotations
 
 import hashlib
@@ -168,6 +168,20 @@ def test_cleanup_one_refuses_wrong_owner(tmp_path, monkeypatch):
     assert p.exists()              # lock left intact
 
 
+def test_cleanup_one_refuses_headerless_lock_when_pkexec_caller(tmp_path, monkeypatch):
+    """Fail CLOSED: a lock with no recorded owner must be refused when pkexec
+    vouches for a caller (the owner can't be verified). The mount helper always
+    writes the user_uid header, so an owner-less lock is corrupt or forged."""
+    monkeypatch.setenv("PKEXEC_UID", "1000")
+    p = _lock(tmp_path, dm_name="veracage-abc123def456",
+              mountpoint="/run/veracage/xyz", user_uid="")   # no owner header
+    with mock.patch("veracage.cleanup.subprocess.run") as r:
+        rc = cleanup.cleanup_one(p)
+    assert rc == 2
+    r.assert_not_called()
+    assert p.exists()
+
+
 def test_cleanup_one_allows_matching_owner(tmp_path, monkeypatch):
     monkeypatch.setenv("PKEXEC_UID", "1000")
     p = _lock(tmp_path, dm_name="veracage-abc123def456", user_uid="1000")
@@ -179,7 +193,7 @@ def test_cleanup_one_allows_matching_owner(tmp_path, monkeypatch):
 
 
 def test_cleanup_one_keeps_scratch_and_lock_on_failed_close(tmp_path, monkeypatch):
-    """A failed (EBUSY) close means the session is still LIVE — its scratch dir /
+    """A failed (EBUSY) close means the session is still LIVE: its scratch dir /
     socket must NOT be torn down, and the lock stays as a recovery trail."""
     monkeypatch.delenv("PKEXEC_UID", raising=False)
     mp = tmp_path / "orphan"
@@ -296,9 +310,24 @@ def test_cleanup_session_closes_every_dm(tmp_path, monkeypatch):
     assert not p.exists()   # lock dropped once all closed
 
 
+def test_cleanup_session_refuses_wrong_or_missing_owner(tmp_path, monkeypatch):
+    """cleanup_session is fail-CLOSED like cleanup_one: a pkexec caller that
+    isn't the recorded owner (including a header-less lock) is refused before
+    any device is touched."""
+    monkeypatch.setenv("PKEXEC_UID", "1001")
+    for uid in ("1000", ""):   # wrong owner, then header-less
+        p = _session_lock(tmp_path, "d" * 16,
+                          [("veracage-abc123abc123", "A")], user_uid=uid)
+        with mock.patch("veracage.cleanup.subprocess.run") as r:
+            rc = cleanup.cleanup_session(p)
+        assert rc == 2
+        r.assert_not_called()
+        assert p.exists()
+
+
 def test_remove_stale_session_sockets_sweeps_the_dir(tmp_path, monkeypatch):
     """Regression: the control socket is keyed by the bootstrap VAULT's hash, not
-    the session id — cleanup once unlinked a 'session-<sid>.sock' that never
+    the session id. Cleanup once unlinked a 'session-<sid>.sock' that never
     existed and left the real stale socket behind."""
     import socket as socket_mod
     base = tmp_path.resolve()

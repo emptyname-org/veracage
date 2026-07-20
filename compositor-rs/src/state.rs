@@ -78,24 +78,48 @@ pub struct State {
 
     /// Host clipboard bridge (compositor's own winit->host connection). Set in
     /// `init_winit` once the backend exists; None if the host isn't Wayland.
-    pub host_clipboard: Option<crate::clipboard::HostClipboard>,
+    pub host_clipboard: Option<crate::hostclip::HostClipboard>,
 
     /// In-window egui toolbar (Phase 3). Built lazily on the first Redraw (needs
     /// the GL context current); `toolbar_failed` latches a construction failure so
-    /// we don't retry every frame — the compositor then just runs with no toolbar.
+    /// we don't retry every frame. The compositor then just runs with no toolbar.
     pub toolbar: Option<crate::toolbar::Toolbar>,
     pub toolbar_failed: bool,
 
     /// Toolbar launcher list, refreshed (throttled) from the leaders' `.apps`
-    /// files so app buttons appear/disappear as vaults open and close.
+    /// files so app buttons appear/disappear as volumes open and close.
     pub leaders: Vec<crate::toolbar::LeaderApps>,
     pub leaders_scan_at: std::time::Duration,
 
+    /// The human-published configured apps (`/run/veracage/pub/config.apps`),
+    /// listed in the Apps menu when no volume is mounted.
+    pub cfg_apps: Vec<crate::toolbar::ConfigApp>,
+
+    /// The window size last applied from `/run/veracage/pub/window.size`, so a
+    /// Settings change resizes the live window (initialized to the startup env
+    /// value, so the first matching scan is a no-op).
+    pub window_size_applied: String,
+
+    /// Active Veracage keyboard shortcuts (clipboard transfers), refreshed from
+    /// `/run/veracage/pub/shortcuts` on the ~1s scan.
+    pub binds: crate::shortcuts::Binds,
+
+    /// The host-clipboard auto-clear policy (enabled, timeout secs) last pushed
+    /// to the clipboard worker, so the ~1s scan only sends it on a change.
+    /// Initialized to the worker's own secure default (enabled, 30s).
+    pub clip_clear_applied: (bool, u32),
+
     /// The current drag-and-drop icon surface (the "ghost" that follows the
     /// cursor during a DnD), set when a client starts a drag and cleared on drop.
-    /// Composited at the pointer each frame — without it a drag has no visual
+    /// Composited at the pointer each frame: without it a drag has no visual
     /// feedback even though the drop itself works.
     pub dnd_icon: Option<DndIcon>,
+
+    /// The "No volume mounted" hint icon as a smithay memory buffer, drawn
+    /// directly by the renderer, bypasses the egui_glow texture path (whose
+    /// sRGB handling fringes a transparent-edged icon), so it renders cleanly
+    /// like the app windows and backdrop.
+    pub hint_icon: Option<smithay::backend::renderer::element::memory::MemoryRenderBuffer>,
 }
 
 /// A drag-and-drop icon: the client's icon surface plus the offset from the
@@ -200,8 +224,14 @@ impl State {
             toolbar: None,
             toolbar_failed: false,
             dnd_icon: None,
+            hint_icon: build_hint_icon(),
             leaders: Vec::new(),
             leaders_scan_at: std::time::Duration::ZERO,
+            cfg_apps: Vec::new(),
+            window_size_applied: std::env::var("VERACAGE_WINDOW_SIZE")
+                .unwrap_or_else(|_| "default".into()),
+            binds: crate::shortcuts::Binds::default(),
+            clip_clear_applied: crate::hostclip::DEFAULT_CLEAR_POLICY,
         }
     }
 
@@ -227,7 +257,7 @@ impl State {
                 // Only accept connections from our OWN (veracage) uid. The socket
                 // is 0700 via the helper's umask, but check the peer explicitly so
                 // sandbox isolation doesn't rest solely on the ambient umask being
-                // right — a future permissive-umask regression can't then silently
+                // right. A future permissive-umask regression can't then silently
                 // expose the sandbox selection/seat to another local uid.
                 let euid = unsafe { libc::geteuid() };
                 match peer_uid(client_stream.as_raw_fd()) {
@@ -252,9 +282,15 @@ impl State {
             .insert_source(
                 Generic::new(display, Interest::READ, Mode::Level),
                 |_, display, state| {
-                    // Safety: we don't drop the display
+                    // Safety: we don't drop the display. A dispatch error must
+                    // NOT unwind: this one compositor hosts every open volume's
+                    // apps, so a panic here would tear them all down. Log and
+                    // continue (per-client protocol errors are handled inside
+                    // wayland-server, so this fires only on a fatal condition).
                     unsafe {
-                        display.get_mut().dispatch_clients(state).unwrap();
+                        if let Err(e) = display.get_mut().dispatch_clients(state) {
+                            tracing::error!("wayland dispatch_clients error: {e}");
+                        }
                     }
                     Ok(PostAction::Continue)
                 },
@@ -275,7 +311,7 @@ impl State {
     /// The tracked toplevel window backing `surface`, if any. Returns `None` for
     /// a surface we don't track (unmapped, never mapped, or not a toplevel) so a
     /// client request naming a stale surface can be ignored rather than panicking
-    /// the compositor — which would tear down every sandboxed app. Folds the
+    /// the compositor, which would tear down every sandboxed app. Folds the
     /// `toplevel()` check in safely (no `.unwrap()`).
     pub fn window_for_surface(&self, surface: &WlSurface) -> Option<Window> {
         self.space
@@ -283,6 +319,90 @@ impl State {
             .find(|w| w.toplevel().map(|t| t.wl_surface() == surface).unwrap_or(false))
             .cloned()
     }
+}
+
+/// Build the smithay memory buffer for the hint icon from the embedded PNG.
+/// RGBA is premultiplied (the renderer blends premultiplied, like wayland
+/// surfaces). None if the PNG can't be decoded.
+fn build_hint_icon() -> Option<smithay::backend::renderer::element::memory::MemoryRenderBuffer> {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
+    use smithay::utils::Transform;
+    let (w, h, mut rgba) = crate::toolbar::decode_icon_rgba()?;
+    for px in rgba.chunks_exact_mut(4) {
+        let a = px[3] as u16;
+        px[0] = (px[0] as u16 * a / 255) as u8;
+        px[1] = (px[1] as u16 * a / 255) as u8;
+        px[2] = (px[2] as u16 * a / 255) as u8;
+    }
+    // RGBA byte order == DRM Abgr8888. Buffer scale = ICON_BUFFER_SCALE (the
+    // 192px art is a 96pt icon), so the element renders at 96 logical points and
+    // stays crisp on a HiDPI (scale 2) output.
+    Some(MemoryRenderBuffer::from_slice(
+        &rgba,
+        Fourcc::Abgr8888,
+        (w as i32, h as i32),
+        crate::toolbar::ICON_BUFFER_SCALE,
+        Transform::Normal,
+        None,
+    ))
+}
+
+// -------------------------------------------------------- exit signals ------
+
+/// Write end of a self-pipe the SIGTERM/SIGINT handler pokes. Stored as a raw fd
+/// so the async-signal-safe handler can reach it without allocation or locks.
+static SIG_WAKE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// async-signal-safe: just a single `write()` to the self-pipe, which wakes the
+/// event loop so its registered source can stop the loop cleanly.
+extern "C" fn on_exit_signal(_sig: libc::c_int) {
+    let fd = SIG_WAKE_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = [1u8];
+        unsafe { libc::write(fd, byte.as_ptr().cast(), 1) };
+    }
+}
+
+/// Route SIGTERM/SIGINT to a clean event-loop stop, so `event_loop.run()`
+/// returns and `main` can run the host-clipboard clear-on-exit before quitting
+/// (the leader SIGTERMs the compositor on session teardown / suspend-dismount).
+/// A self-pipe (written by the handler, read by a calloop source) keeps the
+/// signal path async-signal-safe. Best-effort: on failure we simply keep the
+/// default disposition and rely on the auto-clear timer as the backstop.
+pub fn install_exit_signals(event_loop: &EventLoop<State>) {
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return;
+    }
+    let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    // Nonblocking read end so the loop callback's drain never blocks.
+    let rfd = read_fd.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(rfd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(rfd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    // The write end must outlive every handler invocation -> leak it (process
+    // lifetime); its fd is what the handler writes to.
+    SIG_WAKE_FD.store(write_fd.into_raw_fd(), std::sync::atomic::Ordering::Relaxed);
+    let handler = on_exit_signal as extern "C" fn(libc::c_int);
+    unsafe {
+        libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handler as libc::sighandler_t);
+    }
+    let _ = event_loop.handle().insert_source(
+        Generic::new(read_fd, Interest::READ, Mode::Level),
+        |_readiness, fd, state: &mut State| {
+            let mut buf = [0u8; 8];
+            let _ = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            state.loop_signal.stop();
+            Ok(PostAction::Continue)
+        },
+    );
 }
 
 /// Data associated with a wayland client that connects to State.

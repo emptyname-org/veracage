@@ -1,4 +1,4 @@
-# Veracage — project metadata and tool config.
+# Veracage - project metadata and tool config.
 #
 # The supported install is `make install` (see Makefile): it places the
 # Python package, the Rust privilege helper, the polkit policy and the
@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "veracage"
-version = "0.4.0"
+version = "0.5.0"
 description = "VeraCrypt sandboxing wrapper: mount a vault into a private namespace and run viewer apps in a bubblewrap sandbox with explicit, user-driven host transfer."
 requires-python = ">=3.11"
 authors = [{ name = "emptyname", email = "noreply@emptyname.org" }]
@@ -20,7 +20,7 @@ keywords = ["veracrypt", "sandbox", "bubblewrap", "wayland", "security"]
 
 [project.optional-dependencies]
 # The GUI is the standalone Rust `veracage-agent` binary (see agent-rs/), not a
-# Python/Qt dependency — nothing to pip-install for the UI.
+# Python/Qt dependency - nothing to pip-install for the UI.
 dev = ["pytest", "ruff", "mypy"]
 
 [tool.setuptools]

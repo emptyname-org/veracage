@@ -23,3 +23,6 @@ target/
 
 # Credentials — NEVER commit (SSH keys, VPS access)
 /VPS-ACCESS/
+
+# Claude Code local settings (machine-specific; the rules/ dir is checked in)
+/.claude/settings.local.json

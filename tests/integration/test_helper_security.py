@@ -7,7 +7,7 @@ Run after `make build` (or `make install-dev`):
 Unlike the manual tests in MANUAL.md these need no vault/Wayland/root: every
 case is crafted to fail *before* the helper would fork/mount, so it is safe
 to run anywhere. They assert the privilege-boundary argument contract on the
-real binary — in particular that the LPE vector (caller-chosen --user /
+real binary: in particular that the LPE vector (caller-chosen --user /
 --continuation) no longer exists.
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ HELPER = REPO / "helper-rs" / "target" / "release" / "veracage-helper"
 
 pytestmark = pytest.mark.skipif(
     not HELPER.is_file(),
-    reason="Rust helper not built — run `make build` first",
+    reason="Rust helper not built: run `make build` first",
 )
 
 
@@ -37,44 +37,47 @@ def _run(args, env=None):
     )
 
 
+# Every case uses a VALID flag (`--source`) first so the offending flag is the
+# one the parser rejects. Otherwise a stale/unknown leading flag (e.g. an old
+# `--vault`) would be rejected first and the regression wouldn't be exercised.
+# `parse_args` runs before the euid/PKEXEC_UID checks, so these assert the
+# argument contract even when run unprivileged.
+
 def test_rejects_user_argument():
-    """The LPE vector: --user must not be accepted (regression)."""
-    r = _run(["--vault", "/etc/hostname", "--mountpoint", "/run/veracage/x",
-              "--user", "0", "--", "_leader"])
+    """The LPE vector: a caller-chosen target uid must not be accepted."""
+    r = _run(["--source", "/etc/hostname", "--user", "0", "--", "_leader"])
     assert r.returncode != 0
-    assert "unexpected argument" in r.stderr.lower()
+    assert "unexpected argument: --user" in r.stderr.lower()
 
 
 def test_rejects_continuation_argument():
     """The continuation is pinned at build time; --continuation is rejected."""
-    r = _run(["--vault", "/etc/hostname", "--mountpoint", "/run/veracage/x",
-              "--continuation", "/bin/sh", "--", "x"])
+    r = _run(["--source", "/etc/hostname", "--continuation", "/bin/sh", "--", "x"])
     assert r.returncode != 0
-    assert "unexpected argument" in r.stderr.lower()
+    assert "unexpected argument: --continuation" in r.stderr.lower()
 
 
 def test_rejects_group_argument():
-    r = _run(["--vault", "/etc/hostname", "--mountpoint", "/run/veracage/x",
-              "--group", "0", "--", "x"])
+    r = _run(["--source", "/etc/hostname", "--group", "0", "--", "x"])
     assert r.returncode != 0
-    assert "unexpected argument" in r.stderr.lower()
+    assert "unexpected argument: --group" in r.stderr.lower()
 
 
 def test_does_not_proceed_without_pkexec_uid():
-    """Run as a normal user with no PKEXEC_UID: the helper must refuse before
-    doing anything privileged (it fails the euid check, or — if somehow run as
-    root — the PKEXEC_UID check). Either way: non-zero, no mount."""
+    """Valid args, but run as a normal user with no PKEXEC_UID: the helper must
+    refuse before doing anything privileged (it fails the euid check, or, if
+    somehow run as root, the PKEXEC_UID check). Either way: non-zero, no mount."""
     env = {k: v for k, v in os.environ.items() if k != "PKEXEC_UID"}
-    r = _run(["--vault", "/etc/hostname", "--mountpoint", "/run/veracage/x",
+    r = _run(["--source", "/etc/hostname", "--session", "1000",
               "--", "_leader"], env=env)
     assert r.returncode != 0
 
 
-def test_mountpoint_must_be_under_run_veracage():
-    """As root via the helper, a mountpoint outside /run/veracage/ is rejected.
-    Simulated here by providing PKEXEC_UID and a bad mountpoint; the euid check
-    (non-root) or the path check fires first — never a mount at the bad path."""
+def test_session_must_match_caller():
+    """A `--session` that isn't the caller's own uid is refused (cross-user
+    setns/mount/close guard). Run as root would hit check_session_caller; run
+    unprivileged it fails the euid check first: either way non-zero, no mount."""
     env = dict(os.environ, PKEXEC_UID="1000")
-    r = _run(["--vault", "/etc/hostname", "--mountpoint", "/tmp/evil",
+    r = _run(["--source", "/etc/hostname", "--session", "999999",
               "--", "_leader"], env=env)
     assert r.returncode != 0
