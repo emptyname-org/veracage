@@ -17,9 +17,9 @@ Status tags:
 **Scope narrowed:** `check_continuation_argv` already pins the *subcommand* to
 `{_leader, _compositor}`, so "arbitrary `veracage` subcommand as the veracage
 uid" is **blocked**. The residual is only that the trailing *args* to those
-two subcommands are forwarded unvalidated (`--mountpoint` is separately
-validated, `--apps`/`--first` are JSON the leader only launches from by
-bounds-checked index). Low residual blast radius.
+two subcommands are forwarded unvalidated (the leader's `--mountpoint` is
+injected by the helper itself, `--apps`/`--first` are JSON the leader only
+launches from by bounds-checked index). Low residual blast radius.
 *Fix:* have the helper **construct** the full continuation argv from validated
 inputs rather than forwarding `args.rest`.
 `obsolete-if:` the human-uid launcher becomes the only caller AND the helper's
@@ -111,13 +111,6 @@ edge.
   not `max_size`. A client's negative `set_max_size` yields a below-min
   (possibly negative) configure to that same client. Self-inflicted. *Fix:*
   clamp `max ≥ min`.
-- **Stale `helpers/veracage-helper`**: the legacy Python helper drops to the
-  **caller** uid with **no idmap** (bypasses the entire isolation model) and
-  is still wired as a `cli.py` fallback when the Rust binary is absent. Can't
-  run as root today (polkit pins `exec.path` to the Rust helper) but it's a
-  full-model bypass one policy edit away, and shares the `..` mountpoint
-  weakness. *Fix:* delete it + the `cli.py` fallback (hard-error "build the
-  Rust helper" instead).
 
 ## Misc LOW (record, revisit opportunistically)
 - **A#8** `--passphrase-stdin` with an interactive tty (no EOF) blocks the

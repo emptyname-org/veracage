@@ -8,6 +8,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from veracage import leader
 
 
@@ -159,6 +161,43 @@ def test_launch_app_launches_and_tracks(monkeypatch):
     assert captured["stdin"] == leader.subprocess.DEVNULL
     assert captured["stdout"] == leader.subprocess.DEVNULL
     assert captured["stderr"] == leader.subprocess.DEVNULL
+
+
+def test_consume_launch_request_launches_and_removes(tmp_path, monkeypatch):
+    """The helper's add-volume path drops launch.req (root-written) into the
+    vault runtime dir; the leader launches the spec once and removes the file."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    (tmp_path / "launch.req").write_text('{"name": "Dolphin", "exec": "dolphin"}')
+    launched = []
+    monkeypatch.setattr(
+        leader, "_launch_app",
+        lambda st, spec: launched.append(spec) or {"ok": True})
+    leader._consume_launch_request(_state(wl_socket=Path("/run/x/wayland-1")))
+    assert launched == [{"name": "Dolphin", "exec": "dolphin"}]
+    assert not (tmp_path / "launch.req").exists()
+
+
+def test_consume_launch_request_noop_without_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        leader, "_launch_app",
+        lambda st, spec: pytest.fail("must not launch"))
+    leader._consume_launch_request(_state(wl_socket=Path("/run/x/wayland-1")))
+
+
+def test_consume_launch_request_rejects_bad_specs(tmp_path, monkeypatch, capsys):
+    """Malformed JSON and a metacharacter exec are dropped (file removed, no
+    launch): the same bare-command rule as set-apps."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        leader, "_launch_app",
+        lambda st, spec: pytest.fail("must not launch"))
+    st = _state(wl_socket=Path("/run/x/wayland-1"))
+    for body in ('{"exec": "rm -rf /"}', "not json", '{"name": "x"}'):
+        (tmp_path / "launch.req").write_text(body)
+        leader._consume_launch_request(st)
+        assert not (tmp_path / "launch.req").exists()
+    assert capsys.readouterr().err.count("malformed launch request") == 3
 
 
 def test_reap_reports_immediate_exit(tmp_path, monkeypatch):

@@ -90,14 +90,32 @@ pub fn content_frame(ctx: &egui::Context) -> egui::Frame {
 /// area, so a window shorter than its content never hides the bottom rows (the
 /// Save/Cancel buttons live in `action_bar`, a separate pinned panel). Route
 /// every dialog body through this, so no dialog - present or future - can overflow
-/// off-screen.
+/// off-screen. The scroll bar sits 20px from the window edge; the content keeps
+/// the house 36px side margins (16px inside the scroll area + the panel's 20).
 pub fn content_panel(ctx: &egui::Context, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::CentralPanel::default()
-        .frame(content_frame(ctx))
+        .frame(
+            egui::Frame::central_panel(&ctx.style())
+                .inner_margin(egui::Margin {
+                    left: 36.0,
+                    right: 20.0,
+                    top: 18.0,
+                    bottom: 18.0,
+                }),
+        )
         .show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
-                .show(ui, add_contents);
+                .show(ui, |ui| {
+                    egui::Frame::none()
+                        .inner_margin(egui::Margin {
+                            left: 0.0,
+                            right: 16.0,
+                            top: 0.0,
+                            bottom: 0.0,
+                        })
+                        .show(ui, add_contents);
+                });
         });
 }
 

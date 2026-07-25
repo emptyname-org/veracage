@@ -219,6 +219,36 @@ def _launch_app(state: _LeaderState, spec) -> dict:
     return {"ok": True, "pid": proc.pid}
 
 
+def _consume_launch_request(state: _LeaderState) -> None:
+    """Launch the app the helper's add-volume path handed over (`launch.req` in
+    the vault-owned runtime dir): a volume mounted into the RUNNING session
+    never reaches the leader argv, so its `--first` app (the user's explicit
+    pick, or their default file manager) arrives here instead. The file is
+    root-written into a 0700 veracage dir, unreachable from sandboxes and the
+    human uid; the spec gets the same validation as `set-apps` anyway."""
+    path = Path(os.environ.get("XDG_RUNTIME_DIR", "/nonexistent")) / "launch.req"
+    try:
+        raw = path.read_text()
+    except OSError:
+        return
+    # Remove before launching, so a failing spec can never launch-loop.
+    with contextlib.suppress(OSError):
+        path.unlink()
+    try:
+        spec = json.loads(raw)
+    except ValueError:
+        spec = None
+    exe = spec.get("exec") if isinstance(spec, dict) else None
+    name = spec.get("name") if isinstance(spec, dict) else None
+    if (not isinstance(exe, str) or not _exec_ok(exe)
+            or not (name is None or (isinstance(name, str) and len(name) <= 128))):
+        print("veracage: ignoring malformed launch request", file=sys.stderr)
+        return
+    r = _launch_app(state, {"name": name or exe, "exec": exe})
+    if not r["ok"]:
+        print(f"veracage: launch request: {r['error']}", file=sys.stderr)
+
+
 def _post_notice(message: str) -> None:
     """Publish a short user-facing notice for the compositor to show as a
     transient banner: `/run/veracage/rt/notice`, one `<nonce>\\t<text>` line. The
@@ -561,6 +591,9 @@ def run_leader(mountpoint: str, app_specs: list, first_app: dict | None) -> int:
                     state.volume_label = ", ".join(cur) if cur else "Volume"
                     state.places_file = _write_places_file(cur, state.exchange is not None)
                     _write_apps_file(state)
+                # After the Places refresh, so the app launched for a just-added
+                # volume gets the seed that already lists it.
+                _consume_launch_request(state)
                 if compositor_is_up():
                     comp_seen = True
                 elif comp_seen:

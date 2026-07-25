@@ -562,17 +562,27 @@ impl Toolbar {
             self.notice = None;
         }
 
+        // Union of everything egui actually painted (per-shape visual bounds,
+        // clipped). NOT ctx.used_rect(): that unions only panels and windows,
+        // so menu popups (Foreground-order areas) were missing from the damage
+        // region and an open menu was never presented over the app windows.
+        let mut painted = egui::Rect::NOTHING;
+        for cs in &full.shapes {
+            let b = cs.shape.visual_bounding_rect().intersect(cs.clip_rect);
+            if b.is_positive() {
+                painted = painted.union(b);
+            }
+        }
         let clipped = self.ctx.tessellate(full.shapes, full.pixels_per_point);
         let mut textures_delta = full.textures_delta;
         rebake_font_textures(&mut textures_delta);
         self.pending = Some((clipped, textures_delta, full.pixels_per_point));
-        (action, self.painted_rect(size_px))
+        (action, self.painted_rect(painted, size_px))
     }
 
-    /// The region egui used this frame, in physical pixels, clamped to the
+    /// `used` (egui logical points) as physical pixels, clamped to the
     /// framebuffer. None when egui painted nothing.
-    fn painted_rect(&self, size_px: (i32, i32)) -> Option<Rectangle<i32, Physical>> {
-        let used = self.ctx.used_rect();
+    fn painted_rect(&self, used: egui::Rect, size_px: (i32, i32)) -> Option<Rectangle<i32, Physical>> {
         if !used.is_finite() {
             return None;
         }

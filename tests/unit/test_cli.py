@@ -268,17 +268,16 @@ def test_open_still_refuses_on_legacy_reply_without_bootstrap_open(
     assert rc == 2
 
 
-def test_open_into_live_session_tells_user_about_the_app(
+def test_open_into_live_session_reports_the_join(
         monkeypatch, configured, fake_vault, capsys):
-    """Regression: the helper's add-volume path drops the leader argv, so
-    `veracage open B kate` on a live session mounts B but never launches kate.
-    The CLI must say so instead of exiting 0 silently."""
+    """`veracage open B kate` on a live session mounts B into the running
+    workspace (the helper hands the --first app to the leader via launch.req).
+    The CLI reports the join so an exit 0 isn't silent."""
     monkeypatch.setattr("veracage.cli._any_live_session", lambda: True)
     rc, _ = _run_open(monkeypatch, fake_vault, "kate")
     assert rc == 0
     err = capsys.readouterr().err
     assert "added to the running workspace" in err
-    assert "no app was auto-launched" in err
 
 
 # ------------------------------------------ empty session (front-door B) ---

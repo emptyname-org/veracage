@@ -27,7 +27,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -116,31 +116,6 @@ pub(crate) fn tool(name: &str) -> String {
     name.to_string() // fall back to the (pkexec-sanitized) PATH
 }
 
-/// True iff `arg` is exactly /run/veracage/<one-non-empty-component>. Pure
-/// (no filesystem) so it can be unit-tested. Defeats `..` traversal and the
-/// bare-directory case that a component *prefix* check would wrongly allow.
-fn mountpoint_ok(arg: &str) -> bool {
-    let mut c = Path::new(arg).components();
-    matches!(c.next(), Some(Component::RootDir))
-        && c.next().map(|x| x.as_os_str().as_bytes()) == Some(&b"run"[..])
-        && c.next().map(|x| x.as_os_str().as_bytes()) == Some(&b"veracage"[..])
-        && matches!(c.next(), Some(Component::Normal(n)) if !n.is_empty())
-        && c.next().is_none()
-}
-
-/// Resolve the validated mountpoint under the *canonical* /run/veracage.
-fn validated_mountpoint(arg: &str) -> Result<PathBuf, String> {
-    if !mountpoint_ok(arg) {
-        return Err(format!("mountpoint must be /run/veracage/<name>: {arg}"));
-    }
-    let name = Path::new(arg)
-        .file_name()
-        .ok_or_else(|| "mountpoint has no final component".to_string())?;
-    let parent = std::fs::canonicalize("/run/veracage")
-        .map_err(|e| format!("/run/veracage: {e}"))?;
-    Ok(parent.join(name))
-}
-
 fn fail(msg: &str, code: i32) -> ! {
     eprintln!("veracage-helper: {msg}");
     std::process::exit(code);
@@ -152,7 +127,7 @@ fn fail_errno(what: &str) -> ! {
 
 struct Args {
     /// `--spawn-compositor`: bring up the ONE persistent compositor instead of
-    /// mounting a vault. No --source/--mountpoint needed in this mode.
+    /// mounting a vault. No --source needed in this mode.
     spawn_compositor: bool,
     /// `--empty-session`: bootstrap a session leader with NO volume (the empty
     /// front door / scratchpad). Same NS + workspace tmpfs + idmapped exchange +
@@ -161,11 +136,10 @@ struct Args {
     empty_session: bool,
     source: Option<String>,
     backend: Option<Backend>, // None = auto-detect
-    mountpoint: Option<String>,
-    /// `--session <id>`: shared-workspace bootstrap. When set, the helper mounts
-    /// the volume at `<WORKSPACE>/<label>` in a tmpfs workspace and holds it via
-    /// the session leader (Phase 2), writing `session-<id>.lock`/`.pid`. When
-    /// unset, the legacy per-vault path runs (own NS, own `/run/veracage/<hash>`).
+    /// `--session <id>`: the shared-workspace session (required for a mount).
+    /// The helper mounts the volume at `<WORKSPACE>/<label>` in the session's
+    /// tmpfs workspace and holds it via the session leader, writing
+    /// `session-<id>.lock`/`.pid`.
     session: Option<String>,
     /// `--close-volume <label>`: setns into the session and close JUST this volume
     /// (unmount + `cryptsetup close --deferred` + drop it from the lock), leaving
@@ -183,16 +157,14 @@ struct Args {
     passphrase: Option<Vec<u8>>,
 }
 
-/// Parse argv. Only --spawn-compositor/--source/--backend/--mountpoint/--setenv
-/// are accepted before `--`; anything else is an error (notably no
-/// --user/--continuation). Presence of required args is validated per-mode in
-/// main(), not here.
+/// Parse argv. Only the flags below are accepted before `--`; anything else is
+/// an error (notably no --user/--continuation). Presence of required args is
+/// validated per-mode in main(), not here.
 fn parse_args() -> Args {
     let mut spawn_compositor = false;
     let mut empty_session = false;
     let mut source: Option<String> = None;
     let mut backend: Option<Backend> = None;
-    let mut mountpoint: Option<String> = None;
     let mut session: Option<String> = None;
     let mut close_volume: Option<String> = None;
     let mut exchange: Option<String> = None;
@@ -233,7 +205,6 @@ fn parse_args() -> Args {
                     }
                 }
             }
-            "--mountpoint" => mountpoint = it.next(),
             "--session" => session = it.next(),
             "--close-volume" => close_volume = it.next(),
             "--exchange" => exchange = it.next(),
@@ -249,7 +220,7 @@ fn parse_args() -> Args {
             other => fail(&format!("unexpected argument: {other}"), 2),
         }
     }
-    Args { spawn_compositor, empty_session, source, backend, mountpoint, session, close_volume, exchange, setenv, rest, passphrase }
+    Args { spawn_compositor, empty_session, source, backend, session, close_volume, exchange, setenv, rest, passphrase }
 }
 
 /// (uid, gid) of the invoking human, taken from PKEXEC_UID, never from argv.
@@ -406,27 +377,6 @@ fn is_executable(p: &Path) -> bool {
         && std::fs::metadata(p)
             .map(|m| m.permissions().mode() & 0o111 != 0)
             .unwrap_or(false)
-}
-
-fn write_lock(path: &str, dm_name: &str, mountpoint: &Path, uid: u32) {
-    let body = format!(
-        "dm_name={dm_name}\nmountpoint={}\nuser_uid={uid}\n",
-        mountpoint.display()
-    );
-    // Clear any stale lock (the dir is root-only-writable), then create fresh
-    // with O_EXCL|O_NOFOLLOW so a pre-planted symlink/file can't redirect this
-    // root write. Mode 0600 is set at creation (no separate chmod to fail).
-    let _ = std::fs::remove_file(path);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .unwrap_or_else(|e| fail(&format!("create lock {path}: {e}"), 1));
-    use std::io::Write;
-    f.write_all(body.as_bytes())
-        .unwrap_or_else(|e| fail(&format!("write lock {path}: {e}"), 1));
 }
 
 /// Record the compositor pid (which, because we `exec` rather than fork, is this
@@ -943,162 +893,6 @@ fn validated_exchange(path: &str, human_uid: u32) -> Option<PathBuf> {
     (md.is_dir() && md.uid() == human_uid).then(|| PathBuf::from(path))
 }
 
-fn child(
-    vault_uid: u32,
-    vault_gid: u32,
-    human_uid: u32,
-    human_gid: u32,
-    source: &Path,
-    backend: Option<Backend>,
-    mountpoint: &Path,
-    raw: &Path,
-    vault_run: &Path,
-    ctl_path: &Path,
-    dm_name: &str,
-    cont: &Path,
-    args: &Args,
-) -> ! {
-    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
-        fail_errno("unshare(CLONE_NEWNS)");
-    }
-    let root = CString::new("/").unwrap();
-    if unsafe {
-        libc::mount(ptr::null(), root.as_ptr(), ptr::null(), libc::MS_REC | libc::MS_SLAVE, ptr::null())
-    } != 0
-    {
-        fail_errno("mount --make-rslave /");
-    }
-
-    // Open the encrypted volume. With --passphrase-stdin (the GUI launcher) the
-    // passphrase comes from stdin; otherwise cryptsetup prompts on the tty.
-    // Exit code 4 = the decrypt itself failed (almost always a wrong
-    // passphrase). The GUI watches for it to re-prompt.
-    let backend = backend.unwrap_or_else(|| crypt::detect(source));
-    crypt::open(source, backend, dm_name, args.passphrase.as_deref())
-        .unwrap_or_else(|e| fail(&format!("{e}"), EXIT_CRYPT_FAILED));
-    let dm_path = format!("/dev/mapper/{dm_name}");
-
-    // The volume's own filesystem label (or the vault's file name if unlabeled),
-    // passed to the leader so the sandbox file manager shows it as a named place.
-    let volume_label = read_volume_label(&dm_path).unwrap_or_else(|| {
-        source
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Volume".into())
-    });
-
-    // Stage-mount the decrypted fs so we can read its on-disk owner and clone
-    // it into an idmapped mount.
-    std::fs::create_dir_all(raw).unwrap_or_else(|e| fail(&format!("mkdir staging: {e}"), 1));
-    set_mode(raw, 0o700);
-    // Stage-mount with ownership appropriate to the filesystem: an ownerless fs
-    // (FAT/exFAT/NTFS) gets uid=/gid= mount options, a POSIX fs is mounted plain
-    // and its root inode chowned to the human uid. Either way the idmap below then
-    // presents the human uid as the vault uid, a writable vault. For a POSIX fs
-    // the chown covers only the root inode (non-recursive); the app's config/cache
-    // live on a tmpfs, never the volume. Best-effort so a read-only volume opens.
-    let (opts, needs_chown) = stage_opts(&dm_path, human_uid, human_gid);
-    let st = Command::new(tool("mount"))
-        .args(["-o", &opts])
-        .arg(&dm_path)
-        .arg(raw)
-        .status()
-        .unwrap_or_else(|e| fail(&format!("spawn mount: {e}"), 1));
-    if !st.success() {
-        let _ = crypt::close(dm_name);
-        fail(&format!("mount failed: {}", st.code().unwrap_or(-1)), st.code().unwrap_or(1));
-    }
-    if needs_chown {
-        try_chown(raw, human_uid, human_gid);
-    }
-
-    // Present the vault as the vault uid via an idmapped mount. Map the HUMAN's
-    // uid/gid -> the vault uid/gid: a single-user vault's data is owned by the
-    // human who created it, so that is the owner that must become readable as
-    // the vault uid. (Files owned by *other* uids inside the vault remain
-    // inaccessible: single-user limitation.)
-    std::fs::create_dir_all(mountpoint).unwrap_or_else(|e| fail(&format!("mkdir mountpoint: {e}"), 1));
-    set_mode(mountpoint, 0o700);
-    if let Err(e) = idmap::idmap_mount(raw, mountpoint, human_uid, human_gid, vault_uid, vault_gid, 0) {
-        let _ = Command::new(tool("umount")).arg(raw).status();
-        let _ = crypt::close(dm_name);
-        fail(&format!("idmap_mount: {e}"), 1);
-    }
-
-    // The idmapped clone is independent; drop the staging mount.
-    let _ = Command::new(tool("umount")).arg(raw).status();
-    let _ = std::fs::remove_dir(raw);
-
-    // Optional shared EXCHANGE folder: idmap a human-owned host directory into
-    // this private NS (nosuid/nodev/noexec), presenting it to the sandbox as
-    // veracage-owned and reverse-mapping the sandbox's writes back to the human on
-    // disk, a dialog-free host<->vault shared folder (docs/single-window-ux.md).
-    // The path is caller-supplied, so validate it (owner == human, real dir, no
-    // final-component symlink) before root open_trees it; a same-uid host attacker
-    // owns their own home, so this stops `--exchange /etc` / a symlink to a
-    // root-owned dir. Soft-fail: any problem just means no /exchange this session.
-    if let Some(xpath) = args.exchange.as_deref() {
-        match validated_exchange(xpath, human_uid) {
-            Some(x) => {
-                let xmp = PathBuf::from(format!("{}.x", mountpoint.display()));
-                let _ = std::fs::create_dir_all(&xmp);
-                set_mode(&xmp, 0o700);
-                match idmap::idmap_mount(
-                    &x, &xmp, human_uid, human_gid, vault_uid, vault_gid,
-                    idmap::ATTR_NOSUID_NODEV_NOEXEC,
-                ) {
-                    Ok(()) => env::set_var("VERACAGE_EXCHANGE", &xmp),
-                    Err(e) => eprintln!("veracage: exchange idmap failed ({e}); no /exchange"),
-                }
-            }
-            None => eprintln!("veracage: exchange {xpath:?} is not a human-owned directory; skipping"),
-        }
-    }
-
-    // Past pkexec, the helper is the only place that can hand the leader its
-    // control socket (pkexec closes inherited fds). The host-Wayland connection
-    // now belongs to the persistent compositor (spawned separately), not the
-    // per-vault leader, so there is no wl_fd to pass here anymore.
-    let ctl_fd = ipc::create_control_socket(ctl_path, human_uid, human_gid)
-        .unwrap_or_else(|e| fail(&format!("control socket: {e}"), 1));
-
-    // Provision a vault-writable runtime dir (bwrap /run/user): the vault uid
-    // can't write under root-owned /run/veracage.
-    std::fs::create_dir_all(vault_run).unwrap_or_else(|e| fail(&format!("mkdir vault-run: {e}"), 1));
-    set_mode(vault_run, 0o700);
-    chown(vault_run, vault_uid, vault_gid);
-
-    drop_to_vault_user(vault_uid, vault_gid);
-
-    // Re-establish the handful of allowlisted env vars pkexec stripped.
-    for kv in &args.setenv {
-        if let Some((k, v)) = kv.split_once('=') {
-            if ALLOWED_SETENV.contains(&k) {
-                env::set_var(k, v);
-            }
-        }
-    }
-
-    // Tell the leader which inherited control fd to accept on (the number isn't
-    // secret; the fd is inherited and the vault uid can't re-open the socket).
-    env::set_var("VERACAGE_CONTROL_FD", ctl_fd.to_string());
-    env::set_var("VERACAGE_VAULT_RUNTIME", vault_run);
-    env::set_var("VERACAGE_VOLUME_LABEL", &volume_label);
-
-    // Hand off to the pinned continuation (replaces this process).
-    check_continuation_argv(&args.rest);
-    let err = Command::new(cont).args(&args.rest).exec();
-    fail(&format!("exec continuation {}: {err}", cont.display()), 127);
-}
-
-/// Shared-workspace bootstrap child (Phase 2). Like `child`, but instead of a
-/// per-vault `/run/veracage/<hash>` mountpoint it stands up the session's tmpfs
-/// **workspace** and lands the first volume at `<WORKSPACE>/<label>`. The process
-/// becomes the session leader and holds this namespace for the session's life
-/// (Phase 3 `setns`es into it to add more volumes). The staging `.raw` mount and
-/// every `<WORKSPACE>/*` idmap mount live on the tmpfs and vanish with the NS,
-/// only the global dm device must be closed (from the session lock) on teardown.
-#[allow(clippy::too_many_arguments)]
 /// cryptsetup-open `source` and idmap-mount it at `<WORKSPACE>/<label>` in the
 /// CURRENT mount namespace (the workspace tmpfs must already be mounted: the
 /// bootstrap child mounts it after unshare; the add child inherits it via setns).
@@ -1137,8 +931,9 @@ fn mount_volume_at_workspace(
         parent.join(format!(".{base}.raw"))
     };
 
-    // Stage-mount the decrypted fs to read its on-disk owner, then idmap-clone it
-    // to the workspace path (identical dance to the per-vault `child`).
+    // Stage-mount the decrypted fs with ownership appropriate to the filesystem
+    // (an ownerless FAT/exFAT/NTFS gets uid=/gid= options, a POSIX fs is mounted
+    // plain and its root inode chowned), then idmap-clone it to the workspace path.
     std::fs::create_dir_all(&raw).unwrap_or_else(|e| fail(&format!("mkdir staging: {e}"), 1));
     set_mode(&raw, 0o700);
     let (opts, needs_chown) = stage_opts(&dm_path, human_uid, human_gid);
@@ -1222,10 +1017,9 @@ fn session_child(
     };
     let vault_run = PathBuf::from(format!("/run/veracage/session-{sid}.run"));
 
-    // Shared exchange folder (idmap a human-owned host dir), same as the per-vault
-    // path, bound at /exchange, top-level, presented as veracage-owned. The mount
-    // lives OUTSIDE the workspace (a `session-<sid>.x` sibling, like the legacy
-    // path's `<mountpoint>.x`): the sandbox binds the whole workspace at /vaults
+    // Shared exchange folder (idmap a human-owned host dir), bound at /exchange,
+    // top-level, presented as veracage-owned. The mount lives OUTSIDE the
+    // workspace (a `session-<sid>.x` sibling): the sandbox binds the whole workspace at /vaults
     // recursively, and /vaults is HOME, so a mount under it would surface the
     // host-plaintext folder inside HOME and break the "everything in HOME is
     // encrypted at rest" invariant (an app writing under ~/.exchange, or any
@@ -1497,8 +1291,38 @@ fn run_session_add(
         if Path::new(&dm_path).exists() {
             let _ = crypt::close(&dm_name);
         }
+        std::process::exit(rc);
     }
-    std::process::exit(rc);
+
+    // The volume joined a RUNNING session, so the leader argv we were handed
+    // (`--first`, the app to auto-launch: the user's explicit pick or their
+    // default file manager) was never consumed. Hand the spec to the live
+    // leader instead: drop it, root-written, into the vault-owned runtime dir
+    // (0700 veracage; unreachable from sandboxes and the human uid), where the
+    // leader's serve loop picks it up. Same human-trust UX data as `--apps`.
+    if let Some(spec) = rest_value(&args.rest, "--first") {
+        write_launch_request(sid, spec, vault_uid, vault_gid);
+    }
+    std::process::exit(0);
+}
+
+/// The value following `flag` in the leader argv after `--` (None if absent).
+fn rest_value<'a>(rest: &'a [String], flag: &str) -> Option<&'a str> {
+    let i = rest.iter().position(|a| a == flag)?;
+    rest.get(i + 1).map(|s| s.as_str())
+}
+
+/// Write the auto-launch app spec for the leader to consume (add-volume path).
+/// Best-effort: a mount without the popup beats failing a completed mount.
+fn write_launch_request(sid: &str, spec: &str, vault_uid: u32, vault_gid: u32) {
+    if spec.len() > 4096 {
+        return; // a real {name, exec} spec is tiny; don't relay junk
+    }
+    let path = PathBuf::from(format!("/run/veracage/session-{sid}.run/launch.req"));
+    if std::fs::write(&path, spec).is_ok() {
+        set_mode(&path, 0o600);
+        try_chown(&path, vault_uid, vault_gid);
+    }
 }
 
 fn main() {
@@ -1570,85 +1394,32 @@ fn main() {
         fail(&format!("source must be a file or block device: {}", source.display()), 2);
     }
 
-    // Shared-workspace open. Diverges entirely from the legacy per-vault path
-    // below. The helper picks bootstrap vs. add-volume by whether a LIVE, verified
-    // session leader already holds the workspace NS (so the CLI needs no
-    // session-liveness check: it always passes --session <uid>).
-    if let Some(sid) = args.session.as_deref() {
-        check_session_caller(sid, human_uid);
-        // Serialize the bootstrap-vs-add decision (and everything it leads to)
-        // against concurrent opens/teardowns for the same sid: without this, an
-        // open racing a slow teardown appends to a lock the teardown is about to
-        // act on, and the teardown then deletes the NEW session's pidfile / closes
-        // its dm. The callee decides when to release (bootstrap: before waiting
-        // out the leader; add: on exit).
-        let flock = session_flock(sid);
-        match verify_session_leader(sid, vault_uid) {
-            Some(leader_pid) => {
-                run_session_add(&args, human_uid, human_gid, vault_uid, vault_gid, &source,
-                                leader_pid, flock)
-            }
-            None => {
-                run_session_bootstrap(&args, human_uid, human_gid, vault_uid, vault_gid,
-                                      Some(&source), flock)
-            }
+    // Shared-workspace open (the only mount mode). The helper picks bootstrap
+    // vs. add-volume by whether a LIVE, verified session leader already holds
+    // the workspace NS (so the CLI needs no session-liveness check: it always
+    // passes --session <uid>).
+    let sid = args
+        .session
+        .as_deref()
+        .unwrap_or_else(|| fail("--session required", 2));
+    check_session_caller(sid, human_uid);
+    // Serialize the bootstrap-vs-add decision (and everything it leads to)
+    // against concurrent opens/teardowns for the same sid: without this, an
+    // open racing a slow teardown appends to a lock the teardown is about to
+    // act on, and the teardown then deletes the NEW session's pidfile / closes
+    // its dm. The callee decides when to release (bootstrap: before waiting
+    // out the leader; add: on exit).
+    let flock = session_flock(sid);
+    match verify_session_leader(sid, vault_uid) {
+        Some(leader_pid) => {
+            run_session_add(&args, human_uid, human_gid, vault_uid, vault_gid, &source,
+                            leader_pid, flock)
+        }
+        None => {
+            run_session_bootstrap(&args, human_uid, human_gid, vault_uid, vault_gid,
+                                  Some(&source), flock)
         }
     }
-
-    let mountpoint_arg = args
-        .mountpoint
-        .as_deref()
-        .unwrap_or_else(|| fail("--mountpoint required", 2));
-    let mountpoint = validated_mountpoint(mountpoint_arg).unwrap_or_else(|e| fail(&e, 2));
-    let raw = PathBuf::from(format!("{}.raw", mountpoint.display()));
-    let vault_run = PathBuf::from(format!("{}.run", mountpoint.display()));
-    let runtime_dir = setenv_value(&args, "XDG_RUNTIME_DIR")
-        .unwrap_or_else(|| fail("XDG_RUNTIME_DIR not forwarded; need it for the control socket", 2));
-    let ctl_path = PathBuf::from(&runtime_dir)
-        .join("veracage/sessions")
-        .join(format!("{}.sock", vault_hash(&source)));
-
-    let cont = PathBuf::from(continuation());
-    if !is_executable(&cont) {
-        fail(&format!("continuation not executable: {}", cont.display()), 2);
-    }
-
-    let dm_name = random_dm_name();
-    let lock = format!("/run/veracage/{}.lock", vault_hash(&source));
-    write_lock(&lock, &dm_name, &mountpoint, human_uid);
-
-    // Compositor is brought up by the CLI as its own unit (see the session path);
-    // this legacy per-vault flow just relies on it already being present.
-
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        fail_errno("fork");
-    }
-    if pid == 0 {
-        child(vault_uid, vault_gid, human_uid, human_gid, &source, args.backend,
-              &mountpoint, &raw, &vault_run, &ctl_path, &dm_name, &cont, &args);
-    }
-
-    // Parent (still root, original mount NS).
-    install_signal_forwarding(pid);
-    let rc = wait_for(pid);
-
-    let dm_path = format!("/dev/mapper/{dm_name}");
-    let mut close_ok = true;
-    if Path::new(&dm_path).exists() {
-        close_ok = crypt::close(&dm_name).is_ok();
-    }
-    let _ = std::fs::remove_dir(&raw);
-    let _ = std::fs::remove_dir_all(&vault_run);
-    let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_dir(&mountpoint);
-    // Remove the lock only if the device is actually gone, so a failed close
-    // leaves a recovery trail for the ExecStopPost cleanup.
-    if close_ok {
-        let _ = std::fs::remove_file(&lock);
-    }
-
-    std::process::exit(rc);
 }
 
 #[cfg(test)]
@@ -1682,24 +1453,6 @@ mod tests {
         assert!(!ALLOWED_SETENV.contains(&"LD_PRELOAD"));
         assert!(!ALLOWED_SETENV.contains(&"LD_LIBRARY_PATH"));
         assert!(ALLOWED_SETENV.contains(&"WAYLAND_DISPLAY"));
-    }
-
-    #[test]
-    fn mountpoint_accepts_direct_child() {
-        assert!(mountpoint_ok("/run/veracage/abc123"));
-        assert!(mountpoint_ok("/run/veracage/0123456789abcdef"));
-    }
-
-    #[test]
-    fn mountpoint_rejects_traversal_and_bare_dir() {
-        assert!(!mountpoint_ok("/run/veracage/../../etc/cron.d"));
-        assert!(!mountpoint_ok("/run/veracage/../veracage/x"));
-        assert!(!mountpoint_ok("/run/veracage"));
-        assert!(!mountpoint_ok("/run/veracage/"));
-        assert!(!mountpoint_ok("/run/veracage/a/b"));
-        assert!(!mountpoint_ok("/tmp/evil"));
-        assert!(!mountpoint_ok("/run/veracageX/x"));
-        assert!(!mountpoint_ok("run/veracage/x"));
     }
 
     const PY_KNOWN_HASH: &str = "0631c55cceb0614f";

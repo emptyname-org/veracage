@@ -18,17 +18,17 @@ from .sandbox import bwrap_command  # noqa: F401  (kept for downstream tests)
 
 # Privileged helpers. An install (`make install`) sets VERACAGE_HELPER /
 # VERACAGE_CLEANUP_HELPER in the generated launcher to point at $LIBEXEC.
-# For a source checkout we derive paths from the repo root: prefer the built
-# Rust mount helper if present, else the Python reference helper. Whatever
-# this resolves to MUST match the polkit policy's exec.path.
+# For a source checkout we derive paths from the repo root. Whatever this
+# resolves to MUST match the polkit policy's exec.path.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _default_mount_helper() -> str:
-    rust = _REPO_ROOT / "helper-rs" / "target" / "release" / "veracage-helper"
-    if rust.is_file():
-        return str(rust)
-    return str(_REPO_ROOT / "helpers" / "veracage-helper")
+    """The built Rust helper (make install-dev). There is deliberately no
+    fallback: the removed Python reference helper dropped to the caller uid
+    with no idmap, so falling back silently would bypass the whole isolation
+    model. A missing binary fails loudly at pkexec time instead."""
+    return str(_REPO_ROOT / "helper-rs" / "target" / "release" / "veracage-helper")
 
 
 HELPER_PATH = os.environ.get("VERACAGE_HELPER", _default_mount_helper())
@@ -463,15 +463,12 @@ def cmd_open(args: argparse.Namespace) -> int:
     rc = subprocess.run(cmd).returncode
     if rc == 0 and joining:
         # The helper took the add-volume path: the volume is mounted into the
-        # RUNNING workspace, and the leader argv we built (--first/--apps) was
-        # not consumed - the session's app set is fixed at first open. Say so
-        # instead of silently dropping what the user asked for.
+        # RUNNING workspace. The --first app still launches: the helper hands
+        # the spec to the live leader (launch.req), since the leader argv we
+        # built here was never consumed.
         print("veracage: volume added to the running workspace "
-              "(apps see it at their next launch).", file=sys.stderr)
-        if first_app is not None:
-            print("veracage: note - no app was auto-launched: the running "
-                  "session's app set is fixed at first open. Launch it from the "
-                  "compositor's Apps menu.", file=sys.stderr)
+              "(already-running apps see it at their next launch).",
+              file=sys.stderr)
     return rc
 
 
