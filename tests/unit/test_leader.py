@@ -135,7 +135,7 @@ def test_launch_app_needs_exec_field():
 
 def test_launch_app_launches_and_tracks(monkeypatch):
     monkeypatch.setattr(leader, "bwrap_command",
-                        lambda mp, a, ws, gpu, places=None, exchange=None: ["true"])
+                        lambda mp, a, ws, places=None, exchange=None: ["true"])
 
     captured: dict = {}
 
@@ -150,12 +150,47 @@ def test_launch_app_launches_and_tracks(monkeypatch):
     st = _state(wl_socket=Path("/run/x/wayland-1"))
     r = leader._launch_app(st, {"name": "Kate", "exec": "kate", "args": ["/vault"]})
     assert r == {"ok": True, "pid": 4321}
-    assert st.children == {4321: "Kate"}
+    # Tracked as (label, launch_monotonic) so the reaper can spot an early exit.
+    label, launched_at = st.children[4321]
+    assert label == "Kate"
+    assert isinstance(launched_at, float)
     # M1: the app's stdio must be detached so a viewer can't leak /vault paths to
     # the leader's terminal/journal.
     assert captured["stdin"] == leader.subprocess.DEVNULL
     assert captured["stdout"] == leader.subprocess.DEVNULL
     assert captured["stderr"] == leader.subprocess.DEVNULL
+
+
+def test_reap_reports_immediate_exit(tmp_path, monkeypatch):
+    # An app that exits within _EARLY_EXIT_SECONDS of launch is a failed launch:
+    # the reaper drops it and publishes a notice for the compositor to show. An
+    # X11-only GUI in this Wayland-only sandbox is the motivating case.
+    monkeypatch.setattr(leader, "COMPOSITOR_RUNTIME", tmp_path)
+    monkeypatch.setattr(leader.os, "waitpid", lambda pid, flags: (pid, 0))
+
+    st = _state(wl_socket=Path("/run/x/wayland-1"))
+    st.children = {99: ("VeraCrypt", time.monotonic())}   # just launched, now dead
+    leader._reap_children(st)
+
+    assert st.children == {}
+    nonce, _, text = (tmp_path / "notice").read_text().partition("\t")
+    assert nonce.isdigit()
+    assert "VeraCrypt failed to launch (exited immediately)" in text
+
+
+def test_reap_does_not_report_normal_quit(tmp_path, monkeypatch):
+    # An app the user ran and closed later (exited well after launch) is reaped
+    # silently, with no failed-launch notice.
+    monkeypatch.setattr(leader, "COMPOSITOR_RUNTIME", tmp_path)
+    monkeypatch.setattr(leader.os, "waitpid", lambda pid, flags: (pid, 0))
+
+    st = _state(wl_socket=Path("/run/x/wayland-1"))
+    old = time.monotonic() - (leader._EARLY_EXIT_SECONDS + 5.0)
+    st.children = {7: ("Kate", old)}
+    leader._reap_children(st)
+
+    assert st.children == {}
+    assert not (tmp_path / "notice").exists()
 
 
 def test_launch_app_missing_dependency(monkeypatch):
@@ -177,7 +212,7 @@ def test_reap_children_drops_exited():
     pid = os.fork()
     if pid == 0:
         os._exit(0)
-    st.children[pid] = "x"
+    st.children[pid] = ("x", 0.0)   # launch time in the past: reap, no notice
     for _ in range(50):
         leader._reap_children(st)
         if pid not in st.children:

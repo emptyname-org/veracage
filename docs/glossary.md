@@ -52,8 +52,10 @@ Three uids are in play:
   volume mount exists **only inside** the leader's namespace, so host
   processes can't even *see* it.
 - **bwrap** / **sandbox** - bubblewrap. Wraps each app: no network, no host
-  filesystem, only `/vaults` + the compositor socket visible. So even a
-  malicious app can't exfiltrate what it reads.
+  filesystem, only `/vaults` + the compositor socket visible. This keeps the
+  decrypted data from leaking out to the network or host filesystem. It
+  protects the data, not the host from the app: a malicious app is outside the
+  threat model.
 - **the three barriers** - **deny** (idmap) + **hide** (namespace) +
   **sandbox** (bwrap). An escape of any one still does not yield plaintext.
 
@@ -78,7 +80,9 @@ Three uids are in play:
   appear on the other, owned by the human. The file-transfer path.
 - **pub dir** - `/run/veracage/pub`, root-created and human-owned: where the
   human side publishes the configured app list (`config.apps`) and menu
-  icons for the compositor's Apps menu. Same trust level as config.toml.
+  icons for the compositor's Apps menu, plus the `mimeapps.list` seed the
+  leader copies into each sandbox (default-app associations). Same trust
+  level as config.toml.
 
 ## Privilege & lifecycle
 

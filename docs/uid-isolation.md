@@ -73,6 +73,13 @@ That's intentional: all volumes are the same human's own data. Partitioning
 selections per-volume would add real complexity to defend the human against
 themselves. Co-hosted volumes are one trust domain.
 
+**Not a goal: confining the app you chose to run.** The boundary is
+one-directional. It keeps the host out of the volume, not the app out of the
+host. The app you launch is trusted, so a malicious sandboxed app is outside
+the threat model (not a secondary threat, just outside). The sandbox
+restrictions (no network, no host filesystem) are there to keep the decrypted
+data from leaking out, not to cage the app.
+
 ## On-disk owner / portability
 
 idmap reads the volume's stored ownership and presents it as the veracage

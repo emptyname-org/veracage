@@ -83,18 +83,23 @@ pub struct HostClipboard {
 }
 
 impl HostClipboard {
-    /// SAFETY: `display` must be the winit backend's valid wl_display (compositor
-    /// lifetime). Returns None if the worker or the data-control global is absent.
-    pub unsafe fn from_display_ptr(display: *mut std::ffi::c_void) -> Option<Self> {
+    /// SAFETY: `display` must be the winit backend's valid wl_display. The worker
+    /// borrows it (a foreign, non-owning backend), so it MUST stop before the
+    /// winit backend is dropped: the returned `JoinHandle` lets the caller join
+    /// the worker at teardown (after `clear_on_exit`, which makes it return),
+    /// while the display is still alive. Returns None if the worker can't spawn.
+    pub unsafe fn from_display_ptr(
+        display: *mut std::ffi::c_void,
+    ) -> Option<(Self, std::thread::JoinHandle<()>)> {
         let backend = unsafe { Backend::from_foreign_display(display.cast()) };
         let conn = Connection::from_backend(backend);
         let (wake_r, wake_w) = pipe()?;
         let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("veracage-hostclip".into())
             .spawn(move || worker(conn, rx, wake_r))
             .ok()?;
-        Some(HostClipboard { tx, wake: Arc::new(wake_w) })
+        Some((HostClipboard { tx, wake: Arc::new(wake_w) }, handle))
     }
 
     /// Set the host clipboard to `text` (sandbox -> host). This is the ONLY path
@@ -228,7 +233,16 @@ fn worker(conn: Connection, rx: Receiver<Cmd>, wake_r: OwnedFd) {
         }
         // Handle any queued commands.
         while let Ok(cmd) = rx.try_recv() {
+            let exiting = matches!(cmd, Cmd::ClearOnExit(_));
             handle_cmd(&mut state, &conn, &mut queue, cmd);
+            if exiting {
+                // Shutdown: the clear is queued and acked. Flush it out while the
+                // wl_display is still valid, then RETURN. The display we borrow
+                // belongs to the winit backend, dropped moments later; looping on
+                // past that free is the teardown use-after-free (SIGSEGV) we avoid.
+                let _ = conn.flush();
+                return;
+            }
         }
         // Fire the auto-clear when its countdown elapses.
         if state.deadline.is_some_and(|d| Instant::now() >= d) {

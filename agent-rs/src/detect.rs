@@ -208,12 +208,37 @@ pub fn icon_rgba_for_exec(exec: &str) -> Option<(u32, u32, Vec<u8>)> {
     icon_rgba_for_name(&icon_name)
 }
 
-/// A host icon by freedesktop NAME, as raw RGBA no larger than 64x64. `None`
-/// if the icon isn't in the theme.
+/// A host icon by freedesktop NAME, as raw RGBA no larger than 64x64. Tries a
+/// PNG first (the common case, fast), then an SVG (KDE/breeze apps ship SVG-only,
+/// e.g. VeraCrypt). `None` if the icon isn't in the theme in either form.
 fn icon_rgba_for_name(name: &str) -> Option<(u32, u32, Vec<u8>)> {
-    let png = read_icon_png(name)?;
-    let data = eframe::icon_data::from_png_bytes(&png).ok()?;
-    Some(downscale_max(data.width, data.height, data.rgba, 64))
+    if let Some(png) = read_icon_png(name) {
+        if let Ok(data) = eframe::icon_data::from_png_bytes(&png) {
+            return Some(downscale_max(data.width, data.height, data.rgba, 64));
+        }
+    }
+    read_icon_svg(name)
+}
+
+/// A generic "application" icon, used when an app's own icon can't be resolved so
+/// the menu still shows a glyph rather than bare text. The host theme's standard
+/// generic name first (matches the desktop), then a bundled fallback so a
+/// theme-less host still shows something. Resolved once per process.
+pub fn generic_icon_rgba() -> Option<(u32, u32, Vec<u8>)> {
+    use std::sync::OnceLock;
+    static GENERIC: OnceLock<Option<(u32, u32, Vec<u8>)>> = OnceLock::new();
+    GENERIC
+        .get_or_init(|| {
+            for name in ["application-x-executable", "application-default-icon"] {
+                if let Some(icon) = icon_rgba_for_name(name) {
+                    return Some(icon);
+                }
+            }
+            const GENERIC_APP_PNG: &[u8] = include_bytes!("../../Icons/generic_app.png");
+            let data = eframe::icon_data::from_png_bytes(GENERIC_APP_PNG).ok()?;
+            Some(downscale_max(data.width, data.height, data.rgba, 64))
+        })
+        .clone()
 }
 
 
@@ -277,16 +302,7 @@ fn read_icon_png(icon: &str) -> Option<Vec<u8>> {
     if icon.starts_with('/') {
         return icon.ends_with(".png").then(|| read_capped(std::path::Path::new(icon)))?;
     }
-    let mut roots = Vec::new();
-    let home = std::env::var("HOME").unwrap_or_default();
-    let data_home =
-        std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{home}/.local/share"));
-    roots.push(format!("{data_home}/icons"));
-    let data_dirs = std::env::var("XDG_DATA_DIRS")
-        .unwrap_or_else(|_| "/usr/local/share:/usr/share".into());
-    for d in data_dirs.split(':').filter(|s| !s.is_empty()) {
-        roots.push(format!("{d}/icons"));
-    }
+    let roots = icon_roots();
     // Fast path: hicolor (where apps install their own icons), then pixmaps.
     for size in [48, 64, 32, 96, 128, 256] {
         for root in &roots {
@@ -312,6 +328,70 @@ fn read_icon_png(icon: &str) -> Option<Vec<u8>> {
         scan_for_icon(std::path::Path::new(root), &want, 0, &mut budget, &mut best);
     }
     read_capped(&best?.1)
+}
+
+/// The freedesktop icon-theme roots to search, user dir first: `$XDG_DATA_HOME`
+/// (or `~/.local/share`) then each `$XDG_DATA_DIRS` entry, each `/icons`.
+fn icon_roots() -> Vec<String> {
+    let mut roots = Vec::new();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let data_home =
+        std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{home}/.local/share"));
+    roots.push(format!("{data_home}/icons"));
+    let data_dirs =
+        std::env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".into());
+    for d in data_dirs.split(':').filter(|s| !s.is_empty()) {
+        roots.push(format!("{d}/icons"));
+    }
+    roots
+}
+
+/// Resolve an `Icon=` value to RGBA by finding and rendering an SVG: an absolute
+/// `.svg` path, else `<name>.svg` in the icon-theme roots (the size variant
+/// closest to 48, since breeze ships per-size SVGs). Rasterized at the menu icon
+/// size. `None` when no SVG is found or it fails to parse.
+fn read_icon_svg(icon: &str) -> Option<(u32, u32, Vec<u8>)> {
+    const TARGET: u32 = 64;
+    if icon.starts_with('/') {
+        return icon
+            .ends_with(".svg")
+            .then(|| render_svg(std::path::Path::new(icon), TARGET))?;
+    }
+    let want = format!("{icon}.svg");
+    let mut best: Option<(u32, std::path::PathBuf)> = None;
+    let mut budget: u32 = 80_000;
+    for root in icon_roots() {
+        scan_for_icon(std::path::Path::new(&root), &want, 0, &mut budget, &mut best);
+    }
+    render_svg(&best?.1, TARGET)
+}
+
+/// Rasterize an SVG file to straight-alpha RGBA at `size`x`size` (aspect ratio
+/// preserved, centered in the square). Size-capped. `None` on any read, parse,
+/// or allocation failure.
+fn render_svg(path: &std::path::Path, size: u32) -> Option<(u32, u32, Vec<u8>)> {
+    const MAX_SVG: u64 = 1024 * 1024;
+    let md = std::fs::metadata(path).ok()?;
+    if !md.is_file() || md.len() > MAX_SVG {
+        return None;
+    }
+    let data = std::fs::read(path).ok()?;
+    let tree = resvg::usvg::Tree::from_data(&data, &resvg::usvg::Options::default()).ok()?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size)?;
+    let ts = tree.size();
+    let scale = (size as f32 / ts.width()).min(size as f32 / ts.height());
+    let tx = (size as f32 - ts.width() * scale) / 2.0;
+    let ty = (size as f32 - ts.height() * scale) / 2.0;
+    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale).post_translate(tx, ty);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    // tiny_skia stores premultiplied alpha; the compositor's GL icon path (like
+    // eframe's PNG decode) expects straight-alpha RGBA8. Demultiply per pixel.
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    for px in pixmap.pixels() {
+        let c = px.demultiply();
+        rgba.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+    }
+    Some((size, size, rgba))
 }
 
 /// Recursive `<name>.png` search under `dir` (depth- and entry-capped). Ranks

@@ -21,13 +21,73 @@ use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement
 use smithay::backend::renderer::{ImportAll, ImportMem};
 
 // Custom render elements composited on top of the app windows: the DnD ghost
-// (a wayland surface, needs ImportAll) and the "No volume mounted" hint icon (a
+// (a wayland surface, needs ImportAll), the "No volume mounted" hint icon (a
 // memory buffer drawn directly by the renderer, needs ImportMem, bypasses
-// egui, whose sRGB texture path fringes the icon's transparent edges).
+// egui, whose sRGB texture path fringes the icon's transparent edges), and the
+// draw-nothing damage marker for the egui overlay.
 smithay::backend::renderer::element::render_elements! {
     HintElement<R> where R: ImportMem + ImportAll;
     Surface = WaylandSurfaceRenderElement<R>,
     Memory = MemoryRenderBufferRenderElement<R>,
+    Egui = EguiDamage,
+}
+
+/// A draw-nothing element that reports the egui overlay's region as damaged.
+/// The toolbar is painted straight into the framebuffer AFTER render_output,
+/// outside the damage tracker, so with a real buffer age the tracker must be
+/// told to re-render what lies beneath the overlay: where it paints this frame
+/// (egui blends, so stale pixels would shine through) and where it painted
+/// before (a closed menu must not linger). A fresh Id every frame covers both:
+/// the tracker damages a vanished element's old geometry and a new element's
+/// current one.
+struct EguiDamage {
+    id: smithay::backend::renderer::element::Id,
+    geometry: Rectangle<i32, smithay::utils::Physical>,
+}
+
+impl EguiDamage {
+    fn new(geometry: Rectangle<i32, smithay::utils::Physical>) -> Self {
+        Self {
+            id: smithay::backend::renderer::element::Id::new(),
+            geometry,
+        }
+    }
+}
+
+impl smithay::backend::renderer::element::Element for EguiDamage {
+    fn id(&self) -> &smithay::backend::renderer::element::Id {
+        &self.id
+    }
+    fn current_commit(&self) -> smithay::backend::renderer::utils::CommitCounter {
+        smithay::backend::renderer::utils::CommitCounter::default()
+    }
+    fn src(&self) -> Rectangle<f64, smithay::utils::Buffer> {
+        Rectangle::from_size(
+            (self.geometry.size.w as f64, self.geometry.size.h as f64).into(),
+        )
+    }
+    fn geometry(
+        &self,
+        _scale: smithay::utils::Scale<f64>,
+    ) -> Rectangle<i32, smithay::utils::Physical> {
+        self.geometry
+    }
+}
+
+impl<R: smithay::backend::renderer::Renderer> smithay::backend::renderer::element::RenderElement<R>
+    for EguiDamage
+{
+    fn draw(
+        &self,
+        _frame: &mut R::Frame<'_, '_>,
+        _src: Rectangle<f64, smithay::utils::Buffer>,
+        _dst: Rectangle<i32, smithay::utils::Physical>,
+        _damage: &[Rectangle<i32, smithay::utils::Physical>],
+        _opaque_regions: &[Rectangle<i32, smithay::utils::Physical>],
+        _cache: Option<&smithay::utils::user_data::UserDataMap>,
+    ) -> Result<(), R::Error> {
+        Ok(())
+    }
 }
 
 /// Parse a "<w>x<h>" window-size string into bounded logical dimensions. Bounds
@@ -79,7 +139,7 @@ pub fn init_winit(
         }
         None => {}
     }
-    let (mut backend, winit) = winit::init_from_attributes(attributes)?;
+    let (backend, winit) = winit::init_from_attributes(attributes)?;
 
     // Host clipboard bridge on the compositor's own winit->host connection.
     {
@@ -88,8 +148,14 @@ pub fn init_winit(
             backend.window().display_handle().map(|h| h.as_raw())
         {
             // SAFETY: the display ptr belongs to the winit backend (compositor lifetime).
-            state.host_clipboard =
-                unsafe { crate::hostclip::HostClipboard::from_display_ptr(w.display.as_ptr()) };
+            // Keep the worker's JoinHandle so teardown can stop it before the
+            // backend (and the wl_display it borrows) is dropped.
+            if let Some((hc, worker)) =
+                unsafe { crate::hostclip::HostClipboard::from_display_ptr(w.display.as_ptr()) }
+            {
+                state.host_clipboard = Some(hc);
+                state.host_clipboard_worker = Some(worker);
+            }
         }
     }
 
@@ -125,6 +191,9 @@ pub fn init_winit(
     state.space.map_output(&output, (0, 0));
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
+    // Frames left to render with age 0 (full redraw) after a resize, while the
+    // swapchain reallocates and reported buffer ages are unreliable (as anvil).
+    let mut full_redraw: u8 = 0;
 
     // The backdrop IS the desktop: drawn first, behind every window. Themed:
     // light-gray under the light theme, near-black under dark.
@@ -133,6 +202,14 @@ pub fn init_winit(
     } else {
         [0.85, 0.85, 0.87, 1.0]
     };
+
+    // Rendering stays in the winit source (on Redraw). Share the backend so a
+    // paced timer can drive redraws, instead of the render re-requesting one
+    // every frame (which spun the CPU at ~130% - the loop never idled). calloop
+    // is single-threaded, so the timer's borrow and the render's borrow_mut can
+    // never overlap.
+    let backend = std::rc::Rc::new(std::cell::RefCell::new(backend));
+    let backend_render = backend.clone();
 
     event_loop.handle().insert_source(winit, move |event, _, state| {
         match event {
@@ -146,17 +223,121 @@ pub fn init_winit(
                     Some(Scale::Fractional(scale_factor)),
                     None,
                 );
+                full_redraw = 4;
             }
-            WinitEvent::Input(event) => state.process_input_event(event),
+            WinitEvent::Input(event) => {
+                state.process_input_event(event);
+                state.dirty = true; // cursor/egui may need to repaint
+            }
             WinitEvent::Redraw => {
+                let mut backend = backend_render.borrow_mut();
+                // Consume the dirty flag: this frame satisfies it. egui animations
+                // re-arm it below (via wants_repaint); commits/input set it again
+                // as they arrive.
+                state.dirty = false;
                 let size = backend.window_size();
-                let damage = Rectangle::from_size(size);
                 let has_windows = state.space.elements().next().is_some();
+                let scale_f = output.current_scale().fractional_scale();
+
+                // Refresh the launcher list from the leaders' .apps files and the
+                // human-published config-app list (~1s).
+                let now = state.start_time.elapsed();
+                if now.saturating_sub(state.leaders_scan_at)
+                    >= std::time::Duration::from_secs(1)
+                {
+                    let fresh = crate::toolbar::scan_leaders();
+                    let changed = fresh.len() != state.leaders.len()
+                        || fresh.iter().zip(&state.leaders).any(|(a, b)| {
+                            a.names != b.names || a.label != b.label || a.volumes != b.volumes
+                        });
+                    if changed {
+                        tracing::debug!(
+                            "toolbar: launchers = {:?}",
+                            fresh.iter().map(|l| l.names.clone()).collect::<Vec<_>>()
+                        );
+                        // Title = the mounted volumes; the app_id keeps the icon.
+                        backend.window().set_title(&crate::toolbar::volumes_title(&fresh));
+                    }
+                    state.leaders = fresh;
+                    state.cfg_apps = crate::toolbar::scan_config_apps();
+                    let font = crate::toolbar::scan_font();
+                    if let Some(tb) = state.toolbar.as_mut() {
+                        tb.refresh_icons(&state.cfg_apps);
+                        if let Some((path, base)) = font {
+                            tb.refresh_font(&path, base);
+                        }
+                    }
+                    // Live window resize: pick up a Settings change to the default
+                    // window size (published to /run/veracage/pub/window.size).
+                    if let Some(sz) = crate::toolbar::scan_window_size() {
+                        if sz != state.window_size_applied {
+                            apply_window_size(backend.window(), &sz);
+                            state.window_size_applied = sz;
+                        }
+                    }
+                    // Live keyboard shortcuts (Copy out / Paste in).
+                    if let Some(binds) = crate::shortcuts::scan() {
+                        let label = |b: &Option<crate::shortcuts::Keybind>| {
+                            b.as_ref().map(|k| k.label()).unwrap_or_else(|| "unset".into())
+                        };
+                        if let Some(tb) = state.toolbar.as_mut() {
+                            tb.refresh_shortcuts(label(&binds.copy_out), label(&binds.paste_in));
+                        }
+                        state.binds = binds;
+                    }
+                    // Live host-clipboard auto-clear policy; push to the worker
+                    // only on a change so we don't poke it every scan.
+                    if let Some(policy) = crate::toolbar::scan_clipclear() {
+                        if policy != state.clip_clear_applied {
+                            if let Some(hc) = &state.host_clipboard {
+                                hc.set_policy(policy.0, policy.1);
+                            }
+                            state.clip_clear_applied = policy;
+                        }
+                    }
+                    // Show a transient notice a leader published (a failed launch,
+                    // etc.) once, as a toolbar banner.
+                    if let Some((nonce, msg)) = crate::toolbar::scan_notice() {
+                        if nonce != state.notice_nonce {
+                            state.notice_nonce = nonce;
+                            if let Some(tb) = state.toolbar.as_mut() {
+                                tb.set_notice(msg);
+                            }
+                        }
+                    }
+                    state.leaders_scan_at = now;
+                }
+                // Run the toolbar UI (CPU only) BEFORE compositing: the region
+                // egui will paint goes to the damage tracker (as EguiDamage),
+                // since egui is painted into the framebuffer after render_output.
+                // The desktop indicator shows only with an empty space; a mapped
+                // sandbox window means the app IS the indication (and a filled
+                // CentralPanel would paint over it).
+                let (action, egui_rect) = if let Some(tb) = state.toolbar.as_mut() {
+                    tb.run(
+                        (size.w, size.h),
+                        scale_f,
+                        &state.leaders,
+                        &state.cfg_apps,
+                        has_windows,
+                    )
+                } else {
+                    (crate::toolbar::ToolbarAction::None, None)
+                };
+
+                // Re-render only what changed since this buffer was last drawn
+                // (its EGL buffer age). Right after a resize the age is forced
+                // to 0 (full frame) while the swapchain reallocates.
+                let age = if full_redraw > 0 {
+                    full_redraw -= 1;
+                    0
+                } else {
+                    backend.buffer_age().unwrap_or(0)
+                };
 
                 // A transient EGL/GL error (context loss, host-resize race, GL OOM)
                 // must skip the frame, not abort the compositor and every app.
-                let scale_f = output.current_scale().fractional_scale();
-                let render_err: Option<String> = match backend.bind() {
+                let render_res = match backend.bind() {
                     Ok((renderer, mut framebuffer)) => {
                         // Drag-and-drop icon: composite the "ghost" at the cursor,
                         // on top of the app windows, so a drag has visual feedback
@@ -216,6 +397,11 @@ pub fn init_winit(
                                 }
                             }
                         }
+                        // The egui overlay's region, so the tracker re-renders
+                        // beneath it (see EguiDamage).
+                        if let Some(rect) = egui_rect {
+                            custom.push(HintElement::Egui(EguiDamage::new(rect)));
+                        }
                         smithay::desktop::space::render_output::<
                             _,
                             HintElement<GlesRenderer>,
@@ -225,106 +411,48 @@ pub fn init_winit(
                             &output,
                             renderer,
                             &mut framebuffer,
-                            scale_f as f32,
-                            0,
+                            1.0,
+                            age,
                             [&state.space],
                             &custom,
                             &mut damage_tracker,
                             clear_color,
                         )
-                        .err()
-                        .map(|e| e.to_string())
+                        .map_err(|e| e.to_string())
                     }
-                    Err(e) => Some(e.to_string()),
+                    Err(e) => Err(e.to_string()),
                 };
-                if let Some(e) = render_err {
-                    tracing::warn!("render skipped this frame: {e}");
-                    backend.window().request_redraw();
-                    return;
-                }
+                let res = match render_res {
+                    Ok(res) => res,
+                    Err(e) => {
+                        tracing::warn!("render skipped this frame: {e}");
+                        return;
+                    }
+                };
 
-                // Toolbar (Phase 3): paint egui on top, into the same (still-bound,
-                // still-current) framebuffer, before we swap. Built lazily now
-                // because it needs the GL context current, which bind() just made.
+                // Toolbar built lazily AFTER the first render pass: the egui
+                // painter needs the GL context current, which only rendering
+                // guarantees (bind alone defers it). Re-arm the dirty flag so
+                // the strip paints on the very next frame.
                 if state.toolbar.is_none() && !state.toolbar_failed {
                     match crate::toolbar::Toolbar::new() {
-                        Some(tb) => state.toolbar = Some(tb),
+                        Some(tb) => {
+                            state.toolbar = Some(tb);
+                            state.dirty = true;
+                        }
                         None => state.toolbar_failed = true,
                     }
                 }
-                // Refresh the launcher list from the leaders' .apps files and the
-                // human-published config-app list (~1s).
-                let now = state.start_time.elapsed();
-                if now.saturating_sub(state.leaders_scan_at)
-                    >= std::time::Duration::from_secs(1)
-                {
-                    let fresh = crate::toolbar::scan_leaders();
-                    let changed = fresh.len() != state.leaders.len()
-                        || fresh.iter().zip(&state.leaders).any(|(a, b)| {
-                            a.names != b.names || a.label != b.label || a.volumes != b.volumes
-                        });
-                    if changed {
-                        tracing::debug!(
-                            "toolbar: launchers = {:?}",
-                            fresh.iter().map(|l| l.names.clone()).collect::<Vec<_>>()
-                        );
-                        // Title = the mounted volumes; the app_id keeps the icon.
-                        backend.window().set_title(&crate::toolbar::volumes_title(&fresh));
-                    }
-                    state.leaders = fresh;
-                    state.cfg_apps = crate::toolbar::scan_config_apps();
-                    let font = crate::toolbar::scan_font();
+
+                // Paint egui on top, into the same (still-bound, still-current)
+                // framebuffer, before the swap. Skipped when nothing will be
+                // submitted: painting a buffer the damage tracker considers
+                // unchanged would leave pixels it doesn't know about.
+                if res.damage.is_some() {
                     if let Some(tb) = state.toolbar.as_mut() {
-                        tb.refresh_icons(&state.cfg_apps);
-                        if let Some((path, base)) = font {
-                            tb.refresh_font(&path, base);
-                        }
+                        tb.paint((size.w, size.h));
                     }
-                    // Live window resize: pick up a Settings change to the default
-                    // window size (published to /run/veracage/pub/window.size).
-                    if let Some(sz) = crate::toolbar::scan_window_size() {
-                        if sz != state.window_size_applied {
-                            apply_window_size(backend.window(), &sz);
-                            state.window_size_applied = sz;
-                        }
-                    }
-                    // Live keyboard shortcuts (Copy out / Paste in).
-                    if let Some(binds) = crate::shortcuts::scan() {
-                        let label = |b: &Option<crate::shortcuts::Keybind>| {
-                            b.as_ref().map(|k| k.label()).unwrap_or_else(|| "unset".into())
-                        };
-                        if let Some(tb) = state.toolbar.as_mut() {
-                            tb.refresh_shortcuts(label(&binds.copy_out), label(&binds.paste_in));
-                        }
-                        state.binds = binds;
-                    }
-                    // Live host-clipboard auto-clear policy; push to the worker
-                    // only on a change so we don't poke it every scan.
-                    if let Some(policy) = crate::toolbar::scan_clipclear() {
-                        if policy != state.clip_clear_applied {
-                            if let Some(hc) = &state.host_clipboard {
-                                hc.set_policy(policy.0, policy.1);
-                            }
-                            state.clip_clear_applied = policy;
-                        }
-                    }
-                    state.leaders_scan_at = now;
                 }
-                let scale = output.current_scale().fractional_scale();
-                // The desktop indicator shows only with an empty space; a mapped
-                // sandbox window means the app IS the indication (and a filled
-                // CentralPanel would paint over it).
-                let action = if let Some(tb) = state.toolbar.as_mut() {
-                    tb.render(
-                        (size.w, size.h),
-                        scale,
-                        &state.leaders,
-                        &state.cfg_apps,
-                        has_windows,
-                    )
-                } else {
-                    crate::toolbar::ToolbarAction::None
-                };
                 match action {
                     crate::toolbar::ToolbarAction::ClipPush => {
                         crate::clipboard::push_from_host(state)
@@ -345,10 +473,20 @@ pub fn init_winit(
                     crate::toolbar::ToolbarAction::None => {}
                 }
 
-                if let Err(e) = backend.submit(Some(&[damage])) {
-                    tracing::warn!("submit skipped this frame: {e}");
-                    backend.window().request_redraw();
-                    return;
+                // Keep rendering while egui is animating (menu fade, hover, the
+                // notice banner countdown): it asks for another frame.
+                if state.toolbar.as_ref().is_some_and(|tb| tb.wants_repaint()) {
+                    state.dirty = true;
+                }
+
+                // Swap with the real damage: the host compositor recomposites
+                // only what actually changed. No damage means nothing was
+                // rendered, so there is nothing to swap.
+                if let Some(damage) = res.damage {
+                    if let Err(e) = backend.submit(Some(damage.as_slice())) {
+                        tracing::warn!("submit skipped this frame: {e}");
+                        return;
+                    }
                 }
 
                 state.space.elements().for_each(|window| {
@@ -363,9 +501,6 @@ pub fn init_winit(
                 state.space.refresh();
                 state.popups.cleanup();
                 let _ = state.display_handle.flush_clients();
-
-                // Ask for redraw to schedule new frame.
-                backend.window().request_redraw();
             }
             WinitEvent::CloseRequested => {
                 state.loop_signal.stop();
@@ -373,6 +508,30 @@ pub fn init_winit(
             _ => (),
         };
     })?;
+
+    // Pace redraws at ~60fps with a timer instead of an unbounded self-requesting
+    // redraw. A nested compositor must still redraw periodically to pick up client
+    // commits (they don't wake winit), so we can't render purely on demand; the
+    // timer bounds it to the refresh rate. Single-threaded calloop means this
+    // borrow never overlaps the render's borrow_mut.
+    use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+    event_loop
+        .handle()
+        .insert_source(Timer::immediate(), move |_, _, state| {
+            // Wake the renderer only when something changed (a client commit,
+            // input, an egui animation) or the ~1s scan is due (notices, live
+            // settings). Otherwise stay idle: the compositor software-renders, so
+            // re-drawing an unchanged frame is the ~130% CPU we are avoiding.
+            let scan_due = state
+                .start_time
+                .elapsed()
+                .saturating_sub(state.leaders_scan_at)
+                >= Duration::from_secs(1);
+            if state.dirty || scan_due {
+                backend.borrow().window().request_redraw();
+            }
+            TimeoutAction::ToDuration(Duration::from_millis(16))
+        })?;
 
     Ok(())
 }

@@ -233,8 +233,6 @@ def ensure_empty_session() -> None:
     unit = f"veracage-session-{sid}-{secrets.token_hex(3)}.service"
     helper_flags = ["--empty-session", "--session", sid] + _exchange_flags(cfg)
     leader_args = ["_leader", "--apps", json.dumps(apps_list)]
-    if cfg.gpu:
-        leader_args.append("--gpu")
     # Detached transient unit (no --pty/--pipe): systemd-run returns once started;
     # the leader runs in the background, pkexec authenticating via the polkit agent
     # (auth_self_keep coalesces this with the compositor's prompt moments earlier).
@@ -298,6 +296,10 @@ def cmd_sync_apps(args: argparse.Namespace) -> int:
     session, not only the next one. Best-effort: a session that does not
     answer just keeps its old list."""
     cfg = config.load()
+    # Also refresh the published pub/ files (app list, font, mimeapps seed):
+    # the broker runs _sync-apps on every config.toml change, so this keeps the
+    # published state current for both GUI and CLI edits.
+    config.publish_apps(cfg)
     apps_list = [{"name": a.name, "exec": a.exec} for a in cfg.apps.values()]
     for sp in _session_sockets():
         try:
@@ -349,7 +351,6 @@ def cmd_open(args: argparse.Namespace) -> int:
     # the (label-derived) mountpoint into the leader argv, so the CLI no longer
     # picks a mountpoint. (docs/shared-workspace.md.)
     sid = str(os.getuid())
-    gpu = cfg.gpu_for(str(vault))
     backend = cfg.backend_for(str(vault))
 
     env_args = _forward_env_args()
@@ -410,8 +411,6 @@ def cmd_open(args: argparse.Namespace) -> int:
     leader_args = ["_leader", "--apps", json.dumps(apps_list)]
     if first_app is not None:
         leader_args += ["--first", json.dumps(first_app)]
-    if gpu:
-        leader_args.append("--gpu")
 
     # Wrap the launch in a systemd transient *service* (not a scope: scope units
     # reject Exec* properties, so ExecStopPost never registered) so cleanup is
@@ -483,7 +482,7 @@ def cmd_leader(args: argparse.Namespace) -> int:
     dropped to us and passed the control fd via the environment)."""
     apps_list = json.loads(args.apps) if args.apps else []
     first_app = json.loads(args.first) if args.first else None
-    return leader.run_leader(args.mountpoint, args.gpu, apps_list, first_app)
+    return leader.run_leader(args.mountpoint, apps_list, first_app)
 
 
 # ------------------------------------------------------ veracage list / close
@@ -560,7 +559,6 @@ def main() -> int:
     p_leader.add_argument("--mountpoint", required=True)
     p_leader.add_argument("--apps", default=None)   # JSON list, for the toolbar
     p_leader.add_argument("--first", default=None)  # JSON spec to auto-launch
-    p_leader.add_argument("--gpu", action="store_true")
     p_leader.set_defaults(func=cmd_leader)
 
     p_comp = sub.add_parser("_compositor", help=argparse.SUPPRESS)

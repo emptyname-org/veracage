@@ -19,7 +19,7 @@ Status tags:
 uid" is **blocked**. The residual is only that the trailing *args* to those
 two subcommands are forwarded unvalidated (`--mountpoint` is separately
 validated, `--apps`/`--first` are JSON the leader only launches from by
-bounds-checked index, and `--gpu` is a bool). Low residual blast radius.
+bounds-checked index). Low residual blast radius.
 *Fix:* have the helper **construct** the full continuation argv from validated
 inputs rather than forwarding `args.rest`.
 `obsolete-if:` the human-uid launcher becomes the only caller AND the helper's
@@ -94,11 +94,13 @@ edge.
   root-owned, the helper writes a validated path). *Fix:* match the helper's
   `mountpoint_ok` (parent == `/run/veracage`, reject `..`), applied to the
   `.raw`/`.run` siblings too.
-- **bwrap nested userns + cores**: `sandbox.py` doesn't `--disable-userns`
-  (a compromised viewer can `unshare(CLONE_NEWUSER)` to widen kernel attack
-  surface) nor suppress cores (a crash dumps decrypted content to
-  `/var/lib/systemd/coredump`). *Fix:* `--unshare-user --disable-userns`
-  (bwrap >= 0.8) + `RLIMIT_CORE=0` preexec. Secondary threat model.
+- **bwrap cores dump decrypted content**: `sandbox.py` doesn't suppress cores,
+  so an app crash dumps decrypted content to `/var/lib/systemd/coredump` (a
+  host-readable path). This is an **accidental leak**, in scope. *Fix:*
+  `RLIMIT_CORE=0` preexec. (`--unshare-user --disable-userns` (bwrap >= 0.8)
+  would also narrow the kernel attack surface a compromised app could reach,
+  but confining the app is outside the threat model, so that part is defense in
+  depth only, not a fix this model owes.)
 - **`scan_leaders` TOCTOU** - residual on the existing size/type checks:
   between `symlink_metadata` and `read_to_string` a same-uid process can swap
   the validated regular file for a FIFO (main-thread hang) or grow it past the

@@ -7,18 +7,12 @@ Isolation core in [`docs/uid-isolation.md`](docs/uid-isolation.md).
 
 ## The problem
 
-Encrypting a volume protects it only while it stays unmounted. The moment you
-mount a VeraCrypt or LUKS volume on a normal Linux host, its decrypted contents
-belong to your user account, so every process running as you can read them. A
-background app, a careless script, or malware in your session can open the
-mounted files and watch your clipboard, and ordinary file permissions do nothing
-to stop it, because it is all the same user.
-
-Veracage isolates the decrypted volume from the rest of your own session. It
-mounts the contents so that only a dedicated system user can read them, runs your
-chosen apps as that user with no network and no view of your other files, and
-keeps a separate clipboard that moves data only when you ask. A compromised or
-nosy program in your normal session cannot reach what is inside.
+Encryption at rest protects a volume only until it is mounted. Once decrypted,
+its contents are readable by everything running in your session. Beyond outright
+malware, harmless background processes such as search indexers, antivirus
+scanners, backup tools, cloud-sync clients, thumbnail generators, and
+applications creating autosave or temporary copies can read that plaintext and
+leave copies of sensitive data in unencrypted storage outside the volume.
 
 ## Architecture
 
@@ -44,7 +38,9 @@ ownership, and the mount never appears in `/proc/mounts`. Apps run as
   is an empty session, so apps are launchable before any volume is mounted:
   a sandboxed **scratchpad** (no network, no host filesystem) whose only ways
   out are the clipboard and the shared directory. Mounting a volume joins the
-  same session. Apps launched after the mount see it.
+  same session. Apps launched after the mount see it. Double-clicking a file
+  in a sandboxed file manager opens it with your enabled apps: the file-type
+  defaults are seeded from the enabled list and the host's own associations.
 - **Clipboard** - user-triggered only: Clipboard > Paste in (host to sandbox)
   and Clipboard > Copy out (sandbox to host), with configurable shortcuts
   (defaults Ctrl+Alt+V / Ctrl+Alt+C). Text-only, owned by the compositor. After
@@ -81,13 +77,13 @@ Deferred: GlobalShortcuts-portal integration for the clipboard keybinds.
 Debian 12 system packages:
 
 ```
-sudo apt install bubblewrap cryptsetup veracrypt python3
+sudo apt install bubblewrap cryptsetup python3
 ```
 
-`bubblewrap` + `cryptsetup` (+ `veracrypt` for VeraCrypt volumes) are
-required. No weston, wl-clipboard, Qt/GTK, or python3-gi. The agent and
-compositor are self-contained Rust binaries linking only what a desktop
-session already has (Mesa GL, Wayland/X11, `libxkbcommon.so.0`).
+`bubblewrap` + `cryptsetup` are required. cryptsetup opens both LUKS and
+VeraCrypt volumes. The agent and compositor are self-contained Rust binaries
+linking only what a desktop session already has (Mesa GL, Wayland/X11,
+`libxkbcommon.so.0`).
 
 ### Toolchain (build only)
 
@@ -137,7 +133,6 @@ theme          = "light"        # light | dark
 ui_font        = "system"       # system (host font) | noto | liberation | dejavu | dejavu-mono
 ui_font_size   = "system"       # system (host size) | a point size, e.g. 12
 window_size    = "default"      # default | max | 1280x800 (WxH)
-gpu            = false          # /dev/dri passthrough (side channel, off)
 suspend_action = "dismount"     # unmount on suspend, or "ignore" to keep mounted
 clip_clear     = true           # auto-clear the host clipboard after Copy out
 clip_clear_timeout = 30         # seconds before the auto-clear fires
@@ -148,7 +143,6 @@ exec     = "kate"
 
 [volumes."/path/to/work.vc"]    # optional per-volume overrides
 default_app  = "okular"
-gpu          = true
 ```
 
 Per-volume settings inherit from `[default]`. Only apps under `[apps.*]`

@@ -246,4 +246,64 @@ mod tests {
         assert!(vault_reads, "vault uid {vault} should read the idmapped vault");
         assert!(human_denied, "on-disk uid {on_disk} must be denied");
     }
+
+    /// The read-only-on-FAT fix (see `stage_opts` in main.rs): a filesystem with
+    /// no per-file ownership (vfat/exfat/ntfs) can't be chowned, so the helper
+    /// mounts it with `uid=` options and idmaps that uid to the vault uid. This
+    /// verifies the composition end to end: a vfat volume mounted `uid=<on_disk>`
+    /// then idmap-cloned to the vault uid is WRITABLE by the vault uid (the bug
+    /// was `nobody`, read-only). Needs root + `mkfs.vfat` (dosfstools).
+    #[test]
+    #[ignore = "needs root + dosfstools; run with sudo and --ignored"]
+    fn idmap_mount_writable_on_vfat() {
+        use std::process::Command;
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping idmap_mount_writable_on_vfat: not root");
+            return;
+        }
+        let on_disk = 1000u32;
+        let vault = 65500u32; // a uid no human has
+        let work = std::env::temp_dir().join(format!("vc-vfat-{}", std::process::id()));
+        let m0 = work.join("m0");
+        let target = work.join("idmapped");
+        std::fs::create_dir_all(&m0).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let img = work.join("fat.img");
+        let sh = |c: &str, a: &[&str]| Command::new(c).args(a).status().unwrap().success();
+        assert!(sh("truncate", &["-s", "32M", img.to_str().unwrap()]));
+        assert!(sh("mkfs.vfat", &[img.to_str().unwrap()]));
+        // Mount exactly as stage_opts does for an ownerless fs: every file appears
+        // owned by the human (on_disk) uid.
+        assert!(sh(
+            "mount",
+            &[
+                "-o",
+                &format!("loop,uid={on_disk},gid={on_disk},umask=0077"),
+                img.to_str().unwrap(),
+                m0.to_str().unwrap(),
+            ],
+        ));
+        let cleanup = || {
+            let _ = Command::new("umount").arg(&target).status();
+            let _ = Command::new("umount").arg(&m0).status();
+            let _ = std::fs::remove_dir_all(&work);
+        };
+        if let Err(e) = idmap_mount(&m0, &target, on_disk, on_disk, vault, vault, 0) {
+            cleanup();
+            panic!("idmap_mount failed: {e}");
+        }
+        // The vault uid must be able to CREATE a file (the bug was read-only).
+        let newf = target.join("vault-write.txt");
+        let wrote = Command::new("setpriv")
+            .args([
+                "--reuid", &vault.to_string(), "--regid", &vault.to_string(),
+                "--clear-groups", "touch",
+            ])
+            .arg(&newf)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        cleanup();
+        assert!(wrote, "vault uid {vault} must be able to write the idmapped vfat volume");
+    }
 }

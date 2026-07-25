@@ -475,23 +475,29 @@ pub fn publish_apps() {
     }
     for a in cfg.apps.iter().filter(|a| sane(&a.key)) {
         let path = icons.join(format!("{}.rgba", a.key));
-        // A hit OR a remembered miss (a 0-byte sentinel, which the compositor's
-        // blob validation rejects as "no icon") both short-circuit. Otherwise
-        // an icon-less app re-runs the expensive recursive theme scan on EVERY
-        // publish_apps (startup + every config edit). Icons don't churn.
-        if path.exists() {
+        // Skip only a NON-EMPTY icon already on disk: a real icon (or the generic
+        // fallback) is cached, so an app never re-runs the expensive recursive
+        // theme scan on every publish_apps. A 0-byte file is a stale "miss"
+        // sentinel from an older binary (before SVG + generic fallback existed);
+        // re-resolve it, so an upgrade heals it to a real or generic icon instead
+        // of pinning the app to text forever. Genuine misses now cache the
+        // (non-empty) generic icon, so they don't rescan either.
+        if path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
             continue;
         }
-        let blob = match crate::detect::icon_rgba_for_exec(&a.exec) {
-            Some((w, h, rgba)) => {
+        // The app's own icon, else a generic app icon so the menu shows a glyph
+        // rather than bare text. The 0-byte sentinel is reached only if even the
+        // generic can't be resolved (no theme, missing bundled asset).
+        let blob = crate::detect::icon_rgba_for_exec(&a.exec)
+            .or_else(crate::detect::generic_icon_rgba)
+            .map(|(w, h, rgba)| {
                 let mut b = Vec::with_capacity(8 + rgba.len());
                 b.extend_from_slice(&w.to_le_bytes());
                 b.extend_from_slice(&h.to_le_bytes());
                 b.extend_from_slice(&rgba);
                 b
-            }
-            None => Vec::new(), // 0-byte sentinel: remembers the miss
-        };
+            })
+            .unwrap_or_default();
         let tmp = icons.join(format!("{}.tmp", a.key));
         if std::fs::write(&tmp, blob).is_ok() {
             let _ = std::fs::rename(&tmp, &path);

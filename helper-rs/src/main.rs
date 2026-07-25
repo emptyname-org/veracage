@@ -272,6 +272,27 @@ fn resolve_caller() -> Result<(u32, u32), String> {
     Ok((uid, gid))
 }
 
+/// Drop privileges to the vault user: supplementary groups from the vault
+/// user's /etc/group memberships (initgroups - notably `render`, granted at
+/// install so Mesa can open /dev/dri/renderD* for hardware GL; a bare
+/// setgroups(0) would silently strip it and force llvmpipe software
+/// rendering), then gid, then uid. The group list is root-administered via
+/// /etc/group, never caller input.
+fn drop_to_vault_user(vault_uid: u32, vault_gid: u32) {
+    let name = CString::new(VAULT_USER).unwrap();
+    unsafe {
+        if libc::initgroups(name.as_ptr(), vault_gid) != 0 {
+            fail_errno("initgroups");
+        }
+        if libc::setresgid(vault_gid, vault_gid, vault_gid) != 0 {
+            fail_errno("setresgid");
+        }
+        if libc::setresuid(vault_uid, vault_uid, vault_uid) != 0 {
+            fail_errno("setresuid");
+        }
+    }
+}
+
 /// (uid, gid) of the dedicated vault system user, resolved by NAME, never
 /// from argv, so the caller can't choose to run as their own (or root's) uid.
 fn resolve_vault_user(human_uid: u32) -> Result<(u32, u32), String> {
@@ -347,6 +368,36 @@ fn try_chown(p: &Path, uid: u32, gid: u32) {
             p.display(),
             std::io::Error::last_os_error()
         );
+    }
+}
+
+/// True for a filesystem with no per-file ownership (FAT/exFAT/NTFS): ownership
+/// comes from mount options and `chown(2)` returns EPERM. VeraCrypt/TrueCrypt
+/// volumes are commonly FAT. Detected on the decrypted device via `blkid`.
+fn is_ownerless_fs(dm_path: &str) -> bool {
+    match Command::new(tool("blkid"))
+        .args(["-o", "value", "-s", "TYPE", dm_path])
+        .output()
+    {
+        Ok(o) if o.status.success() => matches!(
+            String::from_utf8_lossy(&o.stdout).trim().to_ascii_lowercase().as_str(),
+            "vfat" | "exfat" | "ntfs" | "msdos",
+        ),
+        _ => false,
+    }
+}
+
+/// Stage-mount options for the decrypted `dm_path`, and whether a chown is still
+/// needed afterward. An ownerless fs (FAT/exFAT/NTFS) is mounted with `uid=/gid=`
+/// so every file already appears owned by the human uid (the idmap then remaps it
+/// to the vault uid, a WRITABLE vault). Without this such a volume mounts
+/// root-owned, `chown` fails with EPERM, and the sandbox sees `nobody`,
+/// read-only. A POSIX fs is mounted plain and its root inode chowned instead.
+fn stage_opts(dm_path: &str, human_uid: u32, human_gid: u32) -> (String, bool) {
+    if is_ownerless_fs(dm_path) {
+        (format!("nodev,nosuid,uid={human_uid},gid={human_gid},umask=0077"), false)
+    } else {
+        ("nodev,nosuid".to_string(), true)
     }
 }
 
@@ -780,18 +831,7 @@ fn spawn_compositor(
     let _ = std::fs::remove_file(rt.join("wl-vc"));
     write_pidfile(&rt.join("compositor.pid"), vault_uid, vault_gid);
 
-    // Drop privileges to the vault uid (gid first, then uid).
-    unsafe {
-        if libc::setgroups(0, ptr::null()) != 0 {
-            fail_errno("setgroups");
-        }
-        if libc::setresgid(vault_gid, vault_gid, vault_gid) != 0 {
-            fail_errno("setresgid");
-        }
-        if libc::setresuid(vault_uid, vault_uid, vault_uid) != 0 {
-            fail_errno("setresuid");
-        }
-    }
+    drop_to_vault_user(vault_uid, vault_gid);
 
     // Allowlisted env pkexec stripped, then force the compositor's runtime dir
     // (veracage-writable; the human's isn't reachable by the vault uid) and the
@@ -951,8 +991,16 @@ fn child(
     // it into an idmapped mount.
     std::fs::create_dir_all(raw).unwrap_or_else(|e| fail(&format!("mkdir staging: {e}"), 1));
     set_mode(raw, 0o700);
+    // Stage-mount with ownership appropriate to the filesystem: an ownerless fs
+    // (FAT/exFAT/NTFS) gets uid=/gid= mount options, a POSIX fs is mounted plain
+    // and its root inode chowned to the human uid. Either way the idmap below then
+    // presents the human uid as the vault uid, a writable vault. For a POSIX fs
+    // the chown covers only the root inode (non-recursive); the app's config/cache
+    // live on a tmpfs, never the volume. Best-effort so a read-only volume opens.
+    let (opts, needs_chown) = stage_opts(&dm_path, human_uid, human_gid);
     let st = Command::new(tool("mount"))
-        .args(["-o", "nodev,nosuid", &dm_path])
+        .args(["-o", &opts])
+        .arg(&dm_path)
         .arg(raw)
         .status()
         .unwrap_or_else(|e| fail(&format!("spawn mount: {e}"), 1));
@@ -960,16 +1008,9 @@ fn child(
         let _ = crypt::close(dm_name);
         fail(&format!("mount failed: {}", st.code().unwrap_or(-1)), st.code().unwrap_or(1));
     }
-
-    // Make the vault writable to the vault uid. The idmap below maps only the
-    // human uid -> vault uid, but a freshly-mkfs'd volume's root dir is
-    // root-owned, so /vault would appear as "nobody" and be read-only. chown
-    // ONLY the root inode (non-recursive) to the human uid so the idmap
-    // presents it as vault-uid-owned and writable. This is the *single*
-    // automatic on-disk change we make; the app's config/cache/rc live on a
-    // tmpfs, never the volume. Best-effort so a genuinely read-only volume
-    // still opens.
-    try_chown(raw, human_uid, human_gid);
+    if needs_chown {
+        try_chown(raw, human_uid, human_gid);
+    }
 
     // Present the vault as the vault uid via an idmapped mount. Map the HUMAN's
     // uid/gid -> the vault uid/gid: a single-user vault's data is owned by the
@@ -1027,18 +1068,7 @@ fn child(
     set_mode(vault_run, 0o700);
     chown(vault_run, vault_uid, vault_gid);
 
-    // Drop privileges to the vault uid (gid first, then uid).
-    unsafe {
-        if libc::setgroups(0, ptr::null()) != 0 {
-            fail_errno("setgroups");
-        }
-        if libc::setresgid(vault_gid, vault_gid, vault_gid) != 0 {
-            fail_errno("setresgid");
-        }
-        if libc::setresuid(vault_uid, vault_uid, vault_uid) != 0 {
-            fail_errno("setresuid");
-        }
-    }
+    drop_to_vault_user(vault_uid, vault_gid);
 
     // Re-establish the handful of allowlisted env vars pkexec stripped.
     for kv in &args.setenv {
@@ -1111,8 +1141,10 @@ fn mount_volume_at_workspace(
     // to the workspace path (identical dance to the per-vault `child`).
     std::fs::create_dir_all(&raw).unwrap_or_else(|e| fail(&format!("mkdir staging: {e}"), 1));
     set_mode(&raw, 0o700);
+    let (opts, needs_chown) = stage_opts(&dm_path, human_uid, human_gid);
     let st = Command::new(tool("mount"))
-        .args(["-o", "nodev,nosuid", &dm_path])
+        .args(["-o", &opts])
+        .arg(&dm_path)
         .arg(&raw)
         .status()
         .unwrap_or_else(|e| fail(&format!("spawn mount: {e}"), 1));
@@ -1121,7 +1153,9 @@ fn mount_volume_at_workspace(
         let _ = crypt::close(dm_name);
         fail(&format!("mount failed: {}", st.code().unwrap_or(-1)), st.code().unwrap_or(1));
     }
-    try_chown(&raw, human_uid, human_gid);
+    if needs_chown {
+        try_chown(&raw, human_uid, human_gid);
+    }
 
     std::fs::create_dir_all(&mountpoint).unwrap_or_else(|e| fail(&format!("mkdir mountpoint: {e}"), 1));
     set_mode(&mountpoint, 0o755);
@@ -1221,17 +1255,7 @@ fn session_child(
     set_mode(&vault_run, 0o700);
     chown(&vault_run, vault_uid, vault_gid);
 
-    unsafe {
-        if libc::setgroups(0, ptr::null()) != 0 {
-            fail_errno("setgroups");
-        }
-        if libc::setresgid(vault_gid, vault_gid, vault_gid) != 0 {
-            fail_errno("setresgid");
-        }
-        if libc::setresuid(vault_uid, vault_uid, vault_uid) != 0 {
-            fail_errno("setresuid");
-        }
-    }
+    drop_to_vault_user(vault_uid, vault_gid);
 
     for kv in &args.setenv {
         if let Some((k, v)) = kv.split_once('=') {

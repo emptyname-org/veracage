@@ -104,6 +104,11 @@ test-compositor:
 # user; it must exist before `veracage open`. Idempotent.
 veracage-user:
 	@id veracage >/dev/null 2>&1 || sudo useradd -r -M -s /usr/sbin/nologin veracage
+	# GPU: membership in `render` lets the compositor and the sandboxed apps open
+	# /dev/dri/renderD* for hardware GL (the helper applies it via initgroups).
+	# Without it Mesa silently falls back to llvmpipe software rendering.
+	@if getent group render >/dev/null 2>&1 && ! id -nG veracage | grep -qw render; then \
+	  sudo usermod -aG render veracage; fi
 	@echo "veracage user uid: $$(id -u veracage)"
 
 # --- real install --------------------------------------------------------
@@ -112,6 +117,9 @@ install: build build-agent build-compositor
 	# Dedicated vault system user (skipped for staged/packaged DESTDIR builds,
 	# where a package postinst should create it instead).
 	@if [ -z "$(DESTDIR)" ]; then id veracage >/dev/null 2>&1 || sudo useradd -r -M -s /usr/sbin/nologin veracage; fi
+	# render-group membership -> hardware GL for the compositor + sandboxed apps.
+	@if [ -z "$(DESTDIR)" ] && getent group render >/dev/null 2>&1 && ! id -nG veracage | grep -qw render; then \
+	  sudo usermod -aG render veracage; fi
 	# Python package
 	$(SUDO) install -d "$(DESTDIR)$(LIBDIR)"
 	# cp -r into an existing dir nests (…/veracage/veracage) and leaves the old

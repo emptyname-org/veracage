@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from pathlib import Path
 
 from .apps import App
 
 
 def bwrap_command(workspace: str, app: App, wayland_socket: Path,
-                  gpu: bool = False, places_fd: int | None = None,
+                  seeds: Sequence[tuple[int, str]] | None = None,
                   exchange: str | None = None) -> list[str]:
     """Construct argv for `bwrap`.
 
@@ -24,9 +25,17 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
     into the sandbox at /run/user/$UID/wayland-0; the rest of the user's
     runtime dir is hidden behind a tmpfs.
 
-    `gpu` opts into /dev/dri passthrough (per-volume `gpu = true`). Off by
-    default - Okular/Kate render fine on CPU and a shared GPU is a documented
-    side channel.
+    `seeds` are (fd, destination) pairs copied into the sandbox as ordinary
+    WRITABLE files via bwrap `--file` (apps such as Dolphin rewrite them on
+    startup, so a read-only bind would error): the KDE Places seed and the
+    default-app associations. The caller must also pass the fds to Popen's
+    pass_fds.
+
+    The host GPU is always passed through (`/dev/dri` plus the /sys device
+    metadata Mesa needs to pick its hardware driver): without it every app
+    falls back to llvmpipe software rendering and burns CPU. The isolation is
+    one-directional (keep the host out of the volume), so the GPU is not a
+    boundary the sandbox needs to withhold.
     """
     uid = os.getuid()
     argv = [
@@ -40,6 +49,14 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
         # Filesystem
         "--proc", "/proc",
         "--dev", "/dev",
+        # GPU: the render node (into the fresh devtmpfs, so this must come after
+        # `--dev /dev`) plus the /sys device metadata Mesa's loader reads to
+        # identify the hardware and pick its driver (verified: without these it
+        # logs "failed to retrieve device information" and falls back to
+        # swrast/llvmpipe). `-try` so a GPU-less host still works (software).
+        "--dev-bind-try", "/dev/dri", "/dev/dri",
+        "--ro-bind-try", "/sys/dev/char", "/sys/dev/char",
+        "--ro-bind-try", "/sys/devices", "/sys/devices",
         "--tmpfs", "/tmp",
         "--ro-bind", "/usr", "/usr",
         # Curated /etc instead of a wholesale `--ro-bind /etc /etc`: expose
@@ -108,17 +125,8 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
         val = os.environ.get(var)
         if val:
             argv += ["--setenv", var, val]
-    if places_fd is not None:
-        # Show the vault as a named place in the sandbox file manager: KDE reads
-        # $XDG_DATA_HOME/user-places.xbel (XDG_DATA_HOME=/xdg/data). Use --file
-        # (not --ro-bind): it writes the seed into a normal WRITABLE file in the
-        # /xdg tmpfs, so Dolphin can rewrite it (it merges its default places on
-        # startup) instead of erroring "not writable". `places_fd` carries the
-        # seed content; it's passed to bwrap via pass_fds.
-        argv += ["--file", str(places_fd), "/xdg/data/user-places.xbel"]
-    if gpu:
-        # Comes after `--dev /dev`, so it binds into the fresh devtmpfs.
-        argv += ["--dev-bind-try", "/dev/dri", "/dev/dri"]
+    for fd, dest in seeds or ():
+        argv += ["--file", str(fd), dest]
     if exchange is not None:
         # The idmapped host<->vault shared folder (helper mounted it in this NS,
         # presented as veracage-owned). Bind it at /exchange - a top-level path,

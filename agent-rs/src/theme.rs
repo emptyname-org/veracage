@@ -86,6 +86,21 @@ pub fn content_frame(ctx: &egui::Context) -> egui::Frame {
         .inner_margin(egui::Margin::symmetric(36.0, 18.0))
 }
 
+/// A dialog's scrollable content panel: the house frame plus a vertical scroll
+/// area, so a window shorter than its content never hides the bottom rows (the
+/// Save/Cancel buttons live in `action_bar`, a separate pinned panel). Route
+/// every dialog body through this, so no dialog - present or future - can overflow
+/// off-screen.
+pub fn content_panel(ctx: &egui::Context, add_contents: impl FnOnce(&mut egui::Ui)) {
+    egui::CentralPanel::default()
+        .frame(content_frame(ctx))
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, add_contents);
+        });
+}
+
 /// Roomier internal padding for the Save/Cancel buttons.
 pub fn pad_buttons(ui: &mut egui::Ui) {
     ui.spacing_mut().button_padding = egui::vec2(16.0, 6.0);

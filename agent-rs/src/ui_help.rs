@@ -73,16 +73,9 @@ const SECTIONS: &[(&str, &[&str])] = &[
     (
         "GPU acceleration",
         &[
-            "Settings > GPU acceleration for apps chooses how apps draw.",
-            "Off means software rendering. Apps draw on the CPU, so video and \
-             3D are slower, and the sandbox shares no graphics hardware with \
-             the host.",
-            "On lets apps render on the host GPU, so video and 3D are smooth. \
-             The GPU is hardware shared with the host, and shared hardware is \
-             a potential side channel: a compromised app could try to observe \
-             traces of other GPU work, or leave traces of its own. Keep it \
-             off for maximum isolation, turn it on when playback or rendering \
-             is too slow.",
+            "Apps render on the host GPU automatically, so video and 3D are \
+             smooth. On a Host without a usable GPU they fall back to software \
+             rendering.",
         ],
     ),
     (
@@ -118,19 +111,15 @@ struct Help;
 
 impl eframe::App for Help {
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
-        egui::CentralPanel::default()
-            .frame(crate::theme::content_frame(ctx))
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (title, lines) in SECTIONS {
-                        ui.heading(*title);
-                        ui.add_space(2.0);
-                        for line in *lines {
-                            ui.label(*line);
-                        }
-                        ui.add_space(14.0);
-                    }
-                });
-            });
+        crate::theme::content_panel(ctx, |ui| {
+            for (title, lines) in SECTIONS {
+                ui.heading(*title);
+                ui.add_space(2.0);
+                for line in *lines {
+                    ui.label(*line);
+                }
+                ui.add_space(14.0);
+            }
+        });
     }
 }

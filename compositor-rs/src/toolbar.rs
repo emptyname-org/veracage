@@ -13,6 +13,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use smithay::utils::{Physical, Rectangle};
+
 /// Height of the toolbar strip, in logical points (== logical px for window
 /// placement, since a point and a logical pixel are the same size). The sandbox
 /// space is offset down by this much (see xdg_shell) so app titlebars aren't
@@ -86,7 +88,16 @@ pub struct Toolbar {
     /// Menu-item icons: Veracage's own two-color glyphs (mono_icons), drawn
     /// once at construction in the theme's ink. App icons stay host-colored.
     menu_icons: HashMap<String, egui::TextureHandle>,
+    /// The frame `run()` produced, painted by `paint()` after the windows are
+    /// composited: tessellated primitives, texture updates, pixels per point.
+    pending: Option<(Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32)>,
+    /// A transient user-facing banner (e.g. a failed launch a leader reported),
+    /// with the instant it was set. Cleared after NOTICE_TTL.
+    notice: Option<(String, std::time::Instant)>,
 }
+
+/// How long a transient toolbar notice (e.g. a failed-launch banner) stays up.
+const NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// The shared app icon PNG (192px = 2x the 96pt display box, for HiDPI), the
 /// same file the About window uses. Regenerate with `convert
@@ -197,7 +208,22 @@ impl Toolbar {
             copy_out_label: crate::shortcuts::DEFAULT_COPY_OUT.to_string(),
             paste_in_label: crate::shortcuts::DEFAULT_PASTE_IN.to_string(),
             menu_icons,
+            pending: None,
+            notice: None,
         })
+    }
+
+    /// Show a transient banner (e.g. a leader-reported failed launch). Cleared
+    /// automatically after NOTICE_TTL.
+    pub fn set_notice(&mut self, msg: String) {
+        self.notice = Some((msg, std::time::Instant::now()));
+    }
+
+    /// True while egui still wants to animate (an open menu, a hover transition,
+    /// the notice banner countdown), so the render loop keeps drawing until it
+    /// settles instead of freezing mid-animation.
+    pub fn wants_repaint(&self) -> bool {
+        self.ctx.has_requested_repaint()
     }
 
     /// Feed a pointer move (logical points, output coordinates).
@@ -285,18 +311,20 @@ impl Toolbar {
         }
     }
 
-    /// Run the UI and paint it into the currently-bound framebuffer. `size_px` is
-    /// the winit framebuffer size (physical pixels), `scale` the output fractional
-    /// scale. MUST be called with the EGL context current. Returns the button
-    /// action for this frame, if any.
-    pub fn render(
+    /// Run the UI (CPU only, no GL): produce this frame's primitives for a later
+    /// `paint()`. `size_px` is the winit framebuffer size (physical pixels),
+    /// `scale` the output fractional scale. Returns the button action for this
+    /// frame plus the region egui painted (physical pixels), which the caller
+    /// must report to the damage tracker: the overlay is drawn outside it, so
+    /// whatever lies beneath must be re-rendered every painted frame.
+    pub fn run(
         &mut self,
         size_px: (i32, i32),
         scale: f64,
         leaders: &[LeaderApps],
         cfg_apps: &[ConfigApp],
         has_windows: bool,
-    ) -> ToolbarAction {
+    ) -> (ToolbarAction, Option<Rectangle<i32, Physical>>) {
         let ppp = (scale as f32).max(1.0);
         self.ctx.set_pixels_per_point(ppp);
         self.ctx.set_visuals(if self.dark {
@@ -333,6 +361,7 @@ impl Toolbar {
         let icons = &self.icons;
         let name_to_key = &self.name_to_key;
         let menu_icons = &self.menu_icons;
+        let notice = &self.notice;
         let dark = self.dark;
         let copy_out_label = self.copy_out_label.as_str();
         let paste_in_label = self.paste_in_label.as_str();
@@ -505,18 +534,69 @@ impl Toolbar {
                         );
                     });
             }
+
+            // Transient banner (e.g. a leader-reported failed launch), floating
+            // bottom-center over the app/desktop for NOTICE_TTL. Non-interactive.
+            if let Some((msg, at)) = notice {
+                if at.elapsed() < NOTICE_TTL {
+                    egui::Area::new(egui::Id::new("veracage_notice"))
+                        .order(egui::Order::Foreground)
+                        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -28.0))
+                        .interactable(false)
+                        .show(ctx, |ui| {
+                            let (bg, fg) = if dark {
+                                (egui::Color32::from_rgb(96, 30, 30), egui::Color32::from_gray(240))
+                            } else {
+                                (egui::Color32::from_rgb(250, 224, 224), egui::Color32::from_rgb(120, 20, 20))
+                            };
+                            egui::Frame::popup(ui.style()).fill(bg).show(ui, |ui| {
+                                ui.colored_label(fg, msg.as_str());
+                            });
+                        });
+                }
+            }
         });
+
+        // Drop an expired notice so it stops repainting and doesn't linger.
+        if self.notice.as_ref().is_some_and(|(_, at)| at.elapsed() >= NOTICE_TTL) {
+            self.notice = None;
+        }
 
         let clipped = self.ctx.tessellate(full.shapes, full.pixels_per_point);
         let mut textures_delta = full.textures_delta;
         rebake_font_textures(&mut textures_delta);
-        self.painter.paint_and_update_textures(
-            [size_px.0.max(1) as u32, size_px.1.max(1) as u32],
-            full.pixels_per_point,
-            &clipped,
-            &textures_delta,
-        );
-        action
+        self.pending = Some((clipped, textures_delta, full.pixels_per_point));
+        (action, self.painted_rect(size_px))
+    }
+
+    /// The region egui used this frame, in physical pixels, clamped to the
+    /// framebuffer. None when egui painted nothing.
+    fn painted_rect(&self, size_px: (i32, i32)) -> Option<Rectangle<i32, Physical>> {
+        let used = self.ctx.used_rect();
+        if !used.is_finite() {
+            return None;
+        }
+        let ppp = self.ctx.pixels_per_point();
+        let x0 = ((used.min.x * ppp).floor() as i32).max(0);
+        let y0 = ((used.min.y * ppp).floor() as i32).max(0);
+        let x1 = ((used.max.x * ppp).ceil() as i32).min(size_px.0);
+        let y1 = ((used.max.y * ppp).ceil() as i32).min(size_px.1);
+        (x1 > x0 && y1 > y0)
+            .then(|| Rectangle::new((x0, y0).into(), (x1 - x0, y1 - y0).into()))
+    }
+
+    /// Paint the frame `run()` produced into the currently-bound framebuffer,
+    /// on top of the composited windows. MUST be called with the EGL context
+    /// current. A no-op if there is nothing pending.
+    pub fn paint(&mut self, size_px: (i32, i32)) {
+        if let Some((clipped, textures_delta, ppp)) = self.pending.take() {
+            self.painter.paint_and_update_textures(
+                [size_px.0.max(1) as u32, size_px.1.max(1) as u32],
+                ppp,
+                &clipped,
+                &textures_delta,
+            );
+        }
     }
 }
 
@@ -607,6 +687,26 @@ const PUB_DIR: &str = "/run/veracage/pub";
 /// The file the human-side broker polls for commands (verb line). Must match
 /// CMD_REQ in agent-rs/src/broker.rs.
 const CMD_REQ: &str = "cmd.req";
+
+/// The leaders' transient user-notice file (must match `_post_notice` in
+/// leader.py): one `<nonce>\t<text>` line, veracage-written.
+const NOTICE_FILE: &str = "notice";
+
+/// Read the transient notice a leader published (e.g. a failed launch), as
+/// `(nonce, text)`. The nonce (a wall-clock ns stamp) lets the caller show each
+/// distinct notice once. Bounded read, control chars stripped, malformed ignored.
+pub fn scan_notice() -> Option<(u64, String)> {
+    let path = std::path::Path::new(RUNTIME_DIR).join(NOTICE_FILE);
+    let md = std::fs::metadata(&path).ok()?;
+    if !md.is_file() || md.len() > 4096 {
+        return None;
+    }
+    let body = std::fs::read_to_string(&path).ok()?;
+    let (nonce, text) = body.lines().next()?.split_once('\t')?;
+    let nonce: u64 = nonce.parse().ok()?;
+    let text: String = text.chars().filter(|c| !c.is_control()).take(200).collect();
+    (!text.is_empty()).then_some((nonce, text))
+}
 
 /// Emit a command to the human-uid broker. The compositor runs as the `veracage`
 /// uid and cannot spawn a human GUI / `pkexec` / open host files, so it drops a

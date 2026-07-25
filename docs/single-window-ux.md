@@ -40,7 +40,7 @@ and delegates host-side actions to the broker.
 | **File** | Mount volume... / Shared directory / Unmount > (one item per mounted volume) / Quit |
 | **Clipboard** | Copy out / Paste in (configurable shortcuts, defaults Ctrl+Alt+C / Ctrl+Alt+V) |
 | **Apps** | one item per app, with its host icon / Configure apps... |
-| **Settings** | Settings... (theme, window size, font, clipboard clear, shared directory, suspend, GPU) / Configure shortcuts... |
+| **Settings** | Settings... (theme, window size, font, clipboard clear, shared directory, suspend) / Configure shortcuts... |
 | **Help** | Help... / About Veracage... |
 
 **Clipboard** and **Apps** (launch, with a volume mounted) act in-process in the
@@ -80,6 +80,13 @@ broker republishes whenever config.toml changes. Trust level: the dir is
 writable only by the human uid, the same trust as config.toml itself. The
 compositor validates everything it reads from there (sizes, key shapes,
 icon dimensions).
+
+The same channel carries `mimeapps.list`, the default-app associations the
+leader seeds into each sandbox at `$XDG_CONFIG_HOME/mimeapps.list` (the
+sandbox XDG config is an empty tmpfs, so without it a file manager asks
+"open with?" for every file): the enabled apps become the defaults for the
+types their `.desktop` files declare, and the host's own associations fill
+in the rest.
 
 ## Prompt flow
 
@@ -131,7 +138,7 @@ dm-teardown path are untouched. What's exposed is exactly what is *in* the
 exchange: declassified, in-transit files the user consciously moved there (a
 same-uid host attacker reading them is not a volume breach). A *compromised
 sandboxed app* could copy volume files into the exchange, but that is
-outside the primary threat model (`veracage-design.md` section 10). Veracage
+outside the threat model (`veracage-design.md` section 10). Veracage
 does not defend the volume against the apps the user chose to run. Two cheap
 in-scope guards: the helper validates the caller-supplied exchange path
 (`O_NOFOLLOW`, owner == human, which stops `--exchange /etc`), and the mount

@@ -2,11 +2,11 @@
 //!
 //! A fresh process (winit can't reopen an EventLoop) that edits the general
 //! settings in `~/.config/veracage/config.toml`: theme, window size, font,
-//! host-clipboard auto-clear, the shared directory, the suspend action, and GPU
-//! passthrough. Spawned by the broker when the compositor's Settings menu is
-//! used. Layout: the appearance rows share one grid (so they align in columns),
-//! a separator, then the clipboard-clear + suspend grid, then the shared-
-//! directory and GPU checkboxes, Save/Cancel bottom-right.
+//! host-clipboard auto-clear, the shared directory, and the suspend action.
+//! Spawned by the broker when the compositor's Settings menu is used. Layout:
+//! the appearance rows share one grid (so they align in columns), a separator,
+//! then the clipboard-clear + suspend grid, then the shared-directory checkbox,
+//! Save/Cancel bottom-right.
 
 use eframe::egui;
 
@@ -116,9 +116,7 @@ impl eframe::App for Settings {
             }
         });
 
-        egui::CentralPanel::default()
-            .frame(crate::theme::content_frame(ctx))
-            .show(ctx, |ui| {
+        crate::theme::content_panel(ctx, |ui| {
             ui.add_space(6.0);
 
             // One label+dropdown pair per grid row, so every label and every
@@ -285,11 +283,6 @@ impl eframe::App for Settings {
                     );
                 });
             });
-            ui.add_space(20.0);
-
-            // GPU acceleration (advanced; last). The tradeoff is explained in
-            // Help > GPU acceleration, not squeezed into a caption here.
-            ui.checkbox(&mut self.cfg.gpu, "GPU acceleration for apps");
         });
 
         if do_cancel {

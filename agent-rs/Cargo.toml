@@ -28,6 +28,12 @@ eframe = "0.29"       # egui control window - static-linked; runtime needs only
                       # what the desktop already has (Mesa GL, Wayland/X11).
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
                       # native file dialogs via the XDG portal (no GTK link).
+resvg = { version = "0.44", default-features = false }
+                      # rasterize SVG menu icons (KDE/breeze apps ship SVG-only);
+                      # pure Rust, no system dependency. Text feature off (icons
+                      # are vector shapes, not text).
+arboard = "3"         # clear the host clipboard after the shortcut configurator
+                      # seeds a sentinel to make Ctrl+V's Paste event fire.
 
 [profile.release]
 opt-level = "z"

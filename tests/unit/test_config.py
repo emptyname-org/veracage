@@ -1,6 +1,8 @@
 """Config TOML round-trip + tolerance to malformed input."""
 from __future__ import annotations
 
+import pytest
+
 from veracage import apps, config
 
 
@@ -139,12 +141,10 @@ def test_save_escapes_quotes_and_backslashes(tmp_xdg_config):
     assert got.name == 'Has "quotes" and \\ slashes'
 
 
-# ------------------------------------------------ gpu / suspend / volumes ---
+# ---------------------------------------------------- suspend / volumes ---
 
-def test_default_gpu_off_and_suspend_dismount(tmp_xdg_config):
-    cfg = config.load()
-    assert cfg.gpu is False
-    assert cfg.suspend_action == "dismount"
+def test_default_suspend_dismount(tmp_xdg_config):
+    assert config.load().suspend_action == "dismount"
 
 
 def test_exchange_default_on_and_roundtrips(tmp_xdg_config):
@@ -156,14 +156,12 @@ def test_exchange_default_on_and_roundtrips(tmp_xdg_config):
     assert config.load().exchange is False
 
 
-def test_roundtrip_gpu_and_suspend_action(tmp_xdg_config):
+def test_roundtrip_suspend_action(tmp_xdg_config):
     config.save(config.Config(
         apps={"kate": apps.App("kate", "Kate", "kate")},
-        gpu=True, suspend_action="ignore",
+        suspend_action="ignore",
     ))
-    loaded = config.load()
-    assert loaded.gpu is True
-    assert loaded.suspend_action == "ignore"
+    assert config.load().suspend_action == "ignore"
 
 
 def test_invalid_suspend_action_falls_back(tmp_xdg_config, capsys):
@@ -175,26 +173,13 @@ def test_invalid_suspend_action_falls_back(tmp_xdg_config, capsys):
     assert "suspend_action" in capsys.readouterr().err
 
 
-def test_per_volume_gpu_override(tmp_xdg_config):
-    config.save(config.Config(
-        apps={"okular": apps.App("okular", "Okular", "okular")},
-        gpu=False,
-        volumes={config._norm_vault("/tmp/work.vc"): config.VolumeConfig(gpu=True)},
-    ))
-    loaded = config.load()
-    assert loaded.gpu_for("/tmp/work.vc") is True     # per-volume override
-    assert loaded.gpu_for("/tmp/other.vc") is False   # inherits [default]
-
-
-def test_per_volume_inherits_default_when_gpu_unset(tmp_xdg_config):
+def test_per_volume_default_app(tmp_xdg_config):
     config.save(config.Config(
         apps={},
-        gpu=True,
         volumes={config._norm_vault("/tmp/x.vc"):
                  config.VolumeConfig(default_app="okular")},
     ))
     loaded = config.load()
-    assert loaded.gpu_for("/tmp/x.vc") is True              # gpu unset -> default
     assert loaded.default_app_for("/tmp/x.vc") == "okular"
     assert loaded.default_app_for("/tmp/none.vc") is None
 
@@ -217,20 +202,15 @@ def test_apps_not_a_table_is_ignored(tmp_xdg_config):
     assert config.load().is_empty()
 
 
-def test_gpu_string_does_not_fail_open(tmp_xdg_config, capsys):
+def test_legacy_gpu_keys_ignored_and_dropped(tmp_xdg_config):
+    # The removed GPU toggle: old configs still carry the keys. They load
+    # without error or warning and disappear on the next save.
     p = config.config_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text('[default]\ngpu = "false"\n')   # truthy string, not a bool
+    p.write_text('[default]\ngpu = true\n[volumes."/tmp/x.vc"]\ngpu = true\n')
     cfg = config.load()
-    assert cfg.gpu is False
-    assert "gpu" in capsys.readouterr().err
-
-
-def test_per_volume_gpu_string_does_not_fail_open(tmp_xdg_config):
-    p = config.config_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text('[volumes."/tmp/x.vc"]\ngpu = "yes"\n')
-    assert config.load().gpu_for("/tmp/x.vc") is False
+    config.save(cfg)
+    assert "gpu" not in p.read_text()
 
 
 def test_control_chars_roundtrip(tmp_xdg_config):
@@ -324,3 +304,64 @@ def test_clip_clear_published(tmp_xdg_config, tmp_path, monkeypatch):
     monkeypatch.setenv("VERACAGE_PUB_DIR", str(pub))
     config.publish_apps(config.Config(apps={}, clip_clear=True, clip_clear_timeout=20))
     assert (pub / "clipclear").read_text() == "1\n20\n"
+
+
+@pytest.fixture
+def tmp_xdg_data(monkeypatch, tmp_path):
+    """An isolated XDG data dir with an applications/ folder, so mimeapps tests
+    never scan the real host .desktop files."""
+    data = tmp_path / "data"
+    (data / "applications").mkdir(parents=True)
+    monkeypatch.setenv("XDG_DATA_HOME", str(data))
+    monkeypatch.setenv("XDG_DATA_DIRS", str(tmp_path / "no-such-data"))
+    return data / "applications"
+
+
+def _desktop_file(apps_dir, name, exec_line, mimes):
+    (apps_dir / name).write_text(
+        f"[Desktop Entry]\nName=X\nExec={exec_line}\nMimeType={mimes}\n")
+
+
+def test_mimeapps_enabled_apps_win_over_host_defaults(
+        tmp_xdg_config, tmp_xdg_data):
+    _desktop_file(tmp_xdg_data, "org.kde.kate.desktop", "kate %U",
+                  "text/plain;text/markdown;")
+    (tmp_xdg_config / "mimeapps.list").write_text(
+        "[Default Applications]\n"
+        "text/plain=kwrite.desktop;\n"
+        "application/pdf=okular.desktop;\n"
+        "[Added Associations]\n"
+        "image/png=gwenview.desktop;\n")
+    cfg = config.Config(apps={"kate": apps.App("kate", "Kate", "kate")})
+    body = config._mimeapps_body(cfg)
+    lines = body.splitlines()
+    # The enabled app claims its declared types, beating the host default.
+    assert "text/plain=org.kde.kate.desktop;" in lines
+    assert "text/markdown=org.kde.kate.desktop;" in lines
+    # Host defaults fill in the types no enabled app claims.
+    assert "application/pdf=okular.desktop;" in lines
+    # Host added associations pass through unchanged.
+    assert "[Added Associations]" in lines
+    assert "image/png=gwenview.desktop;" in lines
+
+
+def test_mimeapps_first_enabled_app_wins_on_overlap(
+        tmp_xdg_config, tmp_xdg_data):
+    _desktop_file(tmp_xdg_data, "a.desktop", "aedit", "text/plain;")
+    _desktop_file(tmp_xdg_data, "b.desktop", "bedit", "text/plain;")
+    cfg = config.Config(apps={
+        "bedit": apps.App("bedit", "Bedit", "bedit"),
+        "aedit": apps.App("aedit", "Aedit", "aedit"),
+    })
+    assert "text/plain=b.desktop;" in config._mimeapps_body(cfg).splitlines()
+
+
+def test_mimeapps_published_and_empty_without_desktop_files(
+        tmp_xdg_config, tmp_xdg_data, tmp_path, monkeypatch):
+    pub = tmp_path / "pub"
+    pub.mkdir()
+    monkeypatch.setenv("VERACAGE_PUB_DIR", str(pub))
+    config.publish_apps(config.Config(
+        apps={"kate": apps.App("kate", "Kate", "kate")}))
+    # No .desktop files and no host mimeapps.list: just the empty section.
+    assert (pub / "mimeapps.list").read_text() == "[Default Applications]\n"

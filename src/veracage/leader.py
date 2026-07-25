@@ -46,6 +46,12 @@ _MAX_REQUEST_BYTES = 64 * 1024  # control requests are tiny; cap to bound memory
 # sandbox binds this whole tree at /vaults, so one app sees all volumes.
 WORKSPACE = Path("/run/veracage/vaults")
 
+# Human-published default-app associations (config.publish_apps writes it, the
+# pub dir is root-created and human-owned): seeded into each sandbox as
+# $XDG_CONFIG_HOME/mimeapps.list so its file managers open files with the
+# human's chosen apps. Human-trust UX data, same as the enabled-app list.
+MIMEAPPS_SEED = Path("/run/veracage/pub/mimeapps.list")
+
 
 def scan_volumes(root: Path | None = None) -> list[str]:
     """The open volumes' labels: the directory names under the workspace root
@@ -68,8 +74,7 @@ def scan_volumes(root: Path | None = None) -> list[str]:
 class _LeaderState:
     mountpoint: str
     wl_socket: Path | None = None       # shared compositor socket, once verified
-    gpu: bool = False
-    children: dict[int, str] = field(default_factory=dict)  # pid -> label
+    children: dict[int, tuple[str, float]] = field(default_factory=dict)  # pid -> (label, launch monotonic)
     closing: bool = False
     app_specs: list = field(default_factory=list)  # enabled apps, for the toolbar
     places_file: Path | None = None  # seeded KDE Places (vault under its label)
@@ -103,7 +108,7 @@ def _handle_request(state: _LeaderState, req: dict) -> dict:
         # fresh (not state.volumes) so the reply can't lag the 1s rescan loop.
         cur = scan_volumes()
         return {"ok": True,
-                "apps": [{"pid": p, "app": k} for p, k in state.children.items()],
+                "apps": [{"pid": p, "app": lbl} for p, (lbl, _t) in state.children.items()],
                 "volumes": cur,
                 "bootstrap_open": Path(state.mountpoint).name in cur}
 
@@ -169,20 +174,23 @@ def _launch_app(state: _LeaderState, spec) -> dict:
     label = name_val if isinstance(name_val, str) else command
 
     app = App(key=label, name=label, exec=command)
-    # Open the seeded Places file and hand bwrap its fd: `--file` writes a
-    # WRITABLE copy into the sandbox tmpfs (Dolphin rewrites it on startup, so a
-    # read-only bind would error). None if there's no seed.
-    places_fd = None
-    if state.places_file is not None:
+    # Open the seed files and hand bwrap their fds: `--file` writes a WRITABLE
+    # copy into the sandbox tmpfs (apps rewrite these on startup, so a
+    # read-only bind would error). A missing seed is skipped.
+    seeds: list[tuple[int, str]] = []
+    for src, dest in ((state.places_file, "/xdg/data/user-places.xbel"),
+                      (MIMEAPPS_SEED, "/xdg/config/mimeapps.list")):
+        if src is None:
+            continue
         try:
-            places_fd = os.open(state.places_file, os.O_RDONLY)
+            seeds.append((os.open(src, os.O_RDONLY), dest))
         except OSError:
-            places_fd = None
+            continue
     try:
         # Bind the whole workspace (/vaults tree), not one volume: the app sees
         # every volume open at launch time (docs/shared-workspace.md).
-        argv = bwrap_command(str(WORKSPACE), app, state.wl_socket, state.gpu,
-                             places_fd, state.exchange)
+        argv = bwrap_command(str(WORKSPACE), app, state.wl_socket,
+                             seeds, state.exchange)
         # Detach the app's stdio. Inheriting the leader's stdin/out/err hands a
         # chatty viewer the session's terminal/journal: Qt/KF apps print the paths
         # of files they open on stderr, which would persist unencrypted in the
@@ -194,15 +202,37 @@ def _launch_app(state: _LeaderState, spec) -> dict:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            pass_fds=(places_fd,) if places_fd is not None else (),
+            pass_fds=[fd for fd, _ in seeds],
         )
     except FileNotFoundError as e:
         return {"ok": False, "error": f"missing dependency: {e.filename}"}
     finally:
-        if places_fd is not None:
-            os.close(places_fd)
-    state.children[proc.pid] = label
+        for fd, _ in seeds:
+            os.close(fd)
+    # Track the launch time (monotonic) alongside the label. The reaper uses it to
+    # tell an immediate failure (a GUI that needs X11 in this Wayland-only sandbox,
+    # a crash, a missing in-sandbox dependency) from a normal quit, and report it.
+    # The app's stdio is DEVNULL'd, so without this a launch that dies at once
+    # leaves no trace. Done in the reaper (not here) so the serve loop never
+    # blocks: the launch returns at once.
+    state.children[proc.pid] = (label, time.monotonic())
     return {"ok": True, "pid": proc.pid}
+
+
+def _post_notice(message: str) -> None:
+    """Publish a short user-facing notice for the compositor to show as a
+    transient banner: `/run/veracage/rt/notice`, one `<nonce>\\t<text>` line. The
+    leader is the veracage uid and rt is veracage-owned. Best-effort. The nonce
+    (a wall-clock ns stamp) lets the compositor show each distinct notice once."""
+    text = "".join(c for c in message if c.isprintable())[:200]
+    notice = COMPOSITOR_RUNTIME / "notice"
+    tmp = COMPOSITOR_RUNTIME / f"notice.{os.getpid()}.tmp"
+    try:
+        tmp.write_text(f"{time.time_ns()}\t{text}\n")
+        tmp.replace(notice)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
 
 
 # The vault file bridge (import/export/outbox over the control socket) was
@@ -214,17 +244,29 @@ def _launch_app(state: _LeaderState, spec) -> dict:
 
 # ------------------------------------------------------------- reaping -----
 
+# A tracked app that exits within this many seconds of launch is reported as a
+# failed launch, not a normal quit. The window covers the reaper's own latency (it
+# runs once per serve-loop pass, at most ~1s apart) plus the app's brief startup.
+_EARLY_EXIT_SECONDS = 2.0
+
+
 def _reap_children(state: _LeaderState) -> None:
-    """Non-blocking reap of exited bwrap app children (only the pids we track,
-    so we don't race the compositor's own Popen)."""
+    """Non-blocking reap of exited bwrap app children (only the pids we track, so
+    we don't race the compositor's own Popen). An app that dies within
+    `_EARLY_EXIT_SECONDS` of launch is reported as a failed launch, since a launch
+    that fails at once is otherwise silent (the app's stdio is discarded)."""
+    now = time.monotonic()
     for pid in list(state.children):
         try:
             reaped, _status = os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
             state.children.pop(pid, None)
             continue
-        if reaped == pid:
-            state.children.pop(pid, None)
+        if reaped != pid:
+            continue
+        label, launched_at = state.children.pop(pid)
+        if now - launched_at < _EARLY_EXIT_SECONDS:
+            _post_notice(f"{label} failed to launch (exited immediately)")
 
 
 # --------------------------------------------------------- accept / serve --
@@ -439,7 +481,7 @@ def _write_places_file(labels: list[str], with_exchange: bool = False) -> Path |
 
 # --------------------------------------------------------- leader run ------
 
-def run_leader(mountpoint: str, gpu: bool, app_specs: list, first_app: dict | None) -> int:
+def run_leader(mountpoint: str, app_specs: list, first_app: dict | None) -> int:
     """Become the vault-side session leader. Returns the exit code.
 
     Attaches to the ONE persistent compositor's shared socket (brought up
@@ -456,7 +498,7 @@ def run_leader(mountpoint: str, gpu: bool, app_specs: list, first_app: dict | No
     if vr:
         os.environ["XDG_RUNTIME_DIR"] = vr
 
-    state = _LeaderState(mountpoint=mountpoint, gpu=gpu, app_specs=app_specs or [])
+    state = _LeaderState(mountpoint=mountpoint, app_specs=app_specs or [])
 
     # The shared compositor must already be up (cli.py brings it up before the
     # mount). We only observe its socket. We never spawn it.

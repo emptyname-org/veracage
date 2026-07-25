@@ -21,7 +21,12 @@ host. Files and clipboard cross the boundary **only** on explicit user action.
 **Threat model - defend against:** unprivileged host processes running **as
 the same user** reading volume contents (indexers, backups, session malware),
 and accidental leaks (thumbnailers, recent-files, `~/.cache` plaintext, swap,
-host clipboard managers scraping a sandbox copy). **Non-goals:** local root
+host clipboard managers scraping a sandbox copy). The isolation is
+**one-directional**: it keeps the host out of the volume, not the app out of
+the host. The app you launch is trusted, so a **malicious sandboxed app is
+outside the threat model** (not a secondary threat, just outside). The sandbox
+restrictions (no network, no host filesystem) are there to keep the decrypted
+data from leaking out, not to confine the app. **Non-goals:** local root
 (reads everything, inherent), cross-volume isolation (all open volumes are one
 trust domain), network from the sandbox, X11, multi-user. Full analysis in
 `uid-isolation.md`.
@@ -65,8 +70,8 @@ Full topology in `uid-isolation.md`. In brief:
 - **`veracage`-uid compositor** (`veracage-compositor`, Rust/smithay): ONE
   persistent instance. Renders every volume's apps into one host window, owns
   the clipboard, hosts the egui menu bar. First-party (not weston/cage), so
-  the process facing the untrusted app is under this project's control and the
-  clipboard channel is private.
+  the compositor is under this project's control and the clipboard channel is
+  private (no `data-control` global is exposed to apps).
 - **`veracage`-uid session leader** (one per session): holds the workspace
   mount namespace, launches apps in bwrap wired to the compositor socket,
   serves a **status-only** control socket (`ping`/`list`/`close`).
@@ -95,9 +100,11 @@ bwrap --unshare-pid --unshare-uts --unshare-ipc --unshare-cgroup --unshare-net \
   in host `~/.cache` (this is what closes the accidental-leak goal).
 - Only the compositor's `wl-vc` socket is bound in. The control / app-launch /
   clipboard channels are not reachable from the sandbox.
-- GPU (`/dev/dri`) off by default. Per-volume `gpu = true` opt-in (documented
-  side channel). `noexec` on the volume mounts is a tracked hardening
-  (`known-problems.md`).
+- GPU always passed through: `/dev/dri` plus the `/sys` device metadata Mesa
+  needs to pick its hardware driver (without them apps fall back to llvmpipe
+  software rendering). The `veracage` user is added to the `render` group at
+  install, and the helper applies it via `initgroups` on privilege drop.
+  `noexec` on the volume mounts is a tracked hardening (`known-problems.md`).
 
 ---
 
@@ -166,7 +173,6 @@ lock + `veracage-<12hex>` device only) and `PKEXEC_UID`-owner-checked.
 ```toml
 [default]
 last_used_app  = "kate"
-gpu            = false          # /dev/dri passthrough (side channel, off)
 suspend_action = "dismount"     # unmount on suspend, or "ignore"
 clip_clear     = true           # auto-clear host clipboard after Copy out
 clip_clear_timeout = 30         # seconds before the auto-clear fires
@@ -177,7 +183,6 @@ exec = "kate"
 
 [volumes."/path/to/work.vc"]    # optional per-volume overrides
 default_app = "okular"
-gpu         = true
 ```
 
 Per-volume settings inherit from `[default]`. Only apps under `[apps.*]`
@@ -189,8 +194,9 @@ integrity is load-bearing, see the config-tamper note in
 
 ## 9. Dependencies
 
-- **Required:** `bubblewrap`, `cryptsetup` (+ `veracrypt` for VC volumes),
-  `systemd`, `polkit`, `python3` >= 3.11.
+- **Required:** `bubblewrap`, `cryptsetup` (its `tcrypt` module opens VeraCrypt
+  volumes natively, so the `veracrypt` binary is not required), `systemd`,
+  `polkit`, `python3` >= 3.11.
 - **Not needed:** no weston/cage (own compositor), no `wl-clipboard`, no
   Qt/GTK, no `python3-gi`. The agent and compositor are self-contained Rust
   binaries that link only what a desktop session already has (Mesa GL,
@@ -207,9 +213,14 @@ integrity is load-bearing, see the config-tamper note in
   seal host root either).
 - No network from the sandbox, even opt-in (v1).
 - Clipboard text-only in v1.
-- GPU off by default (per-volume opt-in, documented side channel).
-- A malicious *sandboxed app* is outside the primary threat model, but the
-  compositor (it parses untrusted Wayland traffic) and any future file bridge
-  are in scope, and are reviewed as such.
+- Apps and the compositor render on the host GPU. The final window pixels
+  already reach the host compositor's GPU path for display, so this opens no
+  new exfiltration channel, and confining the app is not a goal (below).
+- A malicious *sandboxed app* is **outside the threat model**: the isolation is
+  one-directional (host out of the volume, not the app out of the host) and the
+  app you chose to run is trusted. What stays in scope is attacker-controlled
+  *data* crossing the boundary (a hostile volume's filesystem label parsed by
+  the leader/compositor, the exchange path, and any future file bridge),
+  reviewed as such.
 - Wayland only. Single user, single workstation. Cross-volume isolation is not
   a goal (co-hosted volumes share one clipboard by design).

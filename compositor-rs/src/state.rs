@@ -80,16 +80,33 @@ pub struct State {
     /// `init_winit` once the backend exists; None if the host isn't Wayland.
     pub host_clipboard: Option<crate::hostclip::HostClipboard>,
 
+    /// The host-clipboard worker thread. Joined at teardown (after clear-on-exit)
+    /// so it stops touching the winit backend's wl_display before that backend is
+    /// dropped - otherwise the worker faults on the freed display (SIGSEGV).
+    pub host_clipboard_worker: Option<std::thread::JoinHandle<()>>,
+
     /// In-window egui toolbar (Phase 3). Built lazily on the first Redraw (needs
     /// the GL context current); `toolbar_failed` latches a construction failure so
     /// we don't retry every frame. The compositor then just runs with no toolbar.
     pub toolbar: Option<crate::toolbar::Toolbar>,
     pub toolbar_failed: bool,
 
+    /// Something changed and a frame must be (re)rendered: a client committed, an
+    /// input arrived, or egui is animating. The compositor software-renders
+    /// (llvmpipe), so redrawing an unchanged frame is pure CPU waste - the timer
+    /// only wakes the renderer when this is set (or the ~1s scan is due). Starts
+    /// true so the first frame paints.
+    pub dirty: bool,
+
     /// Toolbar launcher list, refreshed (throttled) from the leaders' `.apps`
     /// files so app buttons appear/disappear as volumes open and close.
     pub leaders: Vec<crate::toolbar::LeaderApps>,
     pub leaders_scan_at: std::time::Duration,
+
+    /// Last transient-notice nonce shown (a leader-reported failed launch, etc.),
+    /// so each distinct notice shows once. Seeded from any file present at
+    /// startup, so a stale notice from before the compositor started is not shown.
+    pub notice_nonce: u64,
 
     /// The human-published configured apps (`/run/veracage/pub/config.apps`),
     /// listed in the Apps menu when no volume is mounted.
@@ -221,12 +238,17 @@ impl State {
             seat,
             clip_source: None,
             host_clipboard: None,
+            host_clipboard_worker: None,
             toolbar: None,
             toolbar_failed: false,
             dnd_icon: None,
             hint_icon: build_hint_icon(),
+            dirty: true,
             leaders: Vec::new(),
             leaders_scan_at: std::time::Duration::ZERO,
+            // Baseline: adopt any notice already on disk without showing it, so a
+            // stale one from before this compositor started stays hidden.
+            notice_nonce: crate::toolbar::scan_notice().map(|(n, _)| n).unwrap_or(0),
             cfg_apps: Vec::new(),
             window_size_applied: std::env::var("VERACAGE_WINDOW_SIZE")
                 .unwrap_or_else(|_| "default".into()),

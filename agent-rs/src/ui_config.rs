@@ -225,9 +225,7 @@ impl eframe::App for ConfigApp {
             ui.label(egui::RichText::new(format!("{count} enabled")).weak());
         });
 
-        egui::CentralPanel::default()
-            .frame(crate::theme::content_frame(ctx))
-            .show(ctx, |ui| {
+        crate::theme::content_panel(ctx, |ui| {
                 ui.label(egui::RichText::new("Select apps to use in Veracage").weak());
                 ui.add_space(10.0);
 
@@ -243,7 +241,6 @@ impl eframe::App for ConfigApp {
                     self.is_installed(&e);
                 }
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
                     // Enabled apps first (config order): checked; unticking removes.
                     let mut remove: Option<usize> = None;
                     for (i, a) in self.apps.iter().enumerate() {
@@ -307,8 +304,7 @@ impl eframe::App for ConfigApp {
                     if !self.error.is_empty() {
                         ui.colored_label(crate::theme::ERROR, &self.error);
                     }
-                });
-            });
+        });
 
         if do_cancel {
             self.cancelled = true;

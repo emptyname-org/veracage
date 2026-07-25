@@ -88,6 +88,15 @@ fn combo_from(mods: egui::Modifiers, key: egui::Key) -> Option<String> {
     Some(s)
 }
 
+/// Clear the host clipboard, removing the sentinel that capture seeds to make
+/// Ctrl+V's Paste event fire. Best-effort, so a headless/odd clipboard can't
+/// break the configurator.
+fn clear_clipboard() {
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.clear();
+    }
+}
+
 impl eframe::App for Shortcuts {
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         // While capturing, grab the next modifier+key combo (Esc cancels).
@@ -123,8 +132,12 @@ impl eframe::App for Shortcuts {
                 Some(Some(combo)) => {
                     self.cfg.shortcuts.insert(action, combo);
                     self.capturing = None;
+                    clear_clipboard();
                 }
-                Some(None) => self.capturing = None, // cancelled
+                Some(None) => {
+                    self.capturing = None; // cancelled
+                    clear_clipboard();
+                }
                 None => {}
             }
         }
@@ -136,9 +149,7 @@ impl eframe::App for Shortcuts {
             }
         });
 
-        egui::CentralPanel::default()
-            .frame(crate::theme::content_frame(ctx))
-            .show(ctx, |ui| {
+        crate::theme::content_panel(ctx, |ui| {
                 ui.label(egui::RichText::new("Click a shortcut to modify").weak());
                 ui.add_space(14.0);
 
@@ -156,6 +167,12 @@ impl eframe::App for Shortcuts {
                     let btn = egui::Button::new(text).min_size(egui::vec2(150.0, 0.0));
                     if ui.add(btn).clicked() {
                         self.capturing = Some((*action).to_string());
+                        // egui only emits a Paste event when the clipboard has
+                        // content, so with an empty clipboard Ctrl+V yields no
+                        // event and the key is uncapturable (Copy always fires,
+                        // which is why Ctrl+Shift+C worked but Ctrl+Shift+V did
+                        // not). Seed the clipboard so a paste is always delivered.
+                        ui.ctx().output_mut(|o| o.copied_text = "Veracage".to_string());
                     }
                     ui.add_space(16.0);
                 }

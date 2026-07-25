@@ -64,9 +64,7 @@ impl eframe::App for PassphraseDialog {
         let pass_id = egui::Id::new("veracage-passphrase-field");
         let mut do_submit = false;
         let mut do_cancel = false;
-        egui::CentralPanel::default()
-            .frame(crate::theme::content_frame(ctx))
-            .show(ctx, |ui| {
+        crate::theme::content_panel(ctx, |ui| {
                 ui.label(format!("Passphrase for {}", self.name));
                 if let Some(e) = &self.error {
                     ui.colored_label(crate::theme::ERROR, e);

@@ -77,8 +77,6 @@ pub fn default_shortcut(action: &str) -> String {
 struct DefaultSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_used_app: Option<String>,
-    #[serde(default)]
-    gpu: bool,
     #[serde(default = "default_suspend")]
     suspend_action: String,
     #[serde(default = "default_theme")]
@@ -103,7 +101,6 @@ impl Default for DefaultSection {
     fn default() -> Self {
         DefaultSection {
             last_used_app: None,
-            gpu: false,
             suspend_action: default_suspend(),
             theme: default_theme(),
             ui_font: default_font(),
@@ -171,7 +168,6 @@ struct AppEntry {
 pub struct Config {
     pub apps: Vec<App>,
     pub last_used_app: Option<String>,
-    pub gpu: bool,
     pub suspend_action: String,
     pub theme: String,             // "light" | "dark" (| "system", future)
     pub ui_font: String,           // fonts::CHOICES key ("system" default = host)
@@ -210,7 +206,6 @@ impl Config {
         Config {
             apps: Vec::new(),
             last_used_app: None,
-            gpu: false,
             suspend_action: "dismount".into(),
             theme: "light".into(),
             ui_font: default_font(),
@@ -316,7 +311,6 @@ pub fn load() -> Config {
     Config {
         apps,
         last_used_app: raw.default.last_used_app,
-        gpu: raw.default.gpu,
         suspend_action,
         theme,
         ui_font,
@@ -367,7 +361,6 @@ pub fn save(cfg: &Config) -> io::Result<PathBuf> {
     let raw = Raw {
         default: DefaultSection {
             last_used_app: cfg.last_used_app.clone(),
-            gpu: cfg.gpu,
             suspend_action: cfg.suspend_action.clone(),
             theme: cfg.theme.clone(),
             ui_font: cfg.ui_font.clone(),

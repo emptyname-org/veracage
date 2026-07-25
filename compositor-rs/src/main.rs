@@ -24,6 +24,14 @@ pub use state::State;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
 
+    // Never dump core: the compositor holds decrypted on-screen content and
+    // clipboard secrets, so a core would write that plaintext to a host-readable
+    // file (/var/lib/systemd/coredump). Suppress it before anything sensitive.
+    unsafe {
+        let rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        libc::setrlimit(libc::RLIMIT_CORE, &rl);
+    }
+
     // --socket <name>  the wayland socket name apps connect to (the leader picks
     //                  it, like `weston --socket=`, so it knows it). The clipboard
     //                  is owned in-process now (clipboard.rs), no clip socket.
@@ -48,13 +56,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // when the leader tears the session down, not only on menu Quit / window close.
     crate::state::install_exit_signals(&event_loop);
 
-    event_loop.run(None, &mut state, move |_| {})?;
+    let run_result = event_loop.run(None, &mut state, move |_| {});
 
-    // Clear any sensitive text still on the host clipboard before we exit
-    // (KeePassXC-style clear-on-quit). No-op if nothing was pushed.
+    // Clear any sensitive text still on the host clipboard (KeePassXC-style
+    // clear-on-quit; no-op if nothing was pushed), then STOP its worker BEFORE the
+    // winit backend - which owns the wl_display the worker borrows - is dropped.
+    // clear_on_exit makes the worker return; joining it here, while the backend is
+    // still alive, prevents the teardown use-after-free that otherwise SIGSEGVs
+    // the compositor on shutdown.
     if let Some(hc) = &state.host_clipboard {
         hc.clear_on_exit();
     }
+    if let Some(worker) = state.host_clipboard_worker.take() {
+        let _ = worker.join();
+    }
+    run_result?;
     Ok(())
 }
 

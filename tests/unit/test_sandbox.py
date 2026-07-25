@@ -181,30 +181,31 @@ def test_essential_etc_paths_bound(argv):
         assert needed in bound, f"{needed} not bound into sandbox"
 
 
-def test_gpu_off_by_default_no_dri(argv):
-    assert "/dev/dri" not in argv
-
-
-def test_gpu_opt_in_binds_dev_dri():
-    sock = Path("/tmp/veracage-test.sock")
-    argv = sandbox.bwrap_command("/run/veracage/abc", _OKULAR,
-                                 sock, gpu=True)
+def test_gpu_always_bound(argv):
+    """The GPU is always passed through: the render node plus the /sys device
+    metadata Mesa needs to identify the hardware (without the /sys binds it
+    falls back to software rendering)."""
     triples = list(zip(argv, argv[1:], argv[2:]))
     assert ("--dev-bind-try", "/dev/dri", "/dev/dri") in triples
+    assert ("--ro-bind-try", "/sys/dev/char", "/sys/dev/char") in triples
+    assert ("--ro-bind-try", "/sys/devices", "/sys/devices") in triples
     # Must come after `--dev /dev` so it binds into the fresh devtmpfs.
     assert argv.index("/dev/dri") > argv.index("/dev")
 
 
-def test_no_places_file_by_default(argv):
+def test_no_seed_files_by_default(argv):
     assert "/xdg/data/user-places.xbel" not in argv
+    assert "/xdg/config/mimeapps.list" not in argv
 
 
-def test_places_fd_written_as_writable_file_after_xdg_tmpfs():
+def test_seeds_written_as_writable_files_after_xdg_tmpfs():
     sock = Path("/tmp/veracage-test.sock")
-    argv = sandbox.bwrap_command("/run/veracage/abc", _KATE,
-                                 sock, places_fd=7)
+    argv = sandbox.bwrap_command("/run/veracage/abc", _KATE, sock,
+                                 seeds=[(7, "/xdg/data/user-places.xbel"),
+                                        (8, "/xdg/config/mimeapps.list")])
     triples = list(zip(argv, argv[1:], argv[2:]))
     # --file (not --ro-bind): a WRITABLE tmpfs file, so Dolphin can rewrite it
     # (it merges its default places on startup) instead of erroring "not writable".
     assert ("--file", "7", "/xdg/data/user-places.xbel") in triples
+    assert ("--file", "8", "/xdg/config/mimeapps.list") in triples
     assert argv.index("/xdg/data/user-places.xbel") > argv.index("/xdg")

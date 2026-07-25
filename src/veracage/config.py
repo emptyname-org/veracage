@@ -16,6 +16,7 @@ load and dropped on save: apps always launch bare.
 """
 from __future__ import annotations
 
+import configparser
 import contextlib
 import math
 import os
@@ -45,7 +46,6 @@ _VALID_BACKENDS = ("auto", "luks", "veracrypt")
 @dataclass
 class VolumeConfig:
     """Per-volume overrides; unset (None) fields inherit from [default]."""
-    gpu: bool | None = None
     default_app: str | None = None
     display_name: str | None = None
     backend: str | None = None   # "auto" | "luks" | "veracrypt"
@@ -272,7 +272,6 @@ def _coerce_clip_timeout(val: object) -> int:
 class Config:
     apps: dict[str, App]
     last_used_app: str | None = None
-    gpu: bool = False                     # /dev/dri passthrough default (off)
     suspend_action: str = "dismount"      # "dismount" | "ignore"
     theme: str = "light"                  # compositor/agent egui theme: light|dark|system
     ui_font: str = "system"               # UI font key (see _VALID_FONTS); system = host
@@ -292,13 +291,6 @@ class Config:
 
     def is_empty(self) -> bool:
         return not self.apps
-
-    def gpu_for(self, vault: str) -> bool:
-        """GPU policy for `vault`: per-volume override, else the default."""
-        vc = self.volumes.get(_norm_vault(vault))
-        if vc is not None and vc.gpu is not None:
-            return vc.gpu
-        return self.gpu
 
     def default_app_for(self, vault: str) -> str | None:
         vc = self.volumes.get(_norm_vault(vault))
@@ -362,7 +354,8 @@ def load() -> Config:
     last = default.get("last_used_app")
     if not isinstance(last, str):
         last = None
-    gpu = _coerce_bool(default.get("gpu", False), "default.gpu")
+    # A legacy `gpu` key (the removed per-app GPU toggle: the GPU is always
+    # passed through now) is silently ignored on load and dropped on save.
     exchange = _coerce_bool(default.get("exchange", True), "default.exchange")
     exchange_dir = default.get("exchange_dir") or None
     clip_clear = _coerce_bool(default.get("clip_clear", True), "default.clip_clear")
@@ -402,14 +395,12 @@ def load() -> Config:
                 nk = _norm_vault(key)
             except (OSError, RuntimeError):
                 nk = str(Path(key).expanduser())
-            gval = entry.get("gpu")
             bval = entry.get("backend")
             if bval is not None and bval not in _VALID_BACKENDS:
                 print(f'veracage: volumes."{key}".backend {bval!r} invalid, ignoring',
                       file=sys.stderr)
                 bval = None
             volumes[nk] = VolumeConfig(
-                gpu=_coerce_bool(gval, f'volumes."{key}".gpu') if gval is not None else None,
                 default_app=entry.get("default_app"),
                 display_name=entry.get("display_name"),
                 backend=bval,
@@ -425,7 +416,7 @@ def load() -> Config:
                 print(f"veracage: invalid shortcut [shortcuts].{action} {v!r}; "
                       f"using {shortcuts[action]!r}", file=sys.stderr)
 
-    return Config(apps=apps, last_used_app=last, gpu=gpu,
+    return Config(apps=apps, last_used_app=last,
                   suspend_action=suspend_action, theme=theme, ui_font=ui_font,
                   ui_font_size=ui_font_size, window_size=window_size,
                   exchange=exchange, exchange_dir=exchange_dir,
@@ -444,7 +435,6 @@ def save(cfg: Config) -> Path:
               f'ui_font        = "{_esc(cfg.ui_font)}"',
               f'ui_font_size   = "{_esc(cfg.ui_font_size)}"',
               f'window_size    = "{_esc(cfg.window_size)}"',
-              f"gpu            = {_toml_bool(cfg.gpu)}",
               f"exchange       = {_toml_bool(cfg.exchange)}",
               f'suspend_action = "{_esc(cfg.suspend_action)}"',
               f"clip_clear     = {_toml_bool(cfg.clip_clear)}",
@@ -468,8 +458,6 @@ def save(cfg: Config) -> Path:
             lines += [f'display_name = "{_esc(vc.display_name)}"']
         if vc.default_app is not None:
             lines += [f'default_app  = "{_esc(vc.default_app)}"']
-        if vc.gpu is not None:
-            lines += [f"gpu          = {_toml_bool(vc.gpu)}"]
         if vc.backend is not None:
             lines += [f'backend      = "{_esc(vc.backend)}"']
         lines += [""]
@@ -498,6 +486,110 @@ def _pub_dir() -> Path:
     return Path(os.environ.get("VERACAGE_PUB_DIR") or _PUB_DIR_DEFAULT)
 
 
+# The sandbox starts with an empty XDG config tmpfs, so its file managers have
+# no file-type associations and would ask "open with?" for every file. Publish
+# a mimeapps.list seed (the leader copies it into each sandbox): the enabled
+# apps become the default handlers for the types their .desktop files declare
+# (config order, first app wins), and the host's own defaults fill in the rest.
+
+
+def _application_dirs() -> list[Path]:
+    """The XDG application directories, most-specific first (user overrides
+    system). Mirrors application_dirs in agent-rs detect.rs."""
+    data_home = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
+    data_dirs = os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share"
+    return [Path(d) / "applications"
+            for d in [data_home, *data_dirs.split(":")] if d]
+
+
+def _desktop_entry_fields(body: str) -> tuple[str, str]:
+    """(Exec binary basename, raw MimeType value) from a .desktop file's
+    `[Desktop Entry]` group. Empty strings when absent."""
+    in_entry = False
+    exec_bin = ""
+    mimes = ""
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            in_entry = line == "[Desktop Entry]"
+            continue
+        if not in_entry:
+            continue
+        if line.startswith("Exec=") and not exec_bin:
+            tokens = line[len("Exec="):].split()
+            first = tokens[0] if tokens else ""
+            base = first.rsplit("/", 1)[-1]
+            exec_bin = "" if base.startswith("%") else base
+        elif line.startswith("MimeType=") and not mimes:
+            mimes = line[len("MimeType="):]
+    return exec_bin, mimes
+
+
+def _mime_defaults(apps: list[App]) -> dict[str, str]:
+    """Mime type -> desktop id for the enabled apps: find each app's .desktop
+    (matched by Exec binary basename, user dirs first) and claim the types its
+    MimeType= declares. On overlap the first app in config order wins."""
+    targets = {os.path.basename(a.exec) for a in apps}
+    by_exec: dict[str, tuple[str, str]] = {}
+    for d in _application_dirs():
+        if targets <= by_exec.keys():
+            break
+        try:
+            entries = sorted(os.scandir(d), key=lambda e: e.name)
+        except OSError:
+            continue
+        for e in entries:
+            if not e.name.endswith(".desktop"):
+                continue
+            try:
+                body = Path(e.path).read_text(errors="replace")
+            except OSError:
+                continue
+            exec_bin, mimes = _desktop_entry_fields(body)
+            if exec_bin in targets and exec_bin not in by_exec and mimes:
+                by_exec[exec_bin] = (e.name, mimes)
+    defaults: dict[str, str] = {}
+    for a in apps:
+        hit = by_exec.get(os.path.basename(a.exec))
+        if hit is None:
+            continue
+        desktop_id, mimes = hit
+        for mime in (m.strip() for m in mimes.split(";")):
+            if mime:
+                defaults.setdefault(mime, desktop_id)
+    return defaults
+
+
+def _host_mimeapps() -> configparser.ConfigParser:
+    """The host's own mimeapps.list (missing or unparsable reads as empty)."""
+    cp = configparser.ConfigParser(interpolation=None, strict=False,
+                                   delimiters=("=",))
+    cp.optionxform = str  # type: ignore[assignment]  # mime types are case-sensitive
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+    with contextlib.suppress(OSError, configparser.Error):
+        cp.read_string((base / "mimeapps.list").read_text(errors="replace"))
+    return cp
+
+
+def _mimeapps_body(cfg: Config) -> str:
+    """The mimeapps.list seed: enabled-app defaults first, then the host's own
+    defaults for every type they don't claim, plus the host's added and removed
+    associations unchanged."""
+    defaults = _mime_defaults(list(cfg.apps.values()))
+    host = _host_mimeapps()
+    if host.has_section("Default Applications"):
+        for mime, ids in host.items("Default Applications"):
+            defaults.setdefault(mime, ids)
+    out = ["[Default Applications]\n"]
+    out += [f"{mime}={ids}{'' if ids.endswith(';') else ';'}\n"
+            for mime, ids in defaults.items()]
+    for section in ("Added Associations", "Removed Associations"):
+        if host.has_section(section) and host.items(section):
+            out.append(f"\n[{section}]\n")
+            out += [f"{k}={v}\n" for k, v in host.items(section)]
+    return "".join(out)
+
+
 def publish_apps(cfg: Config) -> None:
     """Publish the enabled app list to `pub/config.apps` (`<key>\\t<name>` per
     line) so the compositor's Apps menu has content before any volume is
@@ -523,6 +615,8 @@ def publish_apps(cfg: Config) -> None:
                     "".join(f"{a}\t{sc.get(a, _DEFAULT_SHORTCUTS[a])}\n" for a in _SHORTCUT_ACTIONS))
     _publish_atomic(pub, "clipclear",
                     f"{1 if cfg.clip_clear else 0}\n{cfg.clip_clear_timeout}\n")
+    # The default-app associations the leader seeds into each sandbox.
+    _publish_atomic(pub, "mimeapps.list", _mimeapps_body(cfg))
 
 
 def _publish_atomic(pub: Path, name: str, body: str) -> None:
@@ -563,8 +657,8 @@ def _toml_bool(b: bool) -> str:
 
 def _coerce_bool(val: object, where: str) -> bool:
     """Strict bool: only a real TOML bool counts. Anything else (e.g. the
-    string "false", which is truthy) warns and is treated as False - so a
-    bad gpu value fails *closed*, not open."""
+    string "false", which is truthy) warns and is treated as False, so a bad
+    value fails predictably instead of silently counting as true."""
     if isinstance(val, bool):
         return val
     print(f"veracage: {where} should be true/false, got {val!r}, using false",
