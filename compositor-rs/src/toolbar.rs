@@ -91,8 +91,9 @@ pub struct Toolbar {
     /// The frame `run()` produced, painted by `paint()` after the windows are
     /// composited: tessellated primitives, texture updates, pixels per point.
     pending: Option<(Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32)>,
-    /// A progress note shown right-aligned in the strip with a spinner, while
-    /// something slow is happening (unlocking a volume, starting an app).
+    /// Set while something slow is happening (unlocking a volume, an app
+    /// starting): a bare spinner is drawn centred over everything. The text is
+    /// not shown, it only names the note in the debug log.
     status: Option<String>,
     /// A transient user-facing banner (e.g. a failed launch a leader reported),
     /// with the instant it was set. Cleared after NOTICE_TTL.
@@ -559,26 +560,18 @@ impl Toolbar {
                     });
             }
 
-            // Progress note, floating just under the toolbar: unlocking a volume
-            // is seconds of key derivation, and an app then takes a moment to put
-            // its window up, both with nothing else to see. Top-centre so it is
-            // visible whether the backdrop or an app window is underneath (the
-            // notice banner has the bottom to itself), and non-interactive so it
-            // never eats a click. The spinner animates, which keeps asking for
-            // frames until the note clears.
-            if let Some(text) = status {
+            // Something slow is happening (unlocking a volume, an app starting):
+            // just a spinner, centred over everything, no frame and no text - it
+            // says "wait" without covering what is underneath. Non-interactive, so
+            // it never eats a click. Its animation is what keeps asking for frames
+            // until the note clears.
+            if status.is_some() {
                 egui::Area::new(egui::Id::new("veracage_status"))
                     .order(egui::Order::Foreground)
-                    .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, height + 14.0))
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                     .interactable(false)
                     .show(ctx, |ui| {
-                        egui::Frame::popup(ui.style()).show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.add(egui::Spinner::new().size(16.0));
-                                ui.add_space(4.0);
-                                ui.label(egui::RichText::new(text).size(base));
-                            });
-                        });
+                        ui.add(egui::Spinner::new().size(56.0));
                     });
             }
 

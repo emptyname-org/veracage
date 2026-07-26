@@ -13,7 +13,6 @@ mod hostclip;
 mod handlers;
 mod input;
 mod mono_icons;
-mod shadow;
 mod shortcuts;
 mod state;
 mod toolbar;

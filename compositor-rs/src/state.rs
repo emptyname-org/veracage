@@ -147,9 +147,6 @@ pub struct State {
     /// like the app windows and backdrop.
     pub hint_icon: Option<smithay::backend::renderer::element::memory::MemoryRenderBuffer>,
 
-    /// The blur profile every window's drop shadow is 9-sliced from (shadow.rs).
-    pub shadow: smithay::backend::renderer::element::memory::MemoryRenderBuffer,
-
     /// The launch progress note being shown: its stamp plus how many windows were
     /// mapped when it arrived. The note clears when the count rises above that,
     /// i.e. when the app being launched puts ITS window up.
@@ -275,7 +272,6 @@ impl State {
             toolbar_failed: false,
             dnd_icon: None,
             hint_icon: build_hint_icon(),
-            shadow: crate::shadow::build_buffer(),
             status_baseline: None,
             frames: 0,
             submits: 0,

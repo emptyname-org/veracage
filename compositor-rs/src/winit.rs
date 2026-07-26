@@ -29,17 +29,7 @@ smithay::backend::renderer::element::render_elements! {
     HintElement<R> where R: ImportMem + ImportAll;
     Surface = WaylandSurfaceRenderElement<R>,
     Memory = MemoryRenderBufferRenderElement<R>,
-    Shadow = smithay::backend::renderer::element::NamespacedElement<MemoryRenderBufferRenderElement<R>>,
     Egui = EguiDamage,
-}
-
-// The full element list for a frame. smithay has this internally, but keeps it
-// private, and its `space::render_output` always puts the custom elements ON TOP.
-// We need both: the overlay above the windows and the window shadows below them.
-smithay::backend::renderer::element::render_elements! {
-    OutputElement<='a, GlesRenderer>;
-    Space = smithay::desktop::space::SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
-    Custom = &'a HintElement<GlesRenderer>,
 }
 
 /// A draw-nothing element that reports the egui overlay's region as damaged.
@@ -519,55 +509,23 @@ pub fn init_winit(
                                 rect,
                             )));
                         }
-                        // A soft drop shadow per window, so the app windows read
-                        // as floating on the backdrop instead of pasted onto it.
-                        let geometries: Vec<_> = state
-                            .space
-                            .elements()
-                            .filter_map(|w| state.space.element_geometry(w))
-                            .collect();
-                        let shadows: Vec<HintElement<GlesRenderer>> = geometries
-                            .into_iter()
-                            .enumerate()
-                            .flat_map(|(i, geo)| {
-                                crate::shadow::ring_elements(
-                                    renderer, &state.shadow, geo, scale_f, i,
-                                )
-                            })
-                            .map(HintElement::Shadow)
-                            .collect();
-
-                        // Assemble the element list ourselves (this is what
-                        // space::render_output does) so the shadows can go
-                        // BELOW the windows: earlier in the list is higher up.
-                        // Order: overlay damage + DnD ghost + hint, then the app
-                        // windows, then their shadows.
-                        type El<'a> = OutputElement<'a>;
-                        match smithay::desktop::space::space_render_elements(
-                            renderer,
-                            [&state.space],
+                        smithay::desktop::space::render_output::<
+                            _,
+                            HintElement<GlesRenderer>,
+                            _,
+                            _,
+                        >(
                             &output,
+                            renderer,
+                            &mut framebuffer,
                             1.0,
-                        ) {
-                            Ok(space_elements) => {
-                                let mut elements: Vec<El> = Vec::with_capacity(
-                                    custom.len() + space_elements.len() + shadows.len(),
-                                );
-                                elements.extend(custom.iter().map(El::Custom));
-                                elements.extend(space_elements.into_iter().map(El::Space));
-                                elements.extend(shadows.iter().map(El::Custom));
-                                damage_tracker
-                                    .render_output(
-                                        renderer,
-                                        &mut framebuffer,
-                                        age,
-                                        &elements,
-                                        clear_color,
-                                    )
-                                    .map_err(|e| e.to_string())
-                            }
-                            Err(e) => Err(e.to_string()),
-                        }
+                            age,
+                            [&state.space],
+                            &custom,
+                            &mut damage_tracker,
+                            clear_color,
+                        )
+                        .map_err(|e| e.to_string())
                     }
                     Err(e) => Err(e.to_string()),
                 };
