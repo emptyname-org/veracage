@@ -35,12 +35,13 @@ smithay::backend::renderer::element::render_elements! {
     Egui = EguiDamage,
 }
 
-// The full element list for a frame. smithay has this internally but keeps it
-// private, and its `space::render_output` always puts custom elements ON TOP.
-// We need both: the overlay above the windows and the shadows below them.
+// The full element list for a frame. smithay's own `space::render_output` cannot
+// express the order we need - it always puts custom elements ON TOP - so the
+// list is assembled here: overlay above the windows, each window's shadow
+// directly beneath THAT window, and the backdrop at the bottom.
 smithay::backend::renderer::element::render_elements! {
     OutputElement<='a, GlesRenderer>;
-    Space = smithay::desktop::space::SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+    Surface = &'a WaylandSurfaceRenderElement<GlesRenderer>,
     Custom = &'a HintElement<GlesRenderer>,
     Shadow = &'a smithay::backend::renderer::gles::element::PixelShaderElement,
 }
@@ -633,62 +634,69 @@ pub fn init_winit(
                                 rect,
                             )));
                         }
-                        // Drop shadows: one shader element per window, drawn under
-                        // the windows (see shadow.rs). Collected first so the
-                        // borrow of `state.space` ends before `state.shadows`.
-                        let geometries: Vec<_> = state
+                        // One layer per window, TOP-MOST FIRST, each carrying its
+                        // own shadow so the shadow lands directly beneath THAT
+                        // window - on the windows behind it - the way a scene
+                        // graph (scenefx, sway) stacks them. Drawing every shadow
+                        // below every window instead only ever showed a halo
+                        // around the whole group.
+                        //
+                        // Dead windows are skipped, so a window and its shadow
+                        // disappear in the same frame: the space keeps an element
+                        // until its next refresh, which is why the shadow used to
+                        // outlive the window by a frame or more.
+                        //
+                        // The window list is collected first so its borrow of
+                        // `state.space` ends before `state.shadows` is touched.
+                        let windows: Vec<_> = state
                             .space
                             .elements()
+                            .rev()
+                            .filter(|w| w.alive())
                             .filter_map(|w| {
+                                let id = w.toplevel()?.wl_surface().id();
                                 let geo = state.space.element_geometry(w)?;
-                                Some((w.toplevel()?.wl_surface().id(), geo))
+                                // Exactly what Space::render_elements_for_region
+                                // uses: the mapped location minus the window's
+                                // own geometry offset.
+                                let loc = state.space.element_location(w)? - w.geometry().loc;
+                                Some((w.clone(), id, geo, loc))
                             })
                             .collect();
-                        let shadows = state.shadows.elements(
-                            renderer,
-                            geometries.into_iter(),
-                            scale_f,
-                        );
-
-                        // Assemble the element list ourselves, as
-                        // space::render_output does, so the order can be: overlay
-                        // and DnD ghost on top, then the app windows, then their
-                        // shadows underneath.
-                        match smithay::desktop::space::space_render_elements(
-                            renderer,
-                            [&state.space],
-                            &output,
-                            1.0,
-                        ) {
-                            Ok(space_elements) => {
-                                // Earlier in the list is higher up: the overlay
-                                // (cursor, DnD ghost, egui damage), then the app
-                                // windows, then their shadows, then the backdrop
-                                // icon at the very bottom so window shadows fall
-                                // ON it rather than under it.
-                                let mut elements: Vec<OutputElement<'_>> = Vec::with_capacity(
-                                    custom.len()
-                                        + space_elements.len()
-                                        + shadows.len()
-                                        + backdrop.len(),
-                                );
-                                elements.extend(custom.iter().map(OutputElement::Custom));
-                                elements
-                                    .extend(space_elements.into_iter().map(OutputElement::Space));
-                                elements.extend(shadows.iter().map(OutputElement::Shadow));
-                                elements.extend(backdrop.iter().map(OutputElement::Custom));
-                                damage_tracker
-                                    .render_output(
-                                        renderer,
-                                        &mut framebuffer,
-                                        age,
-                                        &elements,
-                                        clear_color,
-                                    )
-                                    .map_err(|e| e.to_string())
-                            }
-                            Err(e) => Err(e.to_string()),
+                        let live: Vec<_> = windows.iter().map(|(_, id, _, _)| id.clone()).collect();
+                        state.shadows.retain(&live);
+                        let mut layers: Vec<(
+                            Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+                            Option<smithay::backend::renderer::gles::element::PixelShaderElement>,
+                        )> = Vec::with_capacity(windows.len());
+                        for (window, id, geo, loc) in &windows {
+                            let elements = smithay::backend::renderer::element::AsRenderElements::<
+                                GlesRenderer,
+                            >::render_elements(
+                                window,
+                                renderer,
+                                loc.to_physical_precise_round(scale_f),
+                                smithay::utils::Scale::from(scale_f),
+                                1.0,
+                            );
+                            let shadow = state.shadows.element(renderer, id, *geo, scale_f);
+                            layers.push((elements, shadow));
                         }
+
+                        // Earlier in the list is higher up. Overlay first (cursor,
+                        // DnD ghost, egui damage), then window-with-its-shadow
+                        // from front to back, then the backdrop at the very
+                        // bottom so the shadows fall on it too.
+                        let mut elements: Vec<OutputElement<'_>> = Vec::new();
+                        elements.extend(custom.iter().map(OutputElement::Custom));
+                        for (window_elements, shadow) in &layers {
+                            elements.extend(window_elements.iter().map(OutputElement::Surface));
+                            elements.extend(shadow.iter().map(OutputElement::Shadow));
+                        }
+                        elements.extend(backdrop.iter().map(OutputElement::Custom));
+                        damage_tracker
+                            .render_output(renderer, &mut framebuffer, age, &elements, clear_color)
+                            .map_err(|e| e.to_string())
                     }
                     Err(e) => Err(e.to_string()),
                 };

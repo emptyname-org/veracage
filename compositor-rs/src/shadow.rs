@@ -107,16 +107,21 @@ pub struct Shadows {
 }
 
 impl Shadows {
-    /// The shadow elements for `windows`, bottom-most last. Compiles the shader on
-    /// first use (needs a current GL context, so call from the render path) and
-    /// returns nothing at all if it fails to compile: the compositor runs on
-    /// without shadows rather than not at all.
-    pub fn elements(
+    /// The shadow for ONE window, cached across frames so the damage tracker sees
+    /// a stable element id. Compiles the shader on first use (needs a current GL
+    /// context, so call it from the render path); if that fails there are simply
+    /// no shadows, rather than no compositor.
+    ///
+    /// The caller draws this directly beneath that window, not beneath all of
+    /// them: a shadow has to fall on the windows behind it, which is how scene
+    /// graph compositors (scenefx, sway) place theirs.
+    pub fn element(
         &mut self,
         renderer: &mut GlesRenderer,
-        windows: impl Iterator<Item = (ObjectId, Rectangle<i32, Logical>)>,
+        id: &ObjectId,
+        geo: Rectangle<i32, Logical>,
         scale: f64,
-    ) -> Vec<PixelShaderElement> {
+    ) -> Option<PixelShaderElement> {
         if self.program.is_none() {
             self.program = renderer
                 .compile_custom_pixel_shader(
@@ -130,39 +135,36 @@ impl Shadows {
                 .map_err(|e| tracing::warn!("shadow shader did not compile: {e}"))
                 .ok();
         }
-        let Some(program) = self.program.clone() else {
-            return Vec::new();
-        };
-
+        let program = self.program.clone()?;
         let spread = SPREAD.round() as i32;
-        let mut live = Vec::new();
-        for (id, geo) in windows {
-            // The element covers the window plus the blur on every side.
-            let area = Rectangle::new(
-                (geo.loc.x - spread, geo.loc.y - spread).into(),
-                (geo.size.w + 2 * spread, geo.size.h + 2 * spread).into(),
-            );
-            let element = self.elements.entry(id.clone()).or_insert_with(|| {
-                PixelShaderElement::new(
-                    program.clone(),
-                    area,
-                    None, // nothing here is opaque: it is a soft shadow
-                    1.0,
-                    vec![
-                        // Sigma and radius are in the shader's pixel space, which
-                        // is physical, so they scale with the output.
-                        Uniform::new("blur_sigma", SPREAD * scale as f32),
-                        Uniform::new("corner_radius", CORNER_RADIUS * scale as f32),
-                        Uniform::new("shadow_color", [0.0, 0.0, 0.0, OPACITY]),
-                    ],
-                    Kind::Unspecified,
-                )
-            });
-            element.resize(area, None);
-            live.push(id);
-        }
-        // Drop shadows for windows that are gone, so the map cannot grow forever.
+        // The element covers the window plus the blur on every side.
+        let area = Rectangle::new(
+            (geo.loc.x - spread, geo.loc.y - spread).into(),
+            (geo.size.w + 2 * spread, geo.size.h + 2 * spread).into(),
+        );
+        let element = self.elements.entry(id.clone()).or_insert_with(|| {
+            PixelShaderElement::new(
+                program,
+                area,
+                None, // nothing here is opaque: it is a soft shadow
+                1.0,
+                vec![
+                    // Sigma and radius are in the shader's own pixel space, so
+                    // they scale with the output.
+                    Uniform::new("blur_sigma", SPREAD * scale as f32),
+                    Uniform::new("corner_radius", CORNER_RADIUS * scale as f32),
+                    Uniform::new("shadow_color", [0.0, 0.0, 0.0, OPACITY]),
+                ],
+                Kind::Unspecified,
+            )
+        });
+        element.resize(area, None);
+        Some(element.clone())
+    }
+
+    /// Forget the shadows of windows that are gone, so the map cannot grow
+    /// forever. Called with the ids still on screen.
+    pub fn retain(&mut self, live: &[ObjectId]) {
         self.elements.retain(|id, _| live.contains(id));
-        live.iter().filter_map(|id| self.elements.get(id).cloned()).collect()
     }
 }
