@@ -78,6 +78,7 @@ _FORWARD_ENV = (
     "VERACAGE_FONT_FILE",    # compositor UI font FILE (resolved from config ui_font)
     "VERACAGE_FONT_SIZE",    # compositor UI base point size (config ui_font_size)
     "VERACAGE_WINDOW_SIZE",  # compositor default window size (config window_size)
+    "VERACAGE_DEBUG",        # verbose timing logs (config debug); see docs/debugging.md
 )
 
 
@@ -175,6 +176,8 @@ def ensure_compositor_up() -> int:
     os.environ["VERACAGE_FONT_FILE"] = config.font_file(cfg.ui_font)
     os.environ["VERACAGE_FONT_SIZE"] = str(config.base_font_size(cfg.ui_font_size, cfg.ui_font))
     os.environ["VERACAGE_WINDOW_SIZE"] = cfg.window_size
+    if cfg.debug:
+        os.environ["VERACAGE_DEBUG"] = "1"
     unit = f"veracage-compositor-{secrets.token_hex(3)}.service"
     cmd = [
         "systemd-run", "--user", "--collect", "--quiet",
@@ -233,6 +236,8 @@ def ensure_empty_session() -> None:
     unit = f"veracage-session-{sid}-{secrets.token_hex(3)}.service"
     helper_flags = ["--empty-session", "--session", sid] + _exchange_flags(cfg)
     leader_args = ["_leader", "--apps", json.dumps(apps_list)]
+    if cfg.debug:
+        leader_args.append("--debug")
     # Detached transient unit (no --pty/--pipe): systemd-run returns once started;
     # the leader runs in the background, pkexec authenticating via the polkit agent
     # (auth_self_keep coalesces this with the compositor's prompt moments earlier).
@@ -409,6 +414,8 @@ def cmd_open(args: argparse.Namespace) -> int:
     # No --mountpoint: the helper computes /vaults/<label> after reading the
     # volume label (post-cryptsetup) and injects it into this leader argv.
     leader_args = ["_leader", "--apps", json.dumps(apps_list)]
+    if cfg.debug:
+        leader_args.append("--debug")
     if first_app is not None:
         leader_args += ["--first", json.dumps(first_app)]
 
@@ -479,7 +486,7 @@ def cmd_leader(args: argparse.Namespace) -> int:
     dropped to us and passed the control fd via the environment)."""
     apps_list = json.loads(args.apps) if args.apps else []
     first_app = json.loads(args.first) if args.first else None
-    return leader.run_leader(args.mountpoint, apps_list, first_app)
+    return leader.run_leader(args.mountpoint, apps_list, first_app, args.debug)
 
 
 # ------------------------------------------------------ veracage list / close
@@ -556,6 +563,7 @@ def main() -> int:
     p_leader.add_argument("--mountpoint", required=True)
     p_leader.add_argument("--apps", default=None)   # JSON list, for the toolbar
     p_leader.add_argument("--first", default=None)  # JSON spec to auto-launch
+    p_leader.add_argument("--debug", action="store_true")  # verbose timing logs
     p_leader.set_defaults(func=cmd_leader)
 
     p_comp = sub.add_parser("_compositor", help=argparse.SUPPRESS)

@@ -41,6 +41,19 @@ from .wayland import COMPOSITOR_RUNTIME, COMPOSITOR_SOCKET, compositor_is_up
 
 _MAX_REQUEST_BYTES = 64 * 1024  # control requests are tiny; cap to bound memory
 
+# Wall clock at import, so debug lines carry an elapsed time that lines up with
+# the compositor's own log rather than an absolute clock.
+_STARTED = time.monotonic()
+
+
+def _debug(state, msg: str) -> None:
+    """One timing line to stderr (the session unit's journal) when debug logging
+    is on: `veracage[+12.34s] <msg>`. Read it with
+    `journalctl --user -u 'veracage-*' -f`. See docs/debugging.md."""
+    if state.debug:
+        print(f"veracage[+{time.monotonic() - _STARTED:6.2f}s] {msg}",
+              file=sys.stderr, flush=True)
+
 # The shared-workspace root (must match WORKSPACE in helper-rs/src/main.rs): the
 # leader's private-NS tmpfs holding every open volume at <WORKSPACE>/<label>. The
 # sandbox binds this whole tree at /vaults, so one app sees all volumes.
@@ -81,6 +94,7 @@ class _LeaderState:
     volume_label: str = "Volume"      # joined labels for the window title
     volumes: list = field(default_factory=list)  # per-volume labels (per-vol close)
     exchange: str | None = None      # idmapped host<->vault shared dir -> /exchange
+    debug: bool = False              # verbose timing logs (config debug / --debug)
 
 
 # ------------------------------------------------------------- protocol ----
@@ -186,22 +200,32 @@ def _launch_app(state: _LeaderState, spec) -> dict:
             seeds.append((os.open(src, os.O_RDONLY), dest))
         except OSError:
             continue
+    t0 = time.monotonic()
     try:
         # Bind the whole workspace (/vaults tree), not one volume: the app sees
         # every volume open at launch time (docs/shared-workspace.md).
         argv = bwrap_command(str(WORKSPACE), app, state.wl_socket,
                              seeds, state.exchange)
+        _debug(state, f"launch {label!r}: exec={command} seeds={len(seeds)} "
+                      f"argv={len(argv)} words")
         # Detach the app's stdio. Inheriting the leader's stdin/out/err hands a
         # chatty viewer the session's terminal/journal: Qt/KF apps print the paths
         # of files they open on stderr, which would persist unencrypted in the
         # user journal, readable by any same-uid process after the vault closes
         # (an accidental-leak channel in the threat model), and hands the app an
         # fd to the human's pty. Nothing vault-side needs the app's stdio.
+        # The app's stdio is normally discarded: a chatty viewer prints the paths
+        # of files it opens, which would persist unencrypted in the journal after
+        # the volume closes (an accidental-leak channel in the threat model).
+        # Debug logging deliberately lifts that, because an app's own warnings are
+        # exactly what a launch problem looks like - it is opt-in, and the trade
+        # is documented in docs/debugging.md.
+        app_out = None if state.debug else subprocess.DEVNULL
         proc = subprocess.Popen(
             argv,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=app_out,
+            stderr=app_out,
             pass_fds=[fd for fd, _ in seeds],
         )
     except FileNotFoundError as e:
@@ -222,6 +246,8 @@ def _launch_app(state: _LeaderState, spec) -> dict:
     # leaves no trace. Done in the reaper (not here) so the serve loop never
     # blocks: the launch returns at once.
     state.children[proc.pid] = (label, time.monotonic())
+    _debug(state, f"launch {label!r}: pid={proc.pid} spawned in "
+                  f"{(time.monotonic() - t0) * 1000:.0f}ms")
     # An app takes a second or two to put its first window up, with nothing on
     # screen meanwhile: ask the compositor to show a progress note until the
     # window appears (it clears the note itself, see scan_status).
@@ -316,13 +342,15 @@ def _reap_children(state: _LeaderState) -> None:
     now = time.monotonic()
     for pid in list(state.children):
         try:
-            reaped, _status = os.waitpid(pid, os.WNOHANG)
+            reaped, status = os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
             state.children.pop(pid, None)
             continue
         if reaped != pid:
             continue
         label, launched_at = state.children.pop(pid)
+        _debug(state, f"exit {label!r}: pid={pid} status={status} "
+                      f"after {now - launched_at:.1f}s")
         if now - launched_at < _EARLY_EXIT_SECONDS:
             _post_notice(f"{label} failed to launch (exited immediately)")
 
@@ -539,7 +567,8 @@ def _write_places_file(labels: list[str], with_exchange: bool = False) -> Path |
 
 # --------------------------------------------------------- leader run ------
 
-def run_leader(mountpoint: str, app_specs: list, first_app: dict | None) -> int:
+def run_leader(mountpoint: str, app_specs: list, first_app: dict | None,
+               debug: bool = False) -> int:
     """Become the vault-side session leader. Returns the exit code.
 
     Attaches to the ONE persistent compositor's shared socket (brought up
@@ -556,7 +585,8 @@ def run_leader(mountpoint: str, app_specs: list, first_app: dict | None) -> int:
     if vr:
         os.environ["XDG_RUNTIME_DIR"] = vr
 
-    state = _LeaderState(mountpoint=mountpoint, app_specs=app_specs or [])
+    state = _LeaderState(mountpoint=mountpoint, app_specs=app_specs or [],
+                         debug=debug)
 
     # The shared compositor must already be up (cli.py brings it up before the
     # mount). We only observe its socket. We never spawn it.

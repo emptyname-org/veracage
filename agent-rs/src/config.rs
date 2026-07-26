@@ -95,6 +95,9 @@ struct DefaultSection {
     clip_clear: bool,
     #[serde(default = "default_clip_clear_timeout")]
     clip_clear_timeout: u32,
+    /// Verbose timing logs across the components (see docs/debugging.md).
+    #[serde(default)]
+    debug: bool,
 }
 
 impl Default for DefaultSection {
@@ -110,6 +113,7 @@ impl Default for DefaultSection {
             exchange_dir: None,
             clip_clear: true,
             clip_clear_timeout: default_clip_clear_timeout(),
+            debug: false,
         }
     }
 }
@@ -177,6 +181,7 @@ pub struct Config {
     pub exchange_dir: Option<String>,
     pub clip_clear: bool,          // auto-clear host clipboard after Copy out
     pub clip_clear_timeout: u32,   // seconds before the auto-clear fires
+    pub debug: bool,               // verbose timing logs (docs/debugging.md)
     pub shortcuts: BTreeMap<String, String>, // action -> keybind (copy_out/paste_in)
     volumes: BTreeMap<String, toml::Value>, // opaque pass-through
 }
@@ -215,6 +220,7 @@ impl Config {
             exchange_dir: None,
             clip_clear: true,
             clip_clear_timeout: default_clip_clear_timeout(),
+            debug: false,
             shortcuts: default_shortcuts(),
             volumes: BTreeMap::new(),
         }
@@ -320,6 +326,7 @@ pub fn load() -> Config {
         exchange_dir: raw.default.exchange_dir,
         clip_clear: raw.default.clip_clear,
         clip_clear_timeout,
+        debug: raw.default.debug,
         shortcuts,
         volumes: raw.volumes,
     }
@@ -370,6 +377,7 @@ pub fn save(cfg: &Config) -> io::Result<PathBuf> {
             exchange_dir: cfg.exchange_dir.clone(),
             clip_clear: cfg.clip_clear,
             clip_clear_timeout: cfg.clip_clear_timeout,
+            debug: cfg.debug,
         },
         apps,
         shortcuts: cfg.shortcuts.clone(),

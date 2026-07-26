@@ -96,11 +96,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `hostclip::EXIT_CLEAR_WAIT_MS`; this only covers the thread winding down.
 const WORKER_STOP_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// True when `VERACAGE_DEBUG=1` was forwarded (config `debug`): the compositor
+/// then writes a periodic render/scan summary through `vcdebug`. Read once.
+pub fn debug_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VERACAGE_DEBUG").as_deref() == Ok("1"))
+}
+
 /// Append a debug line to `/run/veracage/rt/compositor.log` (0644, so the human
 /// uid can read it through the 0711 rt dir). The compositor's stdio is swallowed
 /// by pkexec/privilege-drop, so the journal never sees its tracing - this is the
-/// reliable channel for live debugging. Kept for ad-hoc instrumentation.
-#[allow(dead_code)]
+/// reliable channel for live debugging. See docs/debugging.md.
 pub fn vcdebug(msg: &str) {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;

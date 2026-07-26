@@ -138,6 +138,7 @@ window_size    = "default"      # default | max | 1280x800 (WxH)
 suspend_action = "dismount"     # unmount on suspend, or "ignore" to keep mounted
 clip_clear     = true           # auto-clear the host clipboard after Copy out
 clip_clear_timeout = 30         # seconds before the auto-clear fires
+debug          = false          # verbose timing logs (docs/debugging.md)
 
 [apps.kate]                     # the enabled-app allowlist (any installed binary)
 name     = "Kate"

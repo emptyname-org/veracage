@@ -281,6 +281,7 @@ class Config:
     exchange_dir: str | None = None       # default ~/Veracage/Exchange when unset
     clip_clear: bool = True               # auto-clear host clipboard after Copy out
     clip_clear_timeout: int = DEFAULT_CLIP_CLEAR_TIMEOUT   # seconds before it fires
+    debug: bool = False                   # verbose timing logs (see docs/debugging.md)
     shortcuts: dict[str, str] = field(default_factory=_default_shortcuts)
     volumes: dict[str, VolumeConfig] = field(default_factory=dict)
 
@@ -359,6 +360,7 @@ def load() -> Config:
     exchange = _coerce_bool(default.get("exchange", True), "default.exchange")
     exchange_dir = default.get("exchange_dir") or None
     clip_clear = _coerce_bool(default.get("clip_clear", True), "default.clip_clear")
+    debug = _coerce_bool(default.get("debug", False), "default.debug")
     clip_clear_timeout = _coerce_clip_timeout(
         default.get("clip_clear_timeout", DEFAULT_CLIP_CLEAR_TIMEOUT))
     theme = default.get("theme", "light")
@@ -421,7 +423,7 @@ def load() -> Config:
                   ui_font_size=ui_font_size, window_size=window_size,
                   exchange=exchange, exchange_dir=exchange_dir,
                   clip_clear=clip_clear, clip_clear_timeout=clip_clear_timeout,
-                  shortcuts=shortcuts, volumes=volumes)
+                  debug=debug, shortcuts=shortcuts, volumes=volumes)
 
 
 def save(cfg: Config) -> Path:
@@ -438,7 +440,8 @@ def save(cfg: Config) -> Path:
               f"exchange       = {_toml_bool(cfg.exchange)}",
               f'suspend_action = "{_esc(cfg.suspend_action)}"',
               f"clip_clear     = {_toml_bool(cfg.clip_clear)}",
-              f"clip_clear_timeout = {int(cfg.clip_clear_timeout)}"]
+              f"clip_clear_timeout = {int(cfg.clip_clear_timeout)}",
+              f"debug          = {_toml_bool(cfg.debug)}"]
     if cfg.exchange_dir:
         lines += [f'exchange_dir   = "{_esc(cfg.exchange_dir)}"']
     lines += [

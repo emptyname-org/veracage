@@ -291,9 +291,14 @@ impl Toolbar {
         changed
     }
 
-    /// Set (or clear, with None) the progress note shown in the strip beside a
-    /// spinner: "Unlocking <volume>" while the helper derives the key, "Starting
-    /// <app>" until its window appears. True if the note changed.
+    /// The progress note currently shown, for the debug log.
+    pub fn status_text(&self) -> Option<String> {
+        self.status.clone()
+    }
+
+    /// Set (or clear, with None) the progress note shown beside a spinner:
+    /// "Unlocking <volume>" while the helper derives the key, "Starting <app>"
+    /// until its window appears. True if the note changed.
     pub fn set_status(&mut self, status: Option<String>) -> bool {
         if self.status == status {
             return false;
@@ -768,7 +773,10 @@ const NOTICE_FILE: &str = "notice";
 /// just-launched app has no window yet). The broker deletes its file when the
 /// open finishes; the leader's note cannot know when the app's window appears, so
 /// it is dropped here once a window is mapped or after LAUNCH_STATUS_TTL.
-pub fn scan_status(has_windows: bool) -> Option<String> {
+pub fn scan_status(
+    windows_now: usize,
+    baseline: Option<(u64, usize)>,
+) -> (Option<String>, Option<(u64, usize)>) {
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -776,30 +784,43 @@ pub fn scan_status(has_windows: bool) -> Option<String> {
     pick_status(
         read_status_line(&std::path::Path::new(PUB_DIR).join("status")),
         read_status_line(&std::path::Path::new(RUNTIME_DIR).join("status")),
-        has_windows,
+        windows_now,
+        baseline,
         now_ns,
     )
 }
 
-/// Which note to show, given both channels' contents. Pure, so it is unit-tested.
-/// The broker's note (`from_broker`) wins and is trusted to be current: it is
-/// deleted when the open finishes. The leader's launch note is suppressed once a
-/// window is mapped and expires with LAUNCH_STATUS_TTL.
+/// Which note to show, and the launch-note baseline to remember. Pure, so it is
+/// unit-tested.
+///
+/// The broker's note wins and is trusted to be current: it is deleted when the
+/// open finishes. A leader's launch note ("Starting Kate") cannot know when the
+/// app's window appears, so it is shown until the window COUNT rises above what
+/// it was when that note arrived - not merely until some window exists, which
+/// hid the note whenever an app was already open - or until it expires.
 fn pick_status(
     from_broker: Option<(u64, String)>,
     from_leader: Option<(u64, String)>,
-    has_windows: bool,
+    windows_now: usize,
+    baseline: Option<(u64, usize)>,
     now_ns: u128,
-) -> Option<String> {
+) -> (Option<String>, Option<(u64, usize)>) {
     if let Some((_, text)) = from_broker {
-        return Some(text);
+        return (Some(text), baseline);
     }
-    if has_windows {
-        return None; // the app is up: its window IS the confirmation
-    }
-    let (stamp_ns, text) = from_leader?;
-    let age = now_ns.saturating_sub(stamp_ns as u128);
-    (age < LAUNCH_STATUS_TTL.as_nanos()).then_some(text)
+    let Some((stamp_ns, text)) = from_leader else {
+        return (None, None);
+    };
+    // A note we have not seen before: remember how many windows were up when it
+    // arrived, so the app's OWN window is what clears it.
+    let (stamp, windows_at_arrival) = match baseline {
+        Some(b) if b.0 == stamp_ns => b,
+        _ => (stamp_ns, windows_now),
+    };
+    let expired =
+        now_ns.saturating_sub(stamp_ns as u128) >= LAUNCH_STATUS_TTL.as_nanos();
+    let shown = windows_now <= windows_at_arrival && !expired;
+    (shown.then_some(text), Some((stamp, windows_at_arrival)))
 }
 
 /// A status file's one line: `<text>` (broker) or `<stamp_ns>\t<text>` (leader).
@@ -1071,36 +1092,50 @@ mod tests {
     #[test]
     fn broker_status_wins_and_is_never_expired() {
         // The broker deletes its file when the open ends, so whatever is there is
-        // current - even with windows mapped (adding a 2nd volume) or an old stamp.
+        // current - even with windows mapped, or with an old leader stamp beside it.
         let broker = Some((0, "Unlocking work.vc".to_string()));
         let leader = Some((HOUR_NS as u64, "Starting Dolphin".to_string()));
-        for has_windows in [false, true] {
-            assert_eq!(
-                pick_status(broker.clone(), leader.clone(), has_windows, HOUR_NS),
-                Some("Unlocking work.vc".to_string())
-            );
+        for windows in [0, 3] {
+            let (shown, _) = pick_status(broker.clone(), leader.clone(), windows, None, HOUR_NS);
+            assert_eq!(shown, Some("Unlocking work.vc".to_string()));
         }
     }
 
     #[test]
-    fn launch_status_clears_on_a_mapped_window() {
-        // The app's own window is the confirmation: stop showing "Starting ...".
-        let leader = Some((HOUR_NS as u64, "Starting Dolphin".to_string()));
-        assert_eq!(pick_status(None, leader.clone(), false, HOUR_NS),
-                   Some("Starting Dolphin".to_string()));
-        assert_eq!(pick_status(None, leader, true, HOUR_NS), None);
+    fn launch_note_clears_when_that_app_maps_its_own_window() {
+        // Regression: the note used to be hidden whenever ANY window existed, so
+        // launching a second app showed no progress at all. What clears it is the
+        // window COUNT rising above what it was when the note arrived.
+        let leader = Some((HOUR_NS as u64, "Starting Kate".to_string()));
+        // One app already open: the note still shows, with baseline 1 remembered.
+        let (shown, base) = pick_status(None, leader.clone(), 1, None, HOUR_NS);
+        assert_eq!(shown, Some("Starting Kate".to_string()));
+        assert_eq!(base, Some((HOUR_NS as u64, 1)));
+        // Still only that one window: keep showing it.
+        let (shown, base) = pick_status(None, leader.clone(), 1, base, HOUR_NS);
+        assert_eq!(shown, Some("Starting Kate".to_string()));
+        // Kate's window maps (count 2 > baseline 1): the note is done.
+        let (shown, _) = pick_status(None, leader, 2, base, HOUR_NS);
+        assert_eq!(shown, None);
     }
 
     #[test]
-    fn launch_status_expires_so_the_spinner_cannot_spin_forever() {
-        // An app that never maps a window (crashed, or window-less) must not
-        // leave the strip spinning; a stale file from an earlier session neither.
+    fn launch_note_expires_so_the_spinner_cannot_spin_forever() {
+        // An app that never maps a window (crashed, or window-less) must not leave
+        // the strip spinning, and neither must a file left by an earlier session.
         let stamp = HOUR_NS as u64;
         let leader = Some((stamp, "Starting Dolphin".to_string()));
-        let just_inside = HOUR_NS + LAUNCH_STATUS_TTL.as_nanos() - 1;
-        let just_outside = HOUR_NS + LAUNCH_STATUS_TTL.as_nanos();
-        assert!(pick_status(None, leader.clone(), false, just_inside).is_some());
-        assert_eq!(pick_status(None, leader, false, just_outside), None);
+        let base = Some((stamp, 0));
+        let inside = HOUR_NS + LAUNCH_STATUS_TTL.as_nanos() - 1;
+        let outside = HOUR_NS + LAUNCH_STATUS_TTL.as_nanos();
+        assert!(pick_status(None, leader.clone(), 0, base, inside).0.is_some());
+        assert_eq!(pick_status(None, leader, 0, base, outside).0, None);
+    }
+
+    #[test]
+    fn no_note_forgets_the_baseline() {
+        // Nothing published: the next note starts its own baseline afresh.
+        assert_eq!(pick_status(None, None, 2, Some((1, 0)), HOUR_NS), (None, None));
     }
 
     #[test]

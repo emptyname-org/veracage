@@ -214,10 +214,12 @@ fn run_discovery_scan(
             changed = true;
         }
     }
-    // Progress note (unlocking a volume, starting an app): a spinner in the
-    // strip. The launch note clears itself once the app's window is up.
-    let has_windows = state.space.elements().next().is_some();
-    let status = crate::toolbar::scan_status(has_windows);
+    // Progress note (unlocking a volume, starting an app), shown with a spinner.
+    // A launch note clears when THAT app's window appears, so the window count
+    // when it arrived is carried along.
+    let windows_now = state.space.elements().count();
+    let (status, baseline) = crate::toolbar::scan_status(windows_now, state.status_baseline);
+    state.status_baseline = baseline;
     if let Some(tb) = state.toolbar.as_mut() {
         changed |= tb.set_status(status);
     }
@@ -387,6 +389,7 @@ pub fn init_winit(
                 // re-arm it below (via wants_repaint); commits/input set it again
                 // as they arrive.
                 state.dirty = false;
+                state.frames = state.frames.saturating_add(1);
                 let size = backend.window_size();
                 let has_windows = state.space.elements().next().is_some();
                 let scale_f = output.current_scale().fractional_scale();
@@ -618,6 +621,7 @@ pub fn init_winit(
                 // only what actually changed. No damage means nothing was
                 // rendered, so there is nothing to swap.
                 if let Some(damage) = res.damage {
+                    state.submits = state.submits.saturating_add(1);
                     if let Err(e) = backend.submit(Some(damage.as_slice())) {
                         tracing::warn!("submit skipped this frame: {e}");
                         state.dirty = true;
@@ -687,6 +691,26 @@ pub fn init_winit(
             // try_borrow: skip this tick if the renderer holds the backend (the
             // scan only needs the window handle, and the next tick is 250ms away).
             if let Ok(b) = backend_scan.try_borrow() {
+                // Debug logging: one line a second with what the render loop is
+                // actually doing, so a "it feels slow" report has numbers behind
+                // it (see docs/debugging.md).
+                if crate::debug_enabled() {
+                    let now = state.start_time.elapsed();
+                    if now.saturating_sub(state.debug_logged_at) >= Duration::from_secs(1) {
+                        state.debug_logged_at = now;
+                        crate::vcdebug(&format!(
+                            "[+{:6.1}s] frames={} submits={} windows={} dirty={} status={:?}",
+                            now.as_secs_f32(),
+                            state.frames,
+                            state.submits,
+                            state.space.elements().count(),
+                            state.dirty,
+                            state.toolbar.as_ref().and_then(|t| t.status_text()),
+                        ));
+                        state.frames = 0;
+                        state.submits = 0;
+                    }
+                }
                 if run_discovery_scan(state, b.window()) {
                     state.dirty = true;
                     state.toolbar_changed = true;

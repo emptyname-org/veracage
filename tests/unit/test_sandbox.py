@@ -61,8 +61,10 @@ def test_starts_with_bwrap(argv):
 
 
 def test_app_command_appears_after_double_dash(argv):
+    # The app is what bwrap ultimately runs: last, after the `--` separator and
+    # the private-bus wrapper (see test_app_runs_under_a_private_dbus_session).
     sep = argv.index("--")
-    assert argv[sep + 1] == "kate"
+    assert argv[sep + 1:] == [*sandbox.dbus_wrapper(), "kate"]
 
 
 def test_vault_is_bound_at_slash_vault(argv):
@@ -140,9 +142,26 @@ def test_no_share_user_no_share_net_no_network(argv):
 
 def test_app_launches_bare(argv):
     # Apps launch with no arguments (the launch-dir args feature was removed);
-    # the sandbox chdir (/vaults) is what places them in the workspace.
+    # the sandbox chdir (/vaults) is what places them in the workspace. The only
+    # thing allowed between bwrap's `--` and the app is the private-bus wrapper.
     assert argv[-1] == "kate"
-    assert argv[-2] == "--"
+    sep = argv.index("--")
+    assert argv[sep + 1:] == [*sandbox.dbus_wrapper(), "kate"]
+
+
+def test_app_runs_under_a_private_dbus_session():
+    """Qt/KDE apps block on the D-Bus connect timeout (measured: 25s of an app
+    doing nothing, then "Not connected to D-Bus server") when there is no session
+    bus. Each app gets its own, started inside the sandbox - never the host's."""
+    if not sandbox.dbus_wrapper():
+        pytest.skip("dbus-run-session is not installed")
+    sock = Path("/run/user/1000/wayland-0")
+    argv = sandbox.bwrap_command("/run/veracage/abc", _KATE, sock)
+    sep = argv.index("--")
+    assert argv[sep + 1:sep + 3] == ["dbus-run-session", "--"]
+    # No host bus address or socket is passed in: the bus lives in the sandbox.
+    assert not any("DBUS_SESSION_BUS_ADDRESS" in a for a in argv)
+    assert not any("/run/user/1000/bus" in a for a in argv)
 
 
 def test_bwrap_runs_exec_as_single_argv():
@@ -155,8 +174,11 @@ def test_bwrap_runs_exec_as_single_argv():
     weird = App(key="x", name="X", exec="kate --evil; rm -rf ~")
     argv = sandbox.bwrap_command("/run/veracage/abc", weird, sock)
     sep = argv.index("--")
-    # Everything after `--` is exactly one element: the whole exec string.
-    assert argv[sep + 1:] == ["kate --evil; rm -rf ~"]
+    # The exec is the LAST element and still exactly one element, so it can only
+    # name a program (this one fails to exec). `dbus-run-session` is in front of
+    # it on hosts that have it, and execs its command directly - no shell there
+    # either - so the containment argument is unchanged.
+    assert argv[sep + 1:] == [*sandbox.dbus_wrapper(), "kate --evil; rm -rf ~"]
 
 
 def test_chdir_to_vault(argv):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -65,6 +66,11 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
         # config, TLS trust store). Keeps host network/VPN/mail/kerberos
         # configs and the rest of /etc out of a possibly-hostile viewer.
         # `-try` so a path absent on some distro doesn't abort the sandbox.
+        # The host's prebuilt font cache. `/etc/fonts/fonts.conf` names
+        # `/var/cache/fontconfig` first, and without it fontconfig rescans every
+        # font on each app start into the throwaway /xdg tmpfs: measured at ~1s
+        # per launch. Read-only, and it holds nothing but font metadata.
+        "--ro-bind-try", "/var/cache/fontconfig", "/var/cache/fontconfig",
         "--ro-bind-try", "/etc/ld.so.cache", "/etc/ld.so.cache",
         "--ro-bind-try", "/etc/ld.so.conf.d", "/etc/ld.so.conf.d",
         "--ro-bind-try", "/etc/alternatives", "/etc/alternatives",
@@ -133,5 +139,19 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
         # NOT under /vaults, so the "everything in HOME is encrypted" invariant
         # holds. The underlying mount already carries nosuid,nodev,noexec.
         argv += ["--bind", exchange, "/exchange"]
-    argv += ["--", app.exec]
+    # A private D-Bus session bus inside the sandbox. Qt/KDE apps expect one:
+    # without it they block on the D-Bus connect timeout (measured: exactly 25.0s
+    # of an app doing nothing, then "Not connected to D-Bus server" from KDE's
+    # Solid backend) before carrying on degraded. `dbus-run-session` starts a bus
+    # for this app alone and tears it down when it exits. The bus socket lives in
+    # the sandbox's own /tmp and its IPC namespace, so this exposes nothing of the
+    # host session: it is a bus per app, not the host's bus.
+    argv += ["--", *dbus_wrapper(), app.exec]
     return argv
+
+
+def dbus_wrapper() -> list[str]:
+    """`dbus-run-session --` when it is installed, else nothing. The sandbox sees
+    the host's read-only /usr, so testing the host path is testing the sandbox's.
+    Without it apps still run, just with the 25s D-Bus stall."""
+    return ["dbus-run-session", "--"] if shutil.which("dbus-run-session") else []

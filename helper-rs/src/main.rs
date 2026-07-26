@@ -81,6 +81,7 @@ const ALLOWED_SETENV: &[&str] = &[
     "VERACAGE_FONT_FILE",
     "VERACAGE_FONT_SIZE",
     "VERACAGE_WINDOW_SIZE",
+    "VERACAGE_DEBUG",
 ];
 
 /// Trusted continuation, pinned at build time (the Makefile passes

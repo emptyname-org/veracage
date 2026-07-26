@@ -218,6 +218,7 @@ impl Broker {
                 // volume is several seconds of key derivation with nothing else
                 // to see. Cleared in `reap` when this child finishes.
                 publish_status(&format!("Unlocking {name}"));
+                debug_log(&format!("open {name}: pid {} spawned", child.id()));
                 self.opens.push(OpenJob { child, volume, app });
             }
             Err(e) => eprintln!("veracage: could not run `veracage open`: {e}"),
@@ -317,6 +318,7 @@ impl Broker {
         let mut errors: Vec<String> = Vec::new();
         self.opens.retain_mut(|j| match j.child.try_wait() {
             Ok(Some(st)) => {
+                debug_log(&format!("open {} finished: {st}", base(&j.volume)));
                 match st.code() {
                     Some(0) | None => {}
                     Some(EXIT_CRYPT_FAILED) => {
@@ -401,6 +403,16 @@ pub fn publish_shortcuts(cfg: &crate::config::Config) {
 /// Write the host-clipboard auto-clear policy to `PUB_DIR/clipclear`
 /// (`<0|1 enabled>\n<timeout secs>`) so the compositor's clipboard worker picks
 /// it up on its next scan. Best-effort.
+/// One timing line to stderr (the broker's journal entry) when config `debug` is
+/// on. Read it with `journalctl --user -f`; see docs/debugging.md.
+pub fn debug_log(msg: &str) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| crate::config::load().debug) {
+        eprintln!("veracage-agent[debug] {msg}");
+    }
+}
+
 /// Publish a one-line progress note for the compositor's toolbar (a spinner plus
 /// this text), or clear it with an empty `text`. Used around the seconds-long
 /// unlock, so the window is not silently busy. Best-effort: no indicator is a
