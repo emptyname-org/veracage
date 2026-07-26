@@ -51,7 +51,17 @@ struct ConfigApp {
     /// Per-exec installed-state, memoized for the dialog's lifetime so the
     /// `$PATH` stat-walk in `is_installed` runs once per exec, not per repaint.
     installed: std::collections::HashMap<String, bool>,
+    /// Per-exec host icon (None = no icon in the theme), resolved a few rows per
+    /// frame: an icon that is NOT in the theme costs a bounded walk of every
+    /// icon directory, and this dialog lists every suggestion, so resolving them
+    /// all in one frame would stall the window on first paint.
+    icons: std::collections::HashMap<String, Option<egui::TextureHandle>>,
 }
+
+/// Icon edge in logical points, and how many rows may resolve their icon per
+/// frame (the rest fill in over the next frames).
+const ROW_ICON_PT: f32 = 20.0;
+const ICONS_PER_FRAME: usize = 2;
 
 impl ConfigApp {
     fn new(outcome: Arc<Mutex<Outcome>>) -> Self {
@@ -66,7 +76,32 @@ impl ConfigApp {
             cancelled: false,
             outcome,
             installed: std::collections::HashMap::new(),
+            icons: std::collections::HashMap::new(),
         }
+    }
+
+    /// The host icon for `exec`, resolved at most `ICONS_PER_FRAME` times per
+    /// frame and cached. Returns None while still unresolved or when the theme
+    /// has no icon for it; `budget` carries the remaining allowance.
+    fn icon(
+        &mut self,
+        ctx: &egui::Context,
+        exec: &str,
+        budget: &mut usize,
+    ) -> Option<egui::TextureHandle> {
+        if let Some(slot) = self.icons.get(exec) {
+            return slot.clone();
+        }
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        let tex = detect::icon_rgba_for_exec(exec).map(|(w, h, rgba)| {
+            let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+            ctx.load_texture(format!("veracage-cfg-{exec}"), img, egui::TextureOptions::LINEAR)
+        });
+        self.icons.insert(exec.to_string(), tex.clone());
+        tex
     }
 
     /// Installed-state for `exec`, computed once and cached (stable for the
@@ -186,6 +221,39 @@ fn key_for(exec: &str, taken: &HashSet<String>) -> String {
 
 /// One row's label: the app name, plus an optional gray "(note)" in the same
 /// widget so the whole line is one click target.
+/// One app row: tick box, the app's host icon, then its name and note. The whole
+/// row toggles, not just the box. Returns true if this row was just toggled;
+/// `on` holds the new state.
+fn app_row(
+    ui: &mut egui::Ui,
+    on: &mut bool,
+    icon: Option<&egui::TextureHandle>,
+    label: egui::text::LayoutJob,
+) -> bool {
+    let mut toggled = false;
+    let row = ui
+        .horizontal(|ui| {
+            toggled = ui.checkbox(on, "").changed();
+            match icon {
+                Some(tex) => {
+                    ui.add(egui::Image::from_texture(egui::load::SizedTexture::new(
+                        tex.id(),
+                        egui::vec2(ROW_ICON_PT, ROW_ICON_PT),
+                    )));
+                }
+                // Keep the names aligned while an icon is missing or pending.
+                None => ui.add_space(ROW_ICON_PT),
+            }
+            ui.label(label);
+        })
+        .response;
+    if !toggled && row.interact(egui::Sense::click()).clicked() {
+        *on = !*on;
+        toggled = true;
+    }
+    toggled
+}
+
 fn row_label(ui: &egui::Ui, name: &str, note: Option<&str>) -> egui::text::LayoutJob {
     let font = egui::TextStyle::Body.resolve(ui.style());
     let mut job = egui::text::LayoutJob::default();
@@ -242,22 +310,21 @@ impl eframe::App for ConfigApp {
                 }
 
                     // Enabled apps first (config order): checked; unticking removes.
+                    let mut icon_budget = ICONS_PER_FRAME;
                     let mut remove: Option<usize> = None;
-                    for (i, a) in self.apps.iter().enumerate() {
-                        let mut on = true;
+                    for i in 0..self.apps.len() {
+                        let a = self.apps[i].clone();
                         let installed = self.installed.get(&a.exec).copied().unwrap_or(true);
-                        let mut label = row_label(ui, &a.name, self.note_for(a).as_deref());
-                        if !installed {
-                            label = row_label(
-                                ui,
-                                &a.name,
-                                Some(&match self.note_for(a) {
-                                    Some(n) => format!("{n}, not installed"),
-                                    None => "not installed".to_string(),
-                                }),
-                            );
-                        }
-                        if ui.checkbox(&mut on, label).changed() && !on {
+                        let note = match (self.note_for(&a), installed) {
+                            (Some(n), true) => Some(n),
+                            (Some(n), false) => Some(format!("{n}, not installed")),
+                            (None, true) => None,
+                            (None, false) => Some("not installed".to_string()),
+                        };
+                        let label = row_label(ui, &a.name, note.as_deref());
+                        let icon = self.icon(ctx, &a.exec, &mut icon_budget);
+                        let mut on = true;
+                        if app_row(ui, &mut on, icon.as_ref(), label) && !on {
                             remove = Some(i);
                         }
                     }
@@ -269,16 +336,28 @@ impl eframe::App for ConfigApp {
                     // enables. Collect the click and apply after the loop (can't
                     // call &mut self.enable while iterating self.suggested).
                     let mut enable_now: Option<(String, String)> = None;
-                    for s in &self.suggested {
-                        if self.enabled_basename(&s.exec) {
+                    for i in 0..self.suggested.len() {
+                        // Copy the few fields the row needs, so the immutable
+                        // borrow ends before the &mut self calls below.
+                        let (exec, raw_name, category) = {
+                            let s = &self.suggested[i];
+                            (s.exec.clone(), s.name.clone(), s.category)
+                        };
+                        if self.enabled_basename(&exec) {
                             continue;
                         }
                         let mut on = false;
-                        let name = config::capitalize_first(&s.name);
-                        let label = row_label(ui, &name, Some(s.category));
-                        if ui.checkbox(&mut on, label).changed() && on {
-                            enable_now = Some((name, s.exec.clone()));
+                        let name = config::capitalize_first(&raw_name);
+                        let label = row_label(ui, &name, Some(category));
+                        let icon = self.icon(ctx, &exec, &mut icon_budget);
+                        if app_row(ui, &mut on, icon.as_ref(), label) && on {
+                            enable_now = Some((name, exec));
                         }
+                    }
+                    // Icons resolve a couple of rows per frame: keep painting
+                    // until they are all in.
+                    if self.icons.len() < self.apps.len() + self.suggested.len() {
+                        ctx.request_repaint();
                     }
                     if let Some((name, exec)) = enable_now {
                         self.enable(&name, &exec);

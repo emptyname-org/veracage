@@ -103,10 +103,14 @@ pub struct State {
     /// whatever sets `dirty` outside the render path must also call `wake`.
     pub request_redraw: Option<std::rc::Rc<dyn Fn()>>,
 
-    /// Toolbar launcher list, refreshed (throttled) from the leaders' `.apps`
-    /// files so app buttons appear/disappear as volumes open and close.
+    /// Toolbar launcher list, refreshed by the discovery scan from the leaders'
+    /// `.apps` files so app buttons appear/disappear as volumes open and close.
     pub leaders: Vec<crate::toolbar::LeaderApps>,
-    pub leaders_scan_at: std::time::Duration,
+
+    /// The toolbar's own output may have changed (input on the strip, an egui
+    /// animation, a discovery scan), so the overlay's damage region must be
+    /// re-reported. See EguiDamage in winit.rs.
+    pub toolbar_changed: bool,
 
     /// Last transient-notice nonce shown (a leader-reported failed launch, etc.),
     /// so each distinct notice shows once. Seeded from any file present at
@@ -142,6 +146,9 @@ pub struct State {
     /// sRGB handling fringes a transparent-edged icon), so it renders cleanly
     /// like the app windows and backdrop.
     pub hint_icon: Option<smithay::backend::renderer::element::memory::MemoryRenderBuffer>,
+
+    /// The blur profile every window's drop shadow is 9-sliced from (shadow.rs).
+    pub shadow: smithay::backend::renderer::element::memory::MemoryRenderBuffer,
 }
 
 /// A drag-and-drop icon: the client's icon surface plus the offset from the
@@ -256,10 +263,11 @@ impl State {
             toolbar_failed: false,
             dnd_icon: None,
             hint_icon: build_hint_icon(),
+            shadow: crate::shadow::build_buffer(),
             dirty: true,
             request_redraw: None,
             leaders: Vec::new(),
-            leaders_scan_at: std::time::Duration::ZERO,
+            toolbar_changed: true,
             // Baseline: adopt any notice already on disk without showing it, so a
             // stale one from before this compositor started stays hidden.
             notice_nonce: crate::toolbar::scan_notice().map(|(n, _)| n).unwrap_or(0),

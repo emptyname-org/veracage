@@ -214,6 +214,10 @@ impl Broker {
                 if let Some(mut stdin) = child.stdin.take() {
                     let _ = stdin.write_all(&pass); // drop -> EOF
                 }
+                // Tell the compositor to show a progress indicator: unlocking a
+                // volume is several seconds of key derivation with nothing else
+                // to see. Cleared in `reap` when this child finishes.
+                publish_status(&format!("Unlocking {name}"));
                 self.opens.push(OpenJob { child, volume, app });
             }
             Err(e) => eprintln!("veracage: could not run `veracage open`: {e}"),
@@ -328,6 +332,12 @@ impl Broker {
             }
             _ => true,
         });
+        // No open in flight: drop the progress indicator. A retry below
+        // republishes it, so this can't leave the spinner up on a wrong
+        // passphrase.
+        if self.opens.is_empty() {
+            publish_status("");
+        }
         for msg in errors {
             // Track the dialog child so it's reaped, not left a zombie.
             if let Some(child) = show_error(&msg) {
@@ -391,6 +401,29 @@ pub fn publish_shortcuts(cfg: &crate::config::Config) {
 /// Write the host-clipboard auto-clear policy to `PUB_DIR/clipclear`
 /// (`<0|1 enabled>\n<timeout secs>`) so the compositor's clipboard worker picks
 /// it up on its next scan. Best-effort.
+/// Publish a one-line progress note for the compositor's toolbar (a spinner plus
+/// this text), or clear it with an empty `text`. Used around the seconds-long
+/// unlock, so the window is not silently busy. Best-effort: no indicator is a
+/// cosmetic loss, never a reason to fail a mount.
+pub fn publish_status(text: &str) {
+    let dir = pub_dir();
+    if !dir.is_dir() {
+        return;
+    }
+    let path = dir.join("status");
+    if text.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let body: String = text.chars().filter(|c| !c.is_control()).take(80).collect();
+    let tmp = dir.join(format!("status.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, format!("{body}\n")).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 pub fn publish_clipclear(cfg: &crate::config::Config) {
     let dir = pub_dir();
     if !dir.is_dir() {

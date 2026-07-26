@@ -127,15 +127,32 @@ pub fn pad_buttons(ui: &mut egui::Ui) {
 /// The shared dialog action bar (bottom panel): Save / Cancel right-aligned,
 /// with a caller-drawn `trailing` widget to their left (an error status, an
 /// "N enabled" count, ...). Returns `(save_clicked, cancel_clicked)`.
+///
+/// Enter also saves and Escape also cancels, but only while no widget holds
+/// keyboard focus, so Enter still belongs to a focused text field (the
+/// Configure-apps "Add" box). Besides being the expected dialog behaviour, the
+/// keyboard route always lands: a click can be spent on something else first
+/// (activating the window, or dismissing an open dropdown), which is what makes
+/// Save look like it needs pressing twice.
 pub fn action_bar(ctx: &egui::Context, trailing: impl FnOnce(&mut egui::Ui)) -> (bool, bool) {
-    let (mut save, mut cancel) = (false, false);
+    let typing = ctx.memory(|m| m.focused().is_some());
+    let (mut save, mut cancel) = if typing {
+        (false, false)
+    } else {
+        ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+            )
+        })
+    };
     egui::TopBottomPanel::bottom("actions")
         .frame(content_frame(ctx))
         .show(ctx, |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 pad_buttons(ui);
-                cancel = ui.button("Cancel").clicked();
-                save = ui.button("Save").clicked();
+                cancel |= ui.button("Cancel").clicked();
+                save |= ui.button("Save").clicked();
                 trailing(ui);
             });
         });

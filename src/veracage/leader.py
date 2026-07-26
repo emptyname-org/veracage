@@ -222,6 +222,10 @@ def _launch_app(state: _LeaderState, spec) -> dict:
     # leaves no trace. Done in the reaper (not here) so the serve loop never
     # blocks: the launch returns at once.
     state.children[proc.pid] = (label, time.monotonic())
+    # An app takes a second or two to put its first window up, with nothing on
+    # screen meanwhile: ask the compositor to show a progress note until the
+    # window appears (it clears the note itself, see scan_status).
+    _post_status(f"Starting {label}")
     return {"ok": True, "pid": proc.pid}
 
 
@@ -256,6 +260,21 @@ def _consume_launch_request(state: _LeaderState) -> None:
     r = _launch_app(state, {"name": name or exe, "exec": exe})
     if not r["ok"]:
         print(f"veracage: launch request: {r['error']}", file=sys.stderr)
+
+
+def _post_status(message: str) -> None:
+    """Publish a short progress note (`<nonce>\\t<text>`) to
+    `/run/veracage/rt/status` for the compositor's toolbar. The compositor stops
+    showing it once the app's window is mapped, or after its own timeout, so
+    there is nothing to clear here. Best-effort."""
+    text = "".join(c for c in message if c.isprintable())[:80]
+    tmp = COMPOSITOR_RUNTIME / f"status.{os.getpid()}.tmp"
+    try:
+        tmp.write_text(f"{time.time_ns()}\t{text}\n")
+        tmp.replace(COMPOSITOR_RUNTIME / "status")
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
 
 
 def _post_notice(message: str) -> None:
@@ -615,7 +634,12 @@ def run_leader(mountpoint: str, app_specs: list, first_app: dict | None) -> int:
                     print("veracage: compositor gone (window closed) - "
                           "unmounting and exiting.", file=sys.stderr)
                     break
-                for key, _ in sel.select(timeout=1.0):
+                # A quarter second, not a second: this timeout also bounds how
+                # long a just-mounted volume waits for its app to be launched
+                # (the helper hands it over through launch.req, polled above).
+                # The loop body is a scandir on a tmpfs plus a non-blocking
+                # reap, so polling four times a second costs nothing measurable.
+                for key, _ in sel.select(timeout=0.25):
                     # A transient accept() error (ECONNABORTED/EAGAIN from a peer
                     # that aborts a queued connection) or an unexpected launch
                     # failure must NOT unwind into the finally and SIGKILL every

@@ -29,7 +29,17 @@ smithay::backend::renderer::element::render_elements! {
     HintElement<R> where R: ImportMem + ImportAll;
     Surface = WaylandSurfaceRenderElement<R>,
     Memory = MemoryRenderBufferRenderElement<R>,
+    Shadow = smithay::backend::renderer::element::NamespacedElement<MemoryRenderBufferRenderElement<R>>,
     Egui = EguiDamage,
+}
+
+// The full element list for a frame. smithay has this internally, but keeps it
+// private, and its `space::render_output` always puts the custom elements ON TOP.
+// We need both: the overlay above the windows and the window shadows below them.
+smithay::backend::renderer::element::render_elements! {
+    OutputElement<='a, GlesRenderer>;
+    Space = smithay::desktop::space::SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+    Custom = &'a HintElement<GlesRenderer>,
 }
 
 /// A draw-nothing element that reports the egui overlay's region as damaged.
@@ -121,6 +131,99 @@ fn apply_window_size(window: &dyn smithay::reexports::winit::window::Window, siz
     }
 }
 
+/// How often the discovery scan runs: it is what makes a mounted volume show up
+/// in the title and the Apps menu, and what picks up a progress note, so it also
+/// bounds how stale those look. Cheap (a few stats on tmpfs) and it only wakes
+/// the renderer when something actually changed.
+const SCAN_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Poll the published state: the leaders' `.apps` files, the human-side config
+/// apps, font, window size, shortcuts, clipboard policy, notices and progress
+/// notes. Returns true when anything the toolbar draws changed, so the caller
+/// can request a frame instead of rendering on a timer.
+fn run_discovery_scan(
+    state: &mut State,
+    window: &dyn smithay::reexports::winit::window::Window,
+) -> bool {
+    let fresh = crate::toolbar::scan_leaders();
+    let leaders_changed = fresh.len() != state.leaders.len()
+        || fresh.iter().zip(&state.leaders).any(|(a, b)| {
+            a.names != b.names || a.label != b.label || a.volumes != b.volumes
+        });
+    if leaders_changed {
+        tracing::debug!(
+            "toolbar: launchers = {:?}",
+            fresh.iter().map(|l| l.names.clone()).collect::<Vec<_>>()
+        );
+        // Title = the mounted volumes; the app_id keeps the icon.
+        window.set_title(&crate::toolbar::volumes_title(&fresh));
+    }
+    state.leaders = fresh;
+    let mut changed = leaders_changed;
+
+    let cfg_apps = crate::toolbar::scan_config_apps();
+    if cfg_apps != state.cfg_apps {
+        state.cfg_apps = cfg_apps;
+        changed = true;
+    }
+    let font = crate::toolbar::scan_font();
+    if let Some(tb) = state.toolbar.as_mut() {
+        tb.refresh_icons(&state.cfg_apps);
+        if let Some((path, base)) = font {
+            changed |= tb.refresh_font(&path, base);
+        }
+    }
+    // Live window resize: pick up a Settings change to the default window size
+    // (published to /run/veracage/pub/window.size).
+    if let Some(sz) = crate::toolbar::scan_window_size() {
+        if sz != state.window_size_applied {
+            apply_window_size(window, &sz);
+            state.window_size_applied = sz;
+        }
+    }
+    // Live keyboard shortcuts (Copy out / Paste in).
+    if let Some(binds) = crate::shortcuts::scan() {
+        if binds != state.binds {
+            let label = |b: &Option<crate::shortcuts::Keybind>| {
+                b.as_ref().map(|k| k.label()).unwrap_or_else(|| "unset".into())
+            };
+            if let Some(tb) = state.toolbar.as_mut() {
+                tb.refresh_shortcuts(label(&binds.copy_out), label(&binds.paste_in));
+            }
+            state.binds = binds;
+            changed = true;
+        }
+    }
+    // Live host-clipboard auto-clear policy; push to the worker only on a
+    // change so we don't poke it every scan.
+    if let Some(policy) = crate::toolbar::scan_clipclear() {
+        if policy != state.clip_clear_applied {
+            if let Some(hc) = &state.host_clipboard {
+                hc.set_policy(policy.0, policy.1);
+            }
+            state.clip_clear_applied = policy;
+        }
+    }
+    // A transient notice a leader published (a failed launch, etc.): shown once.
+    if let Some((nonce, msg)) = crate::toolbar::scan_notice() {
+        if nonce != state.notice_nonce {
+            state.notice_nonce = nonce;
+            if let Some(tb) = state.toolbar.as_mut() {
+                tb.set_notice(msg);
+            }
+            changed = true;
+        }
+    }
+    // Progress note (unlocking a volume, starting an app): a spinner in the
+    // strip. The launch note clears itself once the app's window is up.
+    let has_windows = state.space.elements().next().is_some();
+    let status = crate::toolbar::scan_status(has_windows);
+    if let Some(tb) = state.toolbar.as_mut() {
+        changed |= tb.set_status(status);
+    }
+    changed
+}
+
 pub fn init_winit(
     event_loop: &mut EventLoop<State>,
     state: &mut State,
@@ -205,7 +308,6 @@ pub fn init_winit(
     // plus a counter bumped only when the toolbar's output can have changed.
     let egui_id = smithay::backend::renderer::element::Id::new();
     let mut egui_commit = smithay::backend::renderer::utils::CommitCounter::default();
-    let mut toolbar_changed = true;
     // True while the pointer is on the toolbar strip or in an open menu, so a
     // pointer move that leaves it still gets one frame to drop the highlight.
     let mut strip_hot = false;
@@ -232,6 +334,7 @@ pub fn init_winit(
     // try_borrow: a failure means we are inside the render path, which is
     // already producing the frame.
     let backend_wake = backend.clone();
+    let backend_scan = backend.clone();
     state.request_redraw = Some(std::rc::Rc::new(move || {
         if let Ok(b) = backend_wake.try_borrow() {
             b.window().request_redraw();
@@ -252,7 +355,7 @@ pub fn init_winit(
                 );
                 full_redraw = 4;
                 state.dirty = true;
-                toolbar_changed = true; // the strip is re-laid out at the new width
+                state.toolbar_changed = true; // the strip is re-laid out at the new width
                 state.wake();
             }
             WinitEvent::Input(event) => {
@@ -271,7 +374,7 @@ pub fn init_winit(
                         .is_some_and(|tb| tb.over_strip() || tb.wants_pointer());
                 if hot || strip_hot {
                     state.dirty = true;
-                    toolbar_changed = true;
+                    state.toolbar_changed = true;
                     state.wake();
                 }
                 strip_hot = hot;
@@ -286,77 +389,6 @@ pub fn init_winit(
                 let has_windows = state.space.elements().next().is_some();
                 let scale_f = output.current_scale().fractional_scale();
 
-                // Refresh the launcher list from the leaders' .apps files and the
-                // human-published config-app list (~1s).
-                let now = state.start_time.elapsed();
-                if now.saturating_sub(state.leaders_scan_at)
-                    >= std::time::Duration::from_secs(1)
-                {
-                    let fresh = crate::toolbar::scan_leaders();
-                    let changed = fresh.len() != state.leaders.len()
-                        || fresh.iter().zip(&state.leaders).any(|(a, b)| {
-                            a.names != b.names || a.label != b.label || a.volumes != b.volumes
-                        });
-                    if changed {
-                        tracing::debug!(
-                            "toolbar: launchers = {:?}",
-                            fresh.iter().map(|l| l.names.clone()).collect::<Vec<_>>()
-                        );
-                        // Title = the mounted volumes; the app_id keeps the icon.
-                        backend.window().set_title(&crate::toolbar::volumes_title(&fresh));
-                    }
-                    state.leaders = fresh;
-                    state.cfg_apps = crate::toolbar::scan_config_apps();
-                    let font = crate::toolbar::scan_font();
-                    if let Some(tb) = state.toolbar.as_mut() {
-                        tb.refresh_icons(&state.cfg_apps);
-                        if let Some((path, base)) = font {
-                            tb.refresh_font(&path, base);
-                        }
-                    }
-                    // Live window resize: pick up a Settings change to the default
-                    // window size (published to /run/veracage/pub/window.size).
-                    if let Some(sz) = crate::toolbar::scan_window_size() {
-                        if sz != state.window_size_applied {
-                            apply_window_size(backend.window(), &sz);
-                            state.window_size_applied = sz;
-                        }
-                    }
-                    // Live keyboard shortcuts (Copy out / Paste in).
-                    if let Some(binds) = crate::shortcuts::scan() {
-                        let label = |b: &Option<crate::shortcuts::Keybind>| {
-                            b.as_ref().map(|k| k.label()).unwrap_or_else(|| "unset".into())
-                        };
-                        if let Some(tb) = state.toolbar.as_mut() {
-                            tb.refresh_shortcuts(label(&binds.copy_out), label(&binds.paste_in));
-                        }
-                        state.binds = binds;
-                    }
-                    // Live host-clipboard auto-clear policy; push to the worker
-                    // only on a change so we don't poke it every scan.
-                    if let Some(policy) = crate::toolbar::scan_clipclear() {
-                        if policy != state.clip_clear_applied {
-                            if let Some(hc) = &state.host_clipboard {
-                                hc.set_policy(policy.0, policy.1);
-                            }
-                            state.clip_clear_applied = policy;
-                        }
-                    }
-                    // Show a transient notice a leader published (a failed launch,
-                    // etc.) once, as a toolbar banner.
-                    if let Some((nonce, msg)) = crate::toolbar::scan_notice() {
-                        if nonce != state.notice_nonce {
-                            state.notice_nonce = nonce;
-                            if let Some(tb) = state.toolbar.as_mut() {
-                                tb.set_notice(msg);
-                            }
-                        }
-                    }
-                    state.leaders_scan_at = now;
-                    // The scan can change what the strip shows (app list, font,
-                    // shortcut labels, notice), so treat it as a change.
-                    toolbar_changed = true;
-                }
                 // Run the toolbar UI (CPU only) BEFORE compositing: the region
                 // egui will paint goes to the damage tracker (as EguiDamage),
                 // since egui is painted into the framebuffer after render_output.
@@ -396,9 +428,9 @@ pub fn init_winit(
                     crate::toolbar::ToolbarAction::Quit => state.loop_signal.stop(),
                     crate::toolbar::ToolbarAction::None => {}
                 }
-                if toolbar_changed {
+                if state.toolbar_changed {
                     egui_commit.increment();
-                    toolbar_changed = false;
+                    state.toolbar_changed = false;
                 }
 
                 // Re-render only what changed since this buffer was last drawn
@@ -482,23 +514,55 @@ pub fn init_winit(
                                 rect,
                             )));
                         }
-                        smithay::desktop::space::render_output::<
-                            _,
-                            HintElement<GlesRenderer>,
-                            _,
-                            _,
-                        >(
-                            &output,
+                        // A soft drop shadow per window, so the app windows read
+                        // as floating on the backdrop instead of pasted onto it.
+                        let geometries: Vec<_> = state
+                            .space
+                            .elements()
+                            .filter_map(|w| state.space.element_geometry(w))
+                            .collect();
+                        let shadows: Vec<HintElement<GlesRenderer>> = geometries
+                            .into_iter()
+                            .enumerate()
+                            .flat_map(|(i, geo)| {
+                                crate::shadow::ring_elements(
+                                    renderer, &state.shadow, geo, scale_f, i,
+                                )
+                            })
+                            .map(HintElement::Shadow)
+                            .collect();
+
+                        // Assemble the element list ourselves (this is what
+                        // space::render_output does) so the shadows can go
+                        // BELOW the windows: earlier in the list is higher up.
+                        // Order: overlay damage + DnD ghost + hint, then the app
+                        // windows, then their shadows.
+                        type El<'a> = OutputElement<'a>;
+                        match smithay::desktop::space::space_render_elements(
                             renderer,
-                            &mut framebuffer,
-                            1.0,
-                            age,
                             [&state.space],
-                            &custom,
-                            &mut damage_tracker,
-                            clear_color,
-                        )
-                        .map_err(|e| e.to_string())
+                            &output,
+                            1.0,
+                        ) {
+                            Ok(space_elements) => {
+                                let mut elements: Vec<El> = Vec::with_capacity(
+                                    custom.len() + space_elements.len() + shadows.len(),
+                                );
+                                elements.extend(custom.iter().map(El::Custom));
+                                elements.extend(space_elements.into_iter().map(El::Space));
+                                elements.extend(shadows.iter().map(El::Custom));
+                                damage_tracker
+                                    .render_output(
+                                        renderer,
+                                        &mut framebuffer,
+                                        age,
+                                        &elements,
+                                        clear_color,
+                                    )
+                                    .map_err(|e| e.to_string())
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
                     }
                     Err(e) => Err(e.to_string()),
                 };
@@ -510,7 +574,7 @@ pub fn init_winit(
                         // dropped, by Toolbar::run).
                         tracing::warn!("render skipped this frame: {e}");
                         state.dirty = true;
-                        toolbar_changed = true;
+                        state.toolbar_changed = true;
                         drop(backend);
                         state.wake();
                         return;
@@ -545,7 +609,7 @@ pub fn init_winit(
                 // notice banner countdown): it asks for another frame.
                 if state.toolbar.as_ref().is_some_and(|tb| tb.wants_repaint()) {
                     state.dirty = true;
-                    toolbar_changed = true;
+                    state.toolbar_changed = true;
                 }
 
                 // Swap with the real damage: the host compositor recomposites
@@ -599,32 +663,35 @@ pub fn init_winit(
         .handle()
         .insert_source(Timer::immediate(), move |_, _, state| {
             // Wake the renderer only when something changed (a client commit,
-            // input, an egui animation) or the ~1s scan is due (notices, live
-            // settings). Otherwise stay idle: the compositor software-renders, so
-            // re-drawing an unchanged frame is the ~130% CPU we are avoiding.
-            let scan_due = state
-                .start_time
-                .elapsed()
-                .saturating_sub(state.leaders_scan_at)
-                >= Duration::from_secs(1);
-            if state.dirty || scan_due {
+            // input, an egui animation, the scan below). Re-drawing an unchanged
+            // frame is the ~130% CPU we are avoiding.
+            if state.dirty {
                 backend.borrow().window().request_redraw();
                 return TimeoutAction::ToDuration(Duration::from_millis(16));
             }
-            // Idle: nothing to draw, so sleep until the scan is due instead of
-            // waking 60 times a second (it keeps a laptop out of deep idle).
-            // A client commit, input, or a window closing wakes the loop on its
-            // own source and asks for the frame directly (State::wake), so this
-            // long sleep costs no latency.
-            let since = state
-                .start_time
-                .elapsed()
-                .saturating_sub(state.leaders_scan_at);
-            TimeoutAction::ToDuration(
-                Duration::from_secs(1)
-                    .saturating_sub(since)
-                    .max(Duration::from_millis(16)),
-            )
+            // Idle: nothing to draw. Sleep a whole frame budget instead of
+            // spinning; a client commit, input, a closing window or the scan
+            // timer each wake the loop on their own source and ask for the
+            // frame directly (State::wake), so nothing waits on this tick.
+            TimeoutAction::ToDuration(Duration::from_millis(100))
+        })?;
+
+    // Discovery scan on its own timer: it is pure file polling, so it must not
+    // be tied to rendering (that forced a frame every second whether or not
+    // anything changed). Now a frame happens only when the scan finds something.
+    event_loop
+        .handle()
+        .insert_source(Timer::immediate(), move |_, _, state| {
+            // try_borrow: skip this tick if the renderer holds the backend (the
+            // scan only needs the window handle, and the next tick is 250ms away).
+            if let Ok(b) = backend_scan.try_borrow() {
+                if run_discovery_scan(state, b.window()) {
+                    state.dirty = true;
+                    state.toolbar_changed = true;
+                    b.window().request_redraw();
+                }
+            }
+            TimeoutAction::ToDuration(SCAN_INTERVAL)
         })?;
 
     Ok(())

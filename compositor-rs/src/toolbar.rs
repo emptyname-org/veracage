@@ -91,6 +91,9 @@ pub struct Toolbar {
     /// The frame `run()` produced, painted by `paint()` after the windows are
     /// composited: tessellated primitives, texture updates, pixels per point.
     pending: Option<(Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32)>,
+    /// A progress note shown right-aligned in the strip with a spinner, while
+    /// something slow is happening (unlocking a volume, starting an app).
+    status: Option<String>,
     /// A transient user-facing banner (e.g. a failed launch a leader reported),
     /// with the instant it was set. Cleared after NOTICE_TTL.
     notice: Option<(String, std::time::Instant)>,
@@ -98,6 +101,10 @@ pub struct Toolbar {
 
 /// How long a transient toolbar notice (e.g. a failed-launch banner) stays up.
 const NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// How long a leader's "Starting <app>" note may stay up when no window ever
+/// appears (a crashed or window-less app), so the spinner can't spin forever.
+const LAUNCH_STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// The shared app icon PNG (192px = 2x the 96pt display box, for HiDPI), the
 /// same file the About window uses. Regenerate with `convert
@@ -209,6 +216,7 @@ impl Toolbar {
             paste_in_label: crate::shortcuts::DEFAULT_PASTE_IN.to_string(),
             menu_icons,
             pending: None,
+            status: None,
             notice: None,
         })
     }
@@ -272,13 +280,26 @@ impl Toolbar {
 
     /// Apply a live font/size change (from `pub/font`). Re-installs the font only
     /// when the file path actually changes (set_fonts rebuilds the atlas). Called
-    /// from the ~1s scan, never per frame.
-    pub fn refresh_font(&mut self, path: &str, base: f32) {
+    /// from the discovery scan, never per frame. True if anything changed.
+    pub fn refresh_font(&mut self, path: &str, base: f32) -> bool {
+        let changed = path != self.font_file || base != self.base_size;
         if path != self.font_file {
             crate::fonts::install_from_file(&self.ctx, path);
             self.font_file = path.to_string();
         }
         self.base_size = base;
+        changed
+    }
+
+    /// Set (or clear, with None) the progress note shown in the strip beside a
+    /// spinner: "Unlocking <volume>" while the helper derives the key, "Starting
+    /// <app>" until its window appears. True if the note changed.
+    pub fn set_status(&mut self, status: Option<String>) -> bool {
+        if self.status == status {
+            return false;
+        }
+        self.status = status;
+        true
     }
 
     /// Refresh the menu-icon cache for the configured apps. Called from the ~1s
@@ -362,6 +383,7 @@ impl Toolbar {
         let name_to_key = &self.name_to_key;
         let menu_icons = &self.menu_icons;
         let notice = &self.notice;
+        let status = self.status.as_deref();
         let dark = self.dark;
         let copy_out_label = self.copy_out_label.as_str();
         let paste_in_label = self.paste_in_label.as_str();
@@ -400,9 +422,6 @@ impl Toolbar {
                             if !vols.is_empty() {
                                 ui.separator();
                                 ui.menu_button("Unmount", |ui| {
-                                    // One volume per line: don't wrap a long label.
-                                    ui.style_mut().wrap_mode =
-                                        Some(egui::TextWrapMode::Extend);
                                     for v in &vols {
                                         if ui.add(menu_item(mi("unmount"), v)).clicked() {
                                             action = ToolbarAction::CloseVolume(v.clone());
@@ -488,6 +507,22 @@ impl Toolbar {
                                 ui.close_menu();
                             }
                         });
+                        // Progress note at the far end of the strip: unlocking a
+                        // volume is seconds of key derivation, and an app takes a
+                        // moment to show its window. The spinner animates, which
+                        // keeps asking for frames until the note clears.
+                        if let Some(text) = status {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.add(egui::Spinner::new().size(14.0));
+                                    ui.label(
+                                        egui::RichText::new(text)
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                },
+                            );
+                        }
                     });
                 });
 
@@ -665,15 +700,19 @@ fn hint_colors(dark: bool) -> (egui::Color32, egui::Color32) {
 /// items fall back to text only.
 fn menu_item(icon: Option<&egui::TextureHandle>, text: &str) -> egui::Button<'static> {
     const ICON_PT: f32 = 16.0;
+    // Never wrap: a menu entry is one line, and the menu widens to fit it. An
+    // item carrying its shortcut ("Copy out    Ctrl+Alt+C") is wide enough to
+    // wrap onto two lines otherwise.
+    let label = egui::RichText::new(text.to_owned());
     match icon {
         Some(tex) => {
             let img = egui::Image::from_texture(egui::load::SizedTexture::new(
                 tex.id(),
                 egui::vec2(ICON_PT, ICON_PT),
             ));
-            egui::Button::image_and_text(img, text.to_owned())
+            egui::Button::image_and_text(img, label).wrap_mode(egui::TextWrapMode::Extend)
         }
-        None => egui::Button::new(text.to_owned()),
+        None => egui::Button::new(label).wrap_mode(egui::TextWrapMode::Extend),
     }
 }
 
@@ -683,15 +722,16 @@ fn menu_item(icon: Option<&egui::TextureHandle>, text: &str) -> egui::Button<'st
 /// texture id is Copy, so the button borrows nothing.
 fn app_button(icon: Option<&egui::TextureHandle>, name: &str) -> egui::Button<'static> {
     const ICON_PT: f32 = 20.0;
+    let label = egui::RichText::new(name.to_owned());
     match icon {
         Some(tex) => {
             let img = egui::Image::from_texture(egui::load::SizedTexture::new(
                 tex.id(),
                 egui::vec2(ICON_PT, ICON_PT),
             ));
-            egui::Button::image_and_text(img, name.to_owned())
+            egui::Button::image_and_text(img, label).wrap_mode(egui::TextWrapMode::Extend)
         }
-        None => egui::Button::new(name.to_owned()),
+        None => egui::Button::new(label).wrap_mode(egui::TextWrapMode::Extend),
     }
 }
 
@@ -716,6 +756,62 @@ const NOTICE_FILE: &str = "notice";
 /// Read the transient notice a leader published (e.g. a failed launch), as
 /// `(nonce, text)`. The nonce (a wall-clock ns stamp) lets the caller show each
 /// distinct notice once. Bounded read, control chars stripped, malformed ignored.
+/// The progress note to show, from either publisher: `pub/status` (the human-side
+/// broker, while a volume is being unlocked) or `rt/status` (a leader, while a
+/// just-launched app has no window yet). The broker deletes its file when the
+/// open finishes; the leader's note cannot know when the app's window appears, so
+/// it is dropped here once a window is mapped or after LAUNCH_STATUS_TTL.
+pub fn scan_status(has_windows: bool) -> Option<String> {
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    pick_status(
+        read_status_line(&std::path::Path::new(PUB_DIR).join("status")),
+        read_status_line(&std::path::Path::new(RUNTIME_DIR).join("status")),
+        has_windows,
+        now_ns,
+    )
+}
+
+/// Which note to show, given both channels' contents. Pure, so it is unit-tested.
+/// The broker's note (`from_broker`) wins and is trusted to be current: it is
+/// deleted when the open finishes. The leader's launch note is suppressed once a
+/// window is mapped and expires with LAUNCH_STATUS_TTL.
+fn pick_status(
+    from_broker: Option<(u64, String)>,
+    from_leader: Option<(u64, String)>,
+    has_windows: bool,
+    now_ns: u128,
+) -> Option<String> {
+    if let Some((_, text)) = from_broker {
+        return Some(text);
+    }
+    if has_windows {
+        return None; // the app is up: its window IS the confirmation
+    }
+    let (stamp_ns, text) = from_leader?;
+    let age = now_ns.saturating_sub(stamp_ns as u128);
+    (age < LAUNCH_STATUS_TTL.as_nanos()).then_some(text)
+}
+
+/// A status file's one line: `<text>` (broker) or `<stamp_ns>\t<text>` (leader).
+/// The stamp is 0 when absent.
+fn read_status_line(path: &std::path::Path) -> Option<(u64, String)> {
+    let md = std::fs::metadata(path).ok()?;
+    if !md.is_file() || md.len() > 4096 {
+        return None;
+    }
+    let body = std::fs::read_to_string(path).ok()?;
+    let line = body.lines().next()?;
+    let (stamp, raw) = match line.split_once('\t') {
+        Some((s, rest)) => (s.parse().unwrap_or(0), rest),
+        None => (0, line),
+    };
+    let text: String = raw.chars().filter(|c| !c.is_control()).take(80).collect();
+    (!text.is_empty()).then_some((stamp, text))
+}
+
 pub fn scan_notice() -> Option<(u64, String)> {
     let path = std::path::Path::new(RUNTIME_DIR).join(NOTICE_FILE);
     let md = std::fs::metadata(&path).ok()?;
@@ -962,6 +1058,65 @@ pub fn launch_app(sock: &std::path::Path, index: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HOUR_NS: u128 = 3_600_000_000_000;
+
+    #[test]
+    fn broker_status_wins_and_is_never_expired() {
+        // The broker deletes its file when the open ends, so whatever is there is
+        // current - even with windows mapped (adding a 2nd volume) or an old stamp.
+        let broker = Some((0, "Unlocking work.vc".to_string()));
+        let leader = Some((HOUR_NS as u64, "Starting Dolphin".to_string()));
+        for has_windows in [false, true] {
+            assert_eq!(
+                pick_status(broker.clone(), leader.clone(), has_windows, HOUR_NS),
+                Some("Unlocking work.vc".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn launch_status_clears_on_a_mapped_window() {
+        // The app's own window is the confirmation: stop showing "Starting ...".
+        let leader = Some((HOUR_NS as u64, "Starting Dolphin".to_string()));
+        assert_eq!(pick_status(None, leader.clone(), false, HOUR_NS),
+                   Some("Starting Dolphin".to_string()));
+        assert_eq!(pick_status(None, leader, true, HOUR_NS), None);
+    }
+
+    #[test]
+    fn launch_status_expires_so_the_spinner_cannot_spin_forever() {
+        // An app that never maps a window (crashed, or window-less) must not
+        // leave the strip spinning; a stale file from an earlier session neither.
+        let stamp = HOUR_NS as u64;
+        let leader = Some((stamp, "Starting Dolphin".to_string()));
+        let just_inside = HOUR_NS + LAUNCH_STATUS_TTL.as_nanos() - 1;
+        let just_outside = HOUR_NS + LAUNCH_STATUS_TTL.as_nanos();
+        assert!(pick_status(None, leader.clone(), false, just_inside).is_some());
+        assert_eq!(pick_status(None, leader, false, just_outside), None);
+    }
+
+    #[test]
+    fn status_line_parses_both_writers_and_rejects_junk() {
+        let dir = std::env::temp_dir().join(format!("veracage-status-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("status");
+        // Leader form: "<stamp_ns>\t<text>".
+        std::fs::write(&p, "12345\tStarting Kate\n").unwrap();
+        assert_eq!(read_status_line(&p), Some((12345, "Starting Kate".to_string())));
+        // Broker form: bare text, no stamp.
+        std::fs::write(&p, "Unlocking work.vc\n").unwrap();
+        assert_eq!(read_status_line(&p), Some((0, "Unlocking work.vc".to_string())));
+        // Control characters are stripped; an empty result is no status.
+        std::fs::write(&p, "1\t\u{1b}[31mred\u{7}\n").unwrap();
+        assert_eq!(read_status_line(&p), Some((1, "[31mred".to_string())));
+        std::fs::write(&p, "\n").unwrap();
+        assert_eq!(read_status_line(&p), None);
+        std::fs::write(&p, "").unwrap();
+        assert_eq!(read_status_line(&p), None);
+        assert_eq!(read_status_line(&dir.join("absent")), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn hint_icon_pos_is_centered() {

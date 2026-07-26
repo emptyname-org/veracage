@@ -82,7 +82,7 @@ pub fn parse(s: &str) -> Option<Keybind> {
 }
 
 /// The compositor's active binds. Defaults until `pub/shortcuts` is read.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Binds {
     pub copy_out: Option<Keybind>,
     pub paste_in: Option<Keybind>,
