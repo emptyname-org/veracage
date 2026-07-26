@@ -322,6 +322,9 @@ pub fn init_winit(
     // Frames left to render with age 0 (full redraw) after a resize, while the
     // swapchain reallocates and reported buffer ages are unreliable (as anvil).
     let mut full_redraw: u8 = 0;
+    // Last cursor decision written to the debug log, so it is logged on change
+    // rather than every frame.
+    let mut cursor_logged: Option<String> = None;
     // Damage bookkeeping for the egui overlay (see EguiDamage): a stable id
     // plus a counter bumped only when the toolbar's output can have changed.
     let egui_id = smithay::backend::renderer::element::Id::new();
@@ -473,26 +476,17 @@ pub fn init_winit(
                         state.cursor_status = CursorImageStatus::default_named();
                     }
                 }
-                // Hide the host cursor ONLY when the client's own cursor surface
-                // really has something to draw. Hiding it whenever a client asked
-                // for a surface left NO cursor at all whenever that surface had no
-                // usable buffer - a sandboxed app whose cursor theme did not load,
-                // for instance - which is how the resize cursors vanished.
-                let client_cursor_ready = match &state.cursor_status {
-                    CursorImageStatus::Surface(surface) => {
-                        surface.alive()
-                            && smithay::backend::renderer::utils::with_renderer_surface_state(
-                                surface,
-                                |st| st.buffer().is_some(),
-                            )
-                            .unwrap_or(false)
-                    }
-                    _ => false,
-                };
+                // Anvil's rule, unchanged: the host cursor is hidden exactly
+                // while a client provides its own cursor surface, which we then
+                // composite below. Requiring that surface to be mapped before
+                // hiding the host cursor (an earlier attempt at "always show
+                // something") means a client's resize cursors never appear, since
+                // by then the host is drawing its own plain arrow instead.
+                let cursor_visible = !matches!(state.cursor_status, CursorImageStatus::Surface(_));
                 if let CursorImageStatus::Named(icon) = state.cursor_status {
                     backend.window().set_cursor(icon.into());
                 }
-                backend.window().set_cursor_visible(!client_cursor_ready);
+                backend.window().set_cursor_visible(cursor_visible);
 
                 // A transient EGL/GL error (context loss, host-resize race, GL OOM)
                 // must skip the frame, not abort the compositor and every app.
@@ -535,9 +529,8 @@ pub fn init_winit(
                         // minus its hotspot (anvil's cursor path). Only when it has
                         // a buffer, which is also when the host cursor was hidden
                         // above - so there is always exactly one cursor on screen.
-                        if let (true, CursorImageStatus::Surface(surface)) =
-                            (client_cursor_ready, state.cursor_status.clone())
-                        {
+                        let mut cursor_drawn = 0usize;
+                        if let CursorImageStatus::Surface(surface) = state.cursor_status.clone() {
                             let hotspot = smithay::wayland::compositor::with_states(
                                 &surface,
                                 |states| {
@@ -565,7 +558,18 @@ pub fn init_winit(
                                     1.0,
                                     smithay::backend::renderer::element::Kind::Cursor,
                                 );
+                            cursor_drawn = cursor_elements.len();
                             custom.extend(cursor_elements.into_iter().map(HintElement::Surface));
+                        }
+                        if crate::debug_enabled() {
+                            let now = format!(
+                                "{} ({cursor_drawn} element(s) composited)",
+                                crate::describe_cursor(&state.cursor_status)
+                            );
+                            if cursor_logged.as_deref() != Some(now.as_str()) {
+                                crate::vcdebug(&format!("cursor: {now}"));
+                                cursor_logged = Some(now);
+                            }
                         }
                         // The Veracage icon belongs to the BACKDROP, so it is drawn
                         // below the app windows and stays there when they open,
@@ -787,9 +791,8 @@ pub fn init_winit(
                     )
                 });
 
-                state.space.refresh();
-                state.popups.cleanup();
-                let _ = state.display_handle.flush_clients();
+                // The frame callbacks just queued (and everything else) go out in
+                // the event loop's own callback, which runs right after this.
                 // Another frame is already due (an egui animation, a lazily built
                 // toolbar): ask for it directly, since the pacing timer may be
                 // sleeping until the next scan. The backend borrow must go first,

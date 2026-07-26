@@ -40,6 +40,9 @@ impl SeatHandler for State {
     /// window's resize edges gave no feedback at all. `winit.rs` either hands a
     /// named shape to the host window or composites the client's cursor surface.
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: smithay::input::pointer::CursorImageStatus) {
+        if crate::debug_enabled() {
+            crate::vcdebug(&format!("cursor request: {}", crate::describe_cursor(&image)));
+        }
         self.cursor_status = image;
         self.dirty = true;
         self.wake();
@@ -170,5 +173,10 @@ impl FractionalScaleHandler for State {
         });
     }
 }
+
+/// Required by smithay's wp_cursor_shape_v1 implementation, whose device object
+/// can also be created for a tablet tool. We advertise no tablet, so every
+/// default applies.
+impl smithay::wayland::tablet_manager::TabletSeatHandler for State {}
 
 smithay::delegate_dispatch2!(State);

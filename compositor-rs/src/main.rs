@@ -58,7 +58,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // when the leader tears the session down, not only on menu Quit / window close.
     crate::state::install_exit_signals(&event_loop);
 
-    let run_result = event_loop.run(None, &mut state, move |_| {});
+    // Flush queued events to the clients after EVERY batch of loop events, as
+    // smallvil and anvil do. Flushing only at the end of a successful render (as
+    // this used to) left an app that connected while nothing was dirty waiting for
+    // its globals until something else happened to trigger a frame - a mouse move,
+    // say - which is a launch that hangs for no visible reason.
+    let run_result = event_loop.run(None, &mut state, move |state| {
+        state.space.refresh();
+        state.popups.cleanup();
+        let _ = state.display_handle.flush_clients();
+    });
 
     // Clear any sensitive text still on the host clipboard (KeePassXC-style
     // clear-on-quit; no-op if nothing was pushed), then STOP its worker BEFORE the
@@ -97,6 +106,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `hostclip::EXIT_CLEAR_WAIT_MS`; this only covers the thread winding down.
 const WORKER_STOP_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// One-line description of what a client asked the cursor to be, for the debug
+/// log: which named shape, or - for a client-drawn cursor - which surface it is
+/// and whether that surface is mapped. Toolkits use a new surface per shape, so a
+/// changing surface id means a changing cursor.
+pub fn describe_cursor(status: &smithay::input::pointer::CursorImageStatus) -> String {
+    use smithay::input::pointer::CursorImageStatus;
+    use smithay::utils::IsAlive;
+    match status {
+        CursorImageStatus::Hidden => "hidden".to_string(),
+        CursorImageStatus::Named(icon) => format!("named {}", icon.name()),
+        CursorImageStatus::Surface(surface) => {
+            let mapped = smithay::backend::renderer::utils::with_renderer_surface_state(surface, |st| {
+                st.buffer().is_some()
+            });
+            use smithay::reexports::wayland_server::Resource;
+            format!(
+                "client surface {:?} (alive {}, mapped {mapped:?})",
+                surface.id().protocol_id(),
+                surface.alive()
+            )
+        }
+    }
+}
+
 /// True when `VERACAGE_DEBUG=1` was forwarded (config `debug`): the compositor
 /// then writes a periodic render/scan summary through `vcdebug`. Read once.
 pub fn debug_enabled() -> bool {
@@ -116,7 +149,11 @@ pub fn vcdebug(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
         let _ = writeln!(f, "{msg}");
+        return;
     }
+    // No session directory (the compositor run straight from a shell, as in the
+    // headless smoke): stderr is then the only place these can go.
+    eprintln!("vcdebug: {msg}");
 }
 
 fn init_logging() {

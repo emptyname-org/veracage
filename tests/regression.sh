@@ -97,9 +97,19 @@ c_headless_smoke() {
       rm -rf "$XR"
     ' EXIT
 
-    weston --backend=headless --socket=wl-host --width=1600 --height=1000 >"$XR/weston.out" 2>&1 &
+    # weston 10 (Debian 12) wants the module file name; 11+ also accepts the
+    # short one. Naming it "headless" alone made every local run fail to start a
+    # host and report SKIP, which is how the client-flush regression got past
+    # this gate. Try the module name first, then the short form.
+    weston --backend=headless-backend.so --socket=wl-host --width=1600 --height=1000 >"$XR/weston.out" 2>&1 &
     WPID=$!
-    for i in $(seq 1 40); do [ -S "$XR/wl-host" ] && break; sleep 0.25; done
+    for i in $(seq 1 20); do [ -S "$XR/wl-host" ] && break; sleep 0.25; done
+    if [ ! -S "$XR/wl-host" ]; then
+      kill "$WPID" 2>/dev/null
+      weston --backend=headless --socket=wl-host --width=1600 --height=1000 >"$XR/weston.out" 2>&1 &
+      WPID=$!
+      for i in $(seq 1 40); do [ -S "$XR/wl-host" ] && break; sleep 0.25; done
+    fi
     [ -S "$XR/wl-host" ] || { echo "FAIL: weston host socket never appeared"; tail -8 "$XR/weston.out"; exit 1; }
     echo "  weston host up"
 
@@ -113,11 +123,11 @@ c_headless_smoke() {
 
     # Every global we expect must be advertised to a connecting client.
     WAYLAND_DISPLAY=wl-vc WAYLAND_DEBUG=1 timeout 3 weston-simple-shm >"$XR/client.out" 2>&1
-    want="xdg_wm_base wl_seat wl_shm wl_data_device_manager zxdg_decoration_manager_v1 org_kde_kwin_server_decoration_manager wp_viewporter wp_fractional_scale_manager_v1 zwp_primary_selection_device_manager_v1"
+    want="xdg_wm_base wl_seat wl_shm wl_data_device_manager zxdg_decoration_manager_v1 org_kde_kwin_server_decoration_manager wp_viewporter wp_fractional_scale_manager_v1 zwp_primary_selection_device_manager_v1 wp_cursor_shape_manager_v1"
     missing=""
     for g in $want; do grep -q "$g" "$XR/client.out" || missing="$missing $g"; done
     [ -z "$missing" ] || { echo "FAIL: globals not advertised:$missing"; exit 1; }
-    echo "  all 9 expected globals advertised"
+    echo "  all $(echo $want | wc -w) expected globals advertised"
 
     # A real toolkit-ish client maps a toplevel: exercises new_toplevel (placement,
     # bounds, focus-on-map -> data-device + primary focus), decoration negotiation,

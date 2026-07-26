@@ -32,6 +32,7 @@ use smithay::{
     utils::{Logical, Point},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
+        cursor_shape::CursorShapeManagerState,
         fractional_scale::FractionalScaleManagerState,
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
@@ -68,6 +69,12 @@ pub struct State {
     pub kde_decoration_state: KdeDecorationState,
     pub viewporter_state: ViewporterState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
+    /// wp_cursor_shape_v1. With it, a toolkit asks for a cursor by NAME
+    /// ("se-resize") instead of loading an XCursor theme itself and handing us a
+    /// cursor surface. The host window then draws the themed cursor, so resize
+    /// cursors work even though the sandbox has no cursor theme configured.
+    /// Held only to keep the global alive.
+    pub cursor_shape_state: CursorShapeManagerState,
     pub popups: PopupManager,
 
     pub seat: Seat<Self>,
@@ -221,6 +228,7 @@ impl State {
         // 1x. No-ops on a 1x host; the output scale (winit.rs) reflects the host.
         let viewporter_state = ViewporterState::new::<Self>(&dh);
         let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(&dh);
+        let cursor_shape_state = CursorShapeManagerState::new::<Self>(&dh);
 
         // A seat is a group of keyboards, pointer and touch devices.
         // A seat typically has a pointer and maintains a keyboard focus and a pointer focus.
@@ -276,6 +284,7 @@ impl State {
             kde_decoration_state,
             viewporter_state,
             fractional_scale_manager_state,
+            cursor_shape_state,
             popups,
             seat,
             clip_source: None,
