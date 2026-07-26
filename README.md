@@ -40,7 +40,9 @@ ownership, and the mount never appears in `/proc/mounts`. Apps run as
   out are the clipboard and the shared directory. Mounting a volume joins the
   same session. Apps launched after the mount see it. Double-clicking a file
   in a sandboxed file manager opens it with your enabled apps: the file-type
-  defaults are seeded from the enabled list and the host's own associations.
+  defaults come from what those apps declare, plus your host associations for
+  the remaining types. Only enabled apps are ever named, so nothing else can
+  be launched inside Veracage.
 - **Clipboard** - user-triggered only: Clipboard > Paste in (host to sandbox)
   and Clipboard > Copy out (sandbox to host), with configurable shortcuts
   (defaults Ctrl+Alt+V / Ctrl+Alt+C). Text-only, owned by the compositor. After

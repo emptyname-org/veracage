@@ -308,8 +308,8 @@ def test_clip_clear_published(tmp_xdg_config, tmp_path, monkeypatch):
 
 @pytest.fixture
 def tmp_xdg_data(monkeypatch, tmp_path):
-    """An isolated XDG data dir with an applications/ folder, so mimeapps tests
-    never scan the real host .desktop files."""
+    """An isolated XDG data dir with an applications/ directory, so mimeapps
+    tests never scan the real host .desktop files."""
     data = tmp_path / "data"
     (data / "applications").mkdir(parents=True)
     monkeypatch.setenv("XDG_DATA_HOME", str(data))
@@ -326,23 +326,47 @@ def test_mimeapps_enabled_apps_win_over_host_defaults(
         tmp_xdg_config, tmp_xdg_data):
     _desktop_file(tmp_xdg_data, "org.kde.kate.desktop", "kate %U",
                   "text/plain;text/markdown;")
+    _desktop_file(tmp_xdg_data, "okularApplication_pdf.desktop", "okular %U",
+                  "application/x-okular;")
     (tmp_xdg_config / "mimeapps.list").write_text(
         "[Default Applications]\n"
         "text/plain=kwrite.desktop;\n"
-        "application/pdf=okular.desktop;\n"
+        "application/pdf=okularApplication_pdf.desktop;\n"
+        "[Added Associations]\n"
+        "image/png=gwenview.desktop;\n")
+    cfg = config.Config(apps={
+        "kate": apps.App("kate", "Kate", "kate"),
+        "okular": apps.App("okular", "Okular", "okular"),
+    })
+    lines = config._mimeapps_body(cfg).splitlines()
+    # The enabled app claims its declared types, beating the host default.
+    assert "text/plain=org.kde.kate.desktop;" in lines
+    assert "text/markdown=org.kde.kate.desktop;" in lines
+    # A host association for a type no enabled app declares is kept, because
+    # its handler IS an enabled app.
+    assert "application/pdf=okularApplication_pdf.desktop;" in lines
+
+
+def test_mimeapps_drops_host_handlers_that_are_not_enabled(
+        tmp_xdg_config, tmp_xdg_data):
+    """Only enabled apps may be named. An unrestricted host entry would let a
+    click in the sandbox start an app the user never enabled (the classic case:
+    x-scheme-handler/http=firefox.desktop, launched with no network)."""
+    _desktop_file(tmp_xdg_data, "org.kde.kate.desktop", "kate %U", "text/plain;")
+    (tmp_xdg_config / "mimeapps.list").write_text(
+        "[Default Applications]\n"
+        "x-scheme-handler/http=firefox-esr.desktop;\n"
+        "x-scheme-handler/mailto=thunderbird.desktop;\n"
+        "application/pdf=okular.desktop;firefox-esr.desktop;\n"
         "[Added Associations]\n"
         "image/png=gwenview.desktop;\n")
     cfg = config.Config(apps={"kate": apps.App("kate", "Kate", "kate")})
     body = config._mimeapps_body(cfg)
-    lines = body.splitlines()
-    # The enabled app claims its declared types, beating the host default.
-    assert "text/plain=org.kde.kate.desktop;" in lines
-    assert "text/markdown=org.kde.kate.desktop;" in lines
-    # Host defaults fill in the types no enabled app claims.
-    assert "application/pdf=okular.desktop;" in lines
-    # Host added associations pass through unchanged.
-    assert "[Added Associations]" in lines
-    assert "image/png=gwenview.desktop;" in lines
+    for unwanted in ("firefox", "thunderbird", "okular", "gwenview",
+                     "x-scheme-handler"):
+        assert unwanted not in body
+    assert body.splitlines() == ["[Default Applications]",
+                                 "text/plain=org.kde.kate.desktop;"]
 
 
 def test_mimeapps_first_enabled_app_wins_on_overlap(

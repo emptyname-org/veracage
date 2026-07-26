@@ -98,6 +98,11 @@ pub struct State {
     /// true so the first frame paints.
     pub dirty: bool,
 
+    /// Ask winit for a frame (set by `init_winit`). Marking the output dirty is
+    /// not enough on its own: the pacing timer idles until the next scan, so
+    /// whatever sets `dirty` outside the render path must also call `wake`.
+    pub request_redraw: Option<std::rc::Rc<dyn Fn()>>,
+
     /// Toolbar launcher list, refreshed (throttled) from the leaders' `.apps`
     /// files so app buttons appear/disappear as volumes open and close.
     pub leaders: Vec<crate::toolbar::LeaderApps>,
@@ -148,6 +153,14 @@ pub struct DndIcon {
 }
 
 impl State {
+    /// Ask winit for a frame. Pair it with every `dirty = true` outside the
+    /// render path, so the change is drawn now rather than at the next scan.
+    pub fn wake(&self) {
+        if let Some(request) = &self.request_redraw {
+            request();
+        }
+    }
+
     pub fn new(event_loop: &mut EventLoop<Self>, display: Display<Self>, socket: Option<String>) -> Self {
         let start_time = std::time::Instant::now();
 
@@ -244,6 +257,7 @@ impl State {
             dnd_icon: None,
             hint_icon: build_hint_icon(),
             dirty: true,
+            request_redraw: None,
             leaders: Vec::new(),
             leaders_scan_at: std::time::Duration::ZERO,
             // Baseline: adopt any notice already on disk without showing it, so a

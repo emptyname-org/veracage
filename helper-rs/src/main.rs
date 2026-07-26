@@ -146,7 +146,7 @@ struct Args {
     /// the rest of the session running (Phase 5). Needs --session.
     close_volume: Option<String>,
     /// `--exchange <dir>`: a human-owned host directory to idmap-mount into the
-    /// sandbox as a shared exchange folder. Caller-supplied, so validated (owner
+    /// sandbox as the shared directory. Caller-supplied, so validated (owner
     /// == human, real dir, no final-component symlink) before root touches it.
     exchange: Option<String>,
     setenv: Vec<String>,
@@ -344,18 +344,12 @@ fn try_chown(p: &Path, uid: u32, gid: u32) {
 
 /// True for a filesystem with no per-file ownership (FAT/exFAT/NTFS): ownership
 /// comes from mount options and `chown(2)` returns EPERM. VeraCrypt/TrueCrypt
-/// volumes are commonly FAT. Detected on the decrypted device via `blkid`.
-fn is_ownerless_fs(dm_path: &str) -> bool {
-    match Command::new(tool("blkid"))
-        .args(["-o", "value", "-s", "TYPE", dm_path])
-        .output()
-    {
-        Ok(o) if o.status.success() => matches!(
-            String::from_utf8_lossy(&o.stdout).trim().to_ascii_lowercase().as_str(),
-            "vfat" | "exfat" | "ntfs" | "msdos",
-        ),
-        _ => false,
-    }
+/// volumes are commonly FAT. Pure, so it is unit-tested.
+fn is_ownerless_fs(fstype: Option<&str>) -> bool {
+    matches!(
+        fstype.unwrap_or("").to_ascii_lowercase().as_str(),
+        "vfat" | "exfat" | "ntfs" | "ntfs3" | "msdos",
+    )
 }
 
 /// Stage-mount options for the decrypted `dm_path`, and whether a chown is still
@@ -364,8 +358,8 @@ fn is_ownerless_fs(dm_path: &str) -> bool {
 /// to the vault uid, a WRITABLE vault). Without this such a volume mounts
 /// root-owned, `chown` fails with EPERM, and the sandbox sees `nobody`,
 /// read-only. A POSIX fs is mounted plain and its root inode chowned instead.
-fn stage_opts(dm_path: &str, human_uid: u32, human_gid: u32) -> (String, bool) {
-    if is_ownerless_fs(dm_path) {
+fn stage_opts(fstype: Option<&str>, human_uid: u32, human_gid: u32) -> (String, bool) {
+    if is_ownerless_fs(fstype) {
         (format!("nodev,nosuid,uid={human_uid},gid={human_gid},umask=0077"), false)
     } else {
         ("nodev,nosuid".to_string(), true)
@@ -855,27 +849,41 @@ fn wait_for(pid: i32) -> i32 {
     }
 }
 
-/// The filesystem label of the decrypted volume (`blkid` on the dm device), or
-/// None if it has none. Used to name the vault in the sandbox file manager, and
-/// forwarded via `env::set_var`, so strip control chars (a NUL would make
-/// `set_var` panic/abort; others would corrupt the title). The label comes from
-/// an attacker-supplied volume, so it is not trusted.
-fn read_volume_label(dm_path: &str) -> Option<String> {
-    let out = Command::new(tool("blkid"))
-        .args(["-o", "value", "-s", "LABEL", dm_path])
+/// Probe the decrypted volume ONCE for both properties the mount needs: its
+/// filesystem label and type. `-p` probes the device directly instead of
+/// answering from the /run/blkid cache, which can hold a stale entry for a
+/// reused dm device (a wrong TYPE would silently mount an ownerless volume
+/// read-only). `-o export` prints `KEY=value` lines, so a missing key is simply
+/// absent rather than an unlabelled empty line.
+fn probe_fs(dm_path: &str) -> (Option<String>, Option<String>) {
+    let Ok(out) = Command::new(tool("blkid"))
+        .args(["-p", "-o", "export", dm_path])
         .output()
-        .ok()?;
-    let s: String = String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect();
+    else {
+        return (None, None);
+    };
+    let mut label = None;
+    let mut fstype = None;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        match line.split_once('=') {
+            // LABEL, not LABEL_FATBOOT / LABEL_ENC: match the key exactly.
+            Some(("LABEL", v)) => label = sanitized(v),
+            Some(("TYPE", v)) => fstype = sanitized(v),
+            _ => {}
+        }
+    }
+    (label, fstype)
+}
+
+/// A blkid value made safe to carry: the label names the vault in the sandbox
+/// file manager and is forwarded via `env::set_var`, so strip control chars (a
+/// NUL would make `set_var` panic/abort; others would corrupt the title). The
+/// value comes from an attacker-supplied volume, so it is not trusted.
+fn sanitized(raw: &str) -> Option<String> {
+    let s: String = raw.trim().chars().filter(|c| !c.is_control()).collect();
     (!s.is_empty()).then_some(s)
 }
 
-/// Child path: new mount NS, open + idmap-mount the vault as the vault uid,
-/// drop to the vault uid, exec the continuation.
-#[allow(clippy::too_many_arguments)]
 /// Validate a caller-supplied exchange directory before root idmap-mounts it.
 /// Opens it `O_DIRECTORY|O_NOFOLLOW` (a final-component symlink fails) and requires
 /// a directory owned by the human. Intermediate symlinks aren't fully chased, but
@@ -915,7 +923,10 @@ fn mount_volume_at_workspace(
         .unwrap_or_else(|e| fail(&format!("{e}"), EXIT_CRYPT_FAILED));
     let dm_path = format!("/dev/mapper/{dm_name}");
 
-    let label = read_volume_label(&dm_path).unwrap_or_else(|| {
+    // One probe for both the label (names the volume) and the filesystem type
+    // (decides the stage-mount options below).
+    let (probed_label, fstype) = probe_fs(&dm_path);
+    let label = probed_label.unwrap_or_else(|| {
         source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Volume".into())
     });
     let mountpoint = workspace_path(&label, source);
@@ -936,7 +947,7 @@ fn mount_volume_at_workspace(
     // plain and its root inode chowned), then idmap-clone it to the workspace path.
     std::fs::create_dir_all(&raw).unwrap_or_else(|e| fail(&format!("mkdir staging: {e}"), 1));
     set_mode(&raw, 0o700);
-    let (opts, needs_chown) = stage_opts(&dm_path, human_uid, human_gid);
+    let (opts, needs_chown) = stage_opts(fstype.as_deref(), human_uid, human_gid);
     let st = Command::new(tool("mount"))
         .args(["-o", &opts])
         .arg(&dm_path)
@@ -1017,11 +1028,11 @@ fn session_child(
     };
     let vault_run = PathBuf::from(format!("/run/veracage/session-{sid}.run"));
 
-    // Shared exchange folder (idmap a human-owned host dir), bound at /exchange,
+    // Shared directory (idmap a human-owned host dir), bound at /exchange,
     // top-level, presented as veracage-owned. The mount lives OUTSIDE the
     // workspace (a `session-<sid>.x` sibling): the sandbox binds the whole workspace at /vaults
     // recursively, and /vaults is HOME, so a mount under it would surface the
-    // host-plaintext folder inside HOME and break the "everything in HOME is
+    // host-plaintext directory inside HOME and break the "everything in HOME is
     // encrypted at rest" invariant (an app writing under ~/.exchange, or any
     // recursive copy of ~, would land plaintext on the host disk).
     if let Some(xpath) = args.exchange.as_deref() {
@@ -1314,14 +1325,43 @@ fn rest_value<'a>(rest: &'a [String], flag: &str) -> Option<&'a str> {
 
 /// Write the auto-launch app spec for the leader to consume (add-volume path).
 /// Best-effort: a mount without the popup beats failing a completed mount.
+///
+/// The target dir is vault-owned, so the veracage uid can plant a symlink (or
+/// swap the file) there. Everything root does here therefore goes through ONE
+/// fd: `O_CREAT|O_EXCL|O_NOFOLLOW` refuses a pre-planted name, the mode is set
+/// at creation, and the ownership handover is `fchown` on that same fd - never a
+/// path lookup a replacement could redirect.
 fn write_launch_request(sid: &str, spec: &str, vault_uid: u32, vault_gid: u32) {
     if spec.len() > 4096 {
         return; // a real {name, exec} spec is tiny; don't relay junk
     }
     let path = PathBuf::from(format!("/run/veracage/session-{sid}.run/launch.req"));
-    if std::fs::write(&path, spec).is_ok() {
-        set_mode(&path, 0o600);
-        try_chown(&path, vault_uid, vault_gid);
+    // Unlink any leftover from a crashed open first: remove_file acts on the
+    // NAME, so it drops a planted symlink rather than following it.
+    let _ = std::fs::remove_file(&path);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path);
+    let Ok(mut file) = file else {
+        eprintln!("veracage-helper: launch request not written (no app auto-launched)");
+        return;
+    };
+    use std::io::Write;
+    if file.write_all(spec.as_bytes()).is_err() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    // fchown, not chown: the leader must be able to read it, and the fd cannot
+    // be redirected between the create above and this call.
+    if unsafe { libc::fchown(file.as_raw_fd(), vault_uid, vault_gid) } != 0 {
+        eprintln!(
+            "veracage-helper: launch request fchown: {}",
+            std::io::Error::last_os_error()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
 
@@ -1425,6 +1465,49 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ownerless_filesystems_get_uid_mount_options() {
+        // FAT/exFAT/NTFS carry no per-file ownership: they must be mounted with
+        // uid=/gid= (and NOT chowned, which returns EPERM) or the vault ends up
+        // read-only. Case-insensitive: blkid reports lowercase, but don't rely on it.
+        for fs in ["vfat", "exfat", "ntfs", "ntfs3", "msdos", "VFAT"] {
+            assert!(is_ownerless_fs(Some(fs)), "{fs} must be treated as ownerless");
+            let (opts, needs_chown) = stage_opts(Some(fs), 1000, 1000);
+            assert!(opts.contains("uid=1000") && opts.contains("umask=0077"));
+            assert!(!needs_chown);
+        }
+        // A POSIX fs (and an unprobeable device) keeps the plain mount + chown.
+        for fs in [Some("ext4"), Some("btrfs"), Some("xfs"), None] {
+            assert!(!is_ownerless_fs(fs));
+            let (opts, needs_chown) = stage_opts(fs, 1000, 1000);
+            assert_eq!(opts, "nodev,nosuid");
+            assert!(needs_chown);
+        }
+    }
+
+    #[test]
+    fn sanitized_strips_control_chars_and_empties() {
+        // The label reaches env::set_var and the window title, from an
+        // attacker-supplied volume.
+        assert_eq!(sanitized("  Work  ").as_deref(), Some("Work"));
+        assert_eq!(sanitized("Wo\u{0}rk\n").as_deref(), Some("Work"));
+        assert_eq!(sanitized("   "), None);
+        assert_eq!(sanitized("\u{0}\n"), None);
+    }
+
+    #[test]
+    fn rest_value_reads_the_flag_that_follows() {
+        let rest: Vec<String> = ["_leader", "--apps", "[]", "--first", "{\"exec\":\"kate\"}"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(rest_value(&rest, "--first"), Some("{\"exec\":\"kate\"}"));
+        assert_eq!(rest_value(&rest, "--apps"), Some("[]"));
+        assert_eq!(rest_value(&rest, "--nope"), None);
+        // A trailing flag with no value must not panic or wrap around.
+        assert_eq!(rest_value(&["--first".to_string()], "--first"), None);
+    }
 
     #[test]
     fn dm_name_matches_cleanup_regex() {

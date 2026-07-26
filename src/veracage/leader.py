@@ -206,6 +206,12 @@ def _launch_app(state: _LeaderState, spec) -> dict:
         )
     except FileNotFoundError as e:
         return {"ok": False, "error": f"missing dependency: {e.filename}"}
+    except OSError as e:
+        # Anything else the spawn can fail with (EMFILE/ENOMEM/EAGAIN under
+        # load) is reported like any other launch failure. It must NOT escape:
+        # the callers run inside the serve loop, whose unwind path terminates
+        # every app in the session.
+        return {"ok": False, "error": f"cannot launch {label}: {e}"}
     finally:
         for fd, _ in seeds:
             os.close(fd)
@@ -228,7 +234,10 @@ def _consume_launch_request(state: _LeaderState) -> None:
     human uid; the spec gets the same validation as `set-apps` anyway."""
     path = Path(os.environ.get("XDG_RUNTIME_DIR", "/nonexistent")) / "launch.req"
     try:
-        raw = path.read_text()
+        # errors="replace": undecodable bytes must not raise (a ValueError here
+        # would escape the serve loop and tear the session down); the spec
+        # validation below rejects the result anyway.
+        raw = path.read_text(errors="replace")
     except OSError:
         return
     # Remove before launching, so a failing spec can never launch-loop.
@@ -592,8 +601,14 @@ def run_leader(mountpoint: str, app_specs: list, first_app: dict | None) -> int:
                     state.places_file = _write_places_file(cur, state.exchange is not None)
                     _write_apps_file(state)
                 # After the Places refresh, so the app launched for a just-added
-                # volume gets the seed that already lists it.
-                _consume_launch_request(state)
+                # volume gets the seed that already lists it. Guarded like the
+                # accept paths below: an unexpected failure here must not unwind
+                # into the finally and SIGKILL every running app.
+                try:
+                    _consume_launch_request(state)
+                except Exception as e:  # noqa: BLE001 - serve loop must survive
+                    print(f"veracage: launch request error (continuing): {e}",
+                          file=sys.stderr)
                 if compositor_is_up():
                     comp_seen = True
                 elif comp_seen:

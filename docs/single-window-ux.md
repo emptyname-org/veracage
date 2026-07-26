@@ -85,8 +85,11 @@ The same channel carries `mimeapps.list`, the default-app associations the
 leader seeds into each sandbox at `$XDG_CONFIG_HOME/mimeapps.list` (the
 sandbox XDG config is an empty tmpfs, so without it a file manager asks
 "open with?" for every file): the enabled apps become the defaults for the
-types their `.desktop` files declare, and the host's own associations fill
-in the rest.
+types their `.desktop` files declare, and the host's own associations cover
+the remaining types. Every handler named in the seed is an enabled app: the
+sandbox has all of read-only `/usr`, so an unfiltered host entry (the usual
+`x-scheme-handler/http=firefox.desktop`) would let a click start an app the
+user never enabled, inside the volume sandbox and with no network to serve it.
 
 ## Prompt flow
 

@@ -31,7 +31,7 @@ from leaking out, not to confine the app.
 | Mount invisible to the host | The privileged helper mounts inside a private mount namespace (`/` made rslave). It never appears in the host's `/proc/mounts`. |
 | Block device sealed | `/dev/mapper/veracage-*` is `root:disk 0660` + `UDISKS_IGNORE=1`: no unprivileged `open`, and no desktop "mount this drive" path. |
 | Decrypted data has no path out to network / host FS | `bwrap` unshares pid/uts/ipc/cgroup/**net**, `--die-with-parent`, `--clearenv` + env allowlist, `HOME=/vaults`, host `$XDG_RUNTIME_DIR` hidden, with only the compositor's Wayland socket bound in. This keeps the volume data from leaking out. It protects the data, it is not a cage on the app (a malicious app is outside the threat model). |
-| Minimal host surface | `/usr` read-only, **curated** `/etc` (linker, fontconfig, tz, NSS, machine-id, TLS) instead of all of `/etc`, no host home, no D-Bus, no portals. |
+| Minimal host surface | `/usr` read-only, **curated** `/etc` (linker, fontconfig, tz, NSS, machine-id, TLS) instead of all of `/etc`, no host home, no D-Bus, no portals. The GPU exception: `/dev/dri` plus `/sys/dev/char` and `/sys/devices` read-only, which Mesa needs to pick the hardware driver. That exposes host *device metadata* (NIC addresses, DMI ids, the device tree) to the app, which the one-directional model accepts: it is not volume data, and a malicious app is outside the threat model. |
 | Clipboard isolation | The sandbox runs against the project's own nested `veracage-compositor`, which owns the selection. **No `data-control` global** is exposed to apps, so a clipboard manager inside the sandbox can't scrape it. Host<->sandbox transfer is one-shot, user-triggered (Ctrl+Alt+V/C or the toolbar), text-only. After a Copy out, the host clipboard is auto-cleared after a timeout (default 30 seconds) and again on exit, so a copied secret does not linger on the host. |
 | Control socket carries no execution | The human-owned control socket exposes `ping`/`list`/`close`/`set-apps`: deliberately no command execution and no file transfer, because any same-uid process can reach it. `set-apps` only replaces the enabled-app list, the same human-trust data as `config.toml`. |
 | File transfer confined to the shared directory | Host<->volume transfer goes through `~/Veracage/Exchange`, idmap-mounted at `/exchange`: a separate mount from the volume, `nosuid,nodev,noexec`, path validated by the helper. Only what the user consciously placed there is exposed. |
@@ -71,9 +71,12 @@ contract.
 - **No network** from the sandbox, even opt-in (v1 non-goal).
 - **Clipboard is text-only** in v1.
 - **Apps and the compositor render on the host GPU** (`/dev/dri` is passed
-  through, and the `veracage` user is in the `render` group). The final window
-  pixels already reach the host compositor's GPU path for display, so this
-  opens no new exfiltration channel, and confining the app is not a goal.
+  through together with the `/sys/dev/char` and `/sys/devices` metadata Mesa
+  reads to identify the hardware, and the `veracage` user is in the `render`
+  group). The final window pixels already reach the host compositor's GPU path
+  for display, so this opens no new exfiltration channel, and confining the app
+  is not a goal. The `/sys` binds do let the app read host device metadata
+  (see the "Minimal host surface" row).
 - **A malicious *sandboxed app* is outside the threat model.** The isolation
   is one-directional (host out of the volume, not the app out of the host) and
   the app you chose to run is trusted. What stays in scope is attacker-controlled

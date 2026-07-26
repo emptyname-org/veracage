@@ -277,7 +277,7 @@ class Config:
     ui_font: str = "system"               # UI font key (see _VALID_FONTS); system = host
     ui_font_size: str = "system"          # "system" (host size) | a point size
     window_size: str = "default"          # compositor default window size
-    exchange: bool = True                 # host<->volume shared folder
+    exchange: bool = True                 # host<->volume shared directory
     exchange_dir: str | None = None       # default ~/Veracage/Exchange when unset
     clip_clear: bool = True               # auto-clear host clipboard after Copy out
     clip_clear_timeout: int = DEFAULT_CLIP_CLEAR_TIMEOUT   # seconds before it fires
@@ -502,6 +502,12 @@ def _application_dirs() -> list[Path]:
             for d in [data_home, *data_dirs.split(":")] if d]
 
 
+# A .desktop file is read only for its Exec and MimeType keys, so stop at the
+# end of the [Desktop Entry] group and cap the read: KDE entries carry hundreds
+# of Name[xx]= translations and trailing [Desktop Action] groups after them.
+_DESKTOP_READ_LIMIT = 256 * 1024
+
+
 def _desktop_entry_fields(body: str) -> tuple[str, str]:
     """(Exec binary basename, raw MimeType value) from a .desktop file's
     `[Desktop Entry]` group. Empty strings when absent."""
@@ -511,6 +517,8 @@ def _desktop_entry_fields(body: str) -> tuple[str, str]:
     for line in body.splitlines():
         line = line.strip()
         if line.startswith("["):
+            if in_entry:
+                break            # past [Desktop Entry]: nothing left to find
             in_entry = line == "[Desktop Entry]"
             continue
         if not in_entry:
@@ -522,35 +530,46 @@ def _desktop_entry_fields(body: str) -> tuple[str, str]:
             exec_bin = "" if base.startswith("%") else base
         elif line.startswith("MimeType=") and not mimes:
             mimes = line[len("MimeType="):]
+        if exec_bin and mimes:
+            break
     return exec_bin, mimes
 
 
-def _mime_defaults(apps: list[App]) -> dict[str, str]:
-    """Mime type -> desktop id for the enabled apps: find each app's .desktop
-    (matched by Exec binary basename, user dirs first) and claim the types its
-    MimeType= declares. On overlap the first app in config order wins."""
+def _enabled_desktop_entries(apps: list[App]) -> dict[str, tuple[str, str]]:
+    """Exec basename -> (desktop id, raw MimeType value) for the enabled apps,
+    found by scanning the XDG application dirs (user dirs first, so a user
+    override wins). Stops as soon as every app is resolved, since the system dir
+    holds hundreds of entries this never needs to look at."""
     targets = {os.path.basename(a.exec) for a in apps}
-    by_exec: dict[str, tuple[str, str]] = {}
+    found: dict[str, tuple[str, str]] = {}
     for d in _application_dirs():
-        if targets <= by_exec.keys():
-            break
         try:
             entries = sorted(os.scandir(d), key=lambda e: e.name)
         except OSError:
             continue
         for e in entries:
+            if targets <= found.keys():
+                return found
             if not e.name.endswith(".desktop"):
                 continue
             try:
-                body = Path(e.path).read_text(errors="replace")
+                with open(e.path, errors="replace") as f:
+                    body = f.read(_DESKTOP_READ_LIMIT)
             except OSError:
                 continue
             exec_bin, mimes = _desktop_entry_fields(body)
-            if exec_bin in targets and exec_bin not in by_exec and mimes:
-                by_exec[exec_bin] = (e.name, mimes)
+            if exec_bin in targets and exec_bin not in found and mimes:
+                found[exec_bin] = (e.name, mimes)
+    return found
+
+
+def _mime_defaults(entries: dict[str, tuple[str, str]],
+                   apps: list[App]) -> dict[str, str]:
+    """Mime type -> desktop id: each enabled app claims the types its .desktop
+    declares. On overlap the first app in config order wins."""
     defaults: dict[str, str] = {}
     for a in apps:
-        hit = by_exec.get(os.path.basename(a.exec))
+        hit = entries.get(os.path.basename(a.exec))
         if hit is None:
             continue
         desktop_id, mimes = hit
@@ -572,21 +591,29 @@ def _host_mimeapps() -> configparser.ConfigParser:
 
 
 def _mimeapps_body(cfg: Config) -> str:
-    """The mimeapps.list seed: enabled-app defaults first, then the host's own
-    defaults for every type they don't claim, plus the host's added and removed
-    associations unchanged."""
-    defaults = _mime_defaults(list(cfg.apps.values()))
+    """The mimeapps.list seed: every type an enabled app declares, plus the
+    host's own associations for the types they don't declare, restricted to
+    handlers that are themselves enabled apps.
+
+    Only enabled apps may be named. The sandbox has the whole read-only /usr, so
+    an unrestricted host entry (`x-scheme-handler/http=firefox.desktop`) would
+    let a click start an app the user never enabled, inside the volume sandbox
+    and with no network to serve it."""
+    apps = list(cfg.apps.values())
+    entries = _enabled_desktop_entries(apps)
+    defaults = _mime_defaults(entries, apps)
+    allowed = {desktop_id for desktop_id, _ in entries.values()}
     host = _host_mimeapps()
-    if host.has_section("Default Applications"):
-        for mime, ids in host.items("Default Applications"):
-            defaults.setdefault(mime, ids)
     out = ["[Default Applications]\n"]
+    for section in ("Default Applications", "Added Associations"):
+        if not host.has_section(section):
+            continue
+        for mime, ids in host.items(section):
+            keep = [i for i in (v.strip() for v in ids.split(";")) if i in allowed]
+            if keep:
+                defaults.setdefault(mime, ";".join(keep))
     out += [f"{mime}={ids}{'' if ids.endswith(';') else ';'}\n"
             for mime, ids in defaults.items()]
-    for section in ("Added Associations", "Removed Associations"):
-        if host.has_section(section) and host.items(section):
-            out.append(f"\n[{section}]\n")
-            out += [f"{k}={v}\n" for k, v in host.items(section)]
     return "".join(out)
 
 

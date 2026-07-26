@@ -28,8 +28,9 @@ impl CompositorHandler for State {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
-        // A client committed new content: a frame must be rendered.
+        // A client committed new content: a frame must be rendered, now.
         self.dirty = true;
+        self.wake();
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {

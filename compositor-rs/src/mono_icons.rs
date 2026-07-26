@@ -70,7 +70,7 @@ fn glyph(key: &str) -> Vec<Shape> {
             cut(circle(0.74, 0.55, 0.055)),
             cut(rect(0.20, 0.42, 0.62, 0.50)),
         ],
-        // An open folder: tab + body.
+        // An open directory: tab + body.
         "exchange" => vec![
             add(rrect(0.08, 0.20, 0.48, 0.40, 0.04)),
             add(rrect(0.08, 0.30, 0.92, 0.78, 0.05)),

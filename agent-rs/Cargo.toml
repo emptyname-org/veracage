@@ -32,7 +32,10 @@ resvg = { version = "0.44", default-features = false }
                       # rasterize SVG menu icons (KDE/breeze apps ship SVG-only);
                       # pure Rust, no system dependency. Text feature off (icons
                       # are vector shapes, not text).
-arboard = "3"         # clear the host clipboard after the shortcut configurator
+# Read/clear the host clipboard around the shortcut configurator's capture.
+# default-features off: `image-data` would pull the whole `image` crate (TIFF,
+# PNG, JPEG decoders) for text we never convert.
+arboard = { version = "3", default-features = false }
                       # seeds a sentinel to make Ctrl+V's Paste event fire.
 
 [profile.release]

@@ -201,23 +201,26 @@ fn exec_binary(exec_line: &str) -> String {
 
 /// The host icon for `exec`, as raw RGBA no larger than 64x64: find a `.desktop`
 /// whose `Exec=` launches the same binary, take its `Icon=`, resolve that to a
-/// PNG (hicolor sizes, then pixmaps), decode, and downscale. `None` when any
-/// step has no answer. The menu then simply shows text without an icon.
+/// PNG or SVG in the icon themes, and decode it. `None` when any step has no
+/// answer. The menu then simply shows text without an icon.
 pub fn icon_rgba_for_exec(exec: &str) -> Option<(u32, u32, Vec<u8>)> {
     let icon_name = desktop_icon_for_exec(exec)?;
     icon_rgba_for_name(&icon_name)
 }
 
-/// A host icon by freedesktop NAME, as raw RGBA no larger than 64x64. Tries a
-/// PNG first (the common case, fast), then an SVG (KDE/breeze apps ship SVG-only,
-/// e.g. VeraCrypt). `None` if the icon isn't in the theme in either form.
+/// A host icon by freedesktop NAME, as raw RGBA no larger than 64x64. Checks the
+/// cheap locations where apps install their own PNG, then falls back to ONE
+/// bounded walk of the icon themes that accepts either extension (KDE/breeze is
+/// SVG-only, e.g. VeraCrypt, while gnome/oxygen ship PNGs). `None` if the icon
+/// isn't in the theme in either form.
 fn icon_rgba_for_name(name: &str) -> Option<(u32, u32, Vec<u8>)> {
-    if let Some(png) = read_icon_png(name) {
-        if let Ok(data) = eframe::icon_data::from_png_bytes(&png) {
-            return Some(downscale_max(data.width, data.height, data.rgba, 64));
-        }
+    if name.starts_with('/') {
+        return load_icon_file(std::path::Path::new(name));
     }
-    read_icon_svg(name)
+    if let Some(icon) = hicolor_or_pixmap_png(name).and_then(|p| load_icon_file(&p)) {
+        return Some(icon);
+    }
+    load_icon_file(&find_icon_in_themes(name)?)
 }
 
 /// A generic "application" icon, used when an app's own icon can't be resolved so
@@ -288,22 +291,37 @@ fn desktop_icon_for_exec(exec: &str) -> Option<String> {
     None
 }
 
-/// Resolve an `Icon=` value to PNG bytes: an absolute `.png` path is read as
-/// is; a bare name is searched in the hicolor theme's app sizes and pixmaps,
-/// and on a miss in a bounded recursive scan of every installed icon theme
-/// (KDE's breeze is SVG-only, but gnome/oxygen ship PNGs for the same names).
-/// Size-capped so a huge file can't balloon the broker.
-fn read_icon_png(icon: &str) -> Option<Vec<u8>> {
-    const MAX_PNG: u64 = 1024 * 1024;
-    let read_capped = |p: &std::path::Path| -> Option<Vec<u8>> {
-        let md = std::fs::metadata(p).ok()?;
-        (md.is_file() && md.len() <= MAX_PNG).then(|| std::fs::read(p).ok())?
-    };
-    if icon.starts_with('/') {
-        return icon.ends_with(".png").then(|| read_capped(std::path::Path::new(icon)))?;
+/// Size cap for an icon file, PNG or SVG: a menu icon is a few KB, so anything
+/// bigger is not worth reading into the broker.
+const MAX_ICON_BYTES: u64 = 1024 * 1024;
+
+/// True if `p` is a regular file small enough to load as an icon.
+fn usable_icon_file(p: &std::path::Path) -> bool {
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() <= MAX_ICON_BYTES)
+}
+
+/// Load an icon FILE as RGBA no larger than 64x64: a `.png` is decoded, a `.svg`
+/// rasterized. `None` for any other extension, an oversized file, or a decode
+/// failure.
+fn load_icon_file(path: &std::path::Path) -> Option<(u32, u32, Vec<u8>)> {
+    if !usable_icon_file(path) {
+        return None;
     }
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("png") => {
+            let data = eframe::icon_data::from_png_bytes(&std::fs::read(path).ok()?).ok()?;
+            Some(downscale_max(data.width, data.height, data.rgba, 64))
+        }
+        Some("svg") => render_svg(path, SVG_TARGET),
+        _ => None,
+    }
+}
+
+/// `<icon>.png` in the cheap, predictable places: the hicolor theme's app sizes
+/// (closest to 48 first), where apps install their own icon, then
+/// `/usr/share/pixmaps`. Checked before the recursive theme walk.
+fn hicolor_or_pixmap_png(icon: &str) -> Option<std::path::PathBuf> {
     let roots = icon_roots();
-    // Fast path: hicolor (where apps install their own icons), then pixmaps.
     for size in [48, 64, 32, 96, 128, 256] {
         for root in &roots {
             let p = std::path::PathBuf::from(root)
@@ -311,23 +329,36 @@ fn read_icon_png(icon: &str) -> Option<Vec<u8>> {
                 .join(format!("{size}x{size}"))
                 .join("apps")
                 .join(format!("{icon}.png"));
-            if let Some(bytes) = read_capped(&p) {
-                return Some(bytes);
+            if usable_icon_file(&p) {
+                return Some(p);
             }
         }
     }
-    if let Some(bytes) = read_capped(std::path::Path::new(&format!("/usr/share/pixmaps/{icon}.png"))) {
-        return Some(bytes);
-    }
-    // Slow path (runs once per app, at publish time): scan the icon roots for
-    // `<icon>.png` in ANY theme/category and pick the size closest to 48.
-    let want = format!("{icon}.png");
-    let mut best: Option<(u32, std::path::PathBuf)> = None;
+    let p = std::path::PathBuf::from(format!("/usr/share/pixmaps/{icon}.png"));
+    usable_icon_file(&p).then_some(p)
+}
+
+/// The best `<icon>.png` or `<icon>.svg` anywhere in the icon-theme roots, found
+/// in ONE bounded recursive walk that accepts both extensions: picks the size
+/// closest to 48 and prefers the PNG on a tie (decoding beats rasterizing).
+/// Runs once per app at publish time, and the result is cached on disk, so the
+/// walk is bounded by a shared dir-entry budget rather than made fast.
+fn find_icon_in_themes(icon: &str) -> Option<std::path::PathBuf> {
+    let wants = [format!("{icon}.png"), format!("{icon}.svg")];
+    let mut best: Option<IconMatch> = None;
     let mut budget: u32 = 80_000; // dir-entry cap: bounded even on a huge theme set
-    for root in &roots {
-        scan_for_icon(std::path::Path::new(root), &want, 0, &mut budget, &mut best);
+    for root in icon_roots() {
+        scan_for_icon(std::path::Path::new(&root), &wants, 0, &mut budget, &mut best);
     }
-    read_capped(&best?.1)
+    best.map(|m| m.path)
+}
+
+/// A candidate from the theme walk: distance of its pixel size from 48, then the
+/// index of its extension in `wants` (PNG first), then where it lives.
+struct IconMatch {
+    dist: u32,
+    ext_rank: usize,
+    path: std::path::PathBuf,
 }
 
 /// The freedesktop icon-theme roots to search, user dir first: `$XDG_DATA_HOME`
@@ -346,25 +377,8 @@ fn icon_roots() -> Vec<String> {
     roots
 }
 
-/// Resolve an `Icon=` value to RGBA by finding and rendering an SVG: an absolute
-/// `.svg` path, else `<name>.svg` in the icon-theme roots (the size variant
-/// closest to 48, since breeze ships per-size SVGs). Rasterized at the menu icon
-/// size. `None` when no SVG is found or it fails to parse.
-fn read_icon_svg(icon: &str) -> Option<(u32, u32, Vec<u8>)> {
-    const TARGET: u32 = 64;
-    if icon.starts_with('/') {
-        return icon
-            .ends_with(".svg")
-            .then(|| render_svg(std::path::Path::new(icon), TARGET))?;
-    }
-    let want = format!("{icon}.svg");
-    let mut best: Option<(u32, std::path::PathBuf)> = None;
-    let mut budget: u32 = 80_000;
-    for root in icon_roots() {
-        scan_for_icon(std::path::Path::new(&root), &want, 0, &mut budget, &mut best);
-    }
-    render_svg(&best?.1, TARGET)
-}
+/// Pixel size an SVG icon is rasterized at (the menu shows it at 20pt).
+const SVG_TARGET: u32 = 64;
 
 /// Rasterize an SVG file to straight-alpha RGBA at `size`x`size` (aspect ratio
 /// preserved, centered in the square). Size-capped. `None` on any read, parse,
@@ -399,10 +413,10 @@ fn render_svg(path: &std::path::Path, size: u32) -> Option<(u32, u32, Vec<u8>)> 
 /// one closest to 48px; `best` holds (distance, path).
 fn scan_for_icon(
     dir: &std::path::Path,
-    want: &str,
+    wants: &[String],
     depth: u32,
     budget: &mut u32,
-    best: &mut Option<(u32, std::path::PathBuf)>,
+    best: &mut Option<IconMatch>,
 ) {
     if depth > 6 || *budget == 0 {
         return;
@@ -416,21 +430,31 @@ fn scan_for_icon(
         let path = entry.path();
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_dir() {
-            scan_for_icon(&path, want, depth + 1, budget, best);
-        } else if ft.is_file() && entry.file_name().to_str() == Some(want) {
-            let size = path
-                .to_str()
-                .and_then(|s| {
-                    s.split('/').find_map(|c| {
-                        let n = c.split('x').next()?;
-                        n.parse::<u32>().ok().filter(|&v| (8..=512).contains(&v))
-                    })
+            scan_for_icon(&path, wants, depth + 1, budget, best);
+            continue;
+        }
+        if !ft.is_file() {
+            continue;
+        }
+        let Some(ext_rank) = wants.iter().position(|w| Some(w.as_str()) == entry.file_name().to_str())
+        else {
+            continue;
+        };
+        let size = path
+            .to_str()
+            .and_then(|s| {
+                s.split('/').find_map(|c| {
+                    let n = c.split('x').next()?;
+                    n.parse::<u32>().ok().filter(|&v| (8..=512).contains(&v))
                 })
-                .unwrap_or(0);
-            let dist = size.abs_diff(48);
-            if best.as_ref().is_none_or(|(d, _)| dist < *d) {
-                *best = Some((dist, path));
-            }
+            })
+            .unwrap_or(0);
+        let dist = size.abs_diff(48);
+        let better = best
+            .as_ref()
+            .is_none_or(|b| (dist, ext_rank) < (b.dist, b.ext_rank));
+        if better && usable_icon_file(&path) {
+            *best = Some(IconMatch { dist, ext_rank, path });
         }
     }
 }

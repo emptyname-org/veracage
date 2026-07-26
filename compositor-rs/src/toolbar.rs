@@ -576,6 +576,17 @@ impl Toolbar {
         let clipped = self.ctx.tessellate(full.shapes, full.pixels_per_point);
         let mut textures_delta = full.textures_delta;
         rebake_font_textures(&mut textures_delta);
+        // A frame that was never painted (a skipped render) must not lose its
+        // texture updates: egui's deltas are INCREMENTAL and never resent, so a
+        // dropped font-atlas patch would leave later text rendering from a stale
+        // atlas and leak the textures it freed. Shapes describe one whole frame
+        // and are simply replaced; deltas accumulate, oldest first.
+        if let Some((_, stale, _)) = self.pending.take() {
+            let mut merged = stale;
+            merged.set.extend(textures_delta.set);
+            merged.free.extend(textures_delta.free);
+            textures_delta = merged;
+        }
         self.pending = Some((clipped, textures_delta, full.pixels_per_point));
         (action, self.painted_rect(painted, size_px))
     }

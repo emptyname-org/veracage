@@ -68,11 +68,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hc.clear_on_exit();
     }
     if let Some(worker) = state.host_clipboard_worker.take() {
-        let _ = worker.join();
+        // Join ONLY once the worker has actually finished. Its host roundtrips
+        // are unbounded, so a wedged host compositor could otherwise leave it
+        // blocked and this join would hang the process forever, keeping the
+        // volume mounted (the leader waits on our exit) with the dm-crypt key
+        // still in RAM. If it has not stopped in time, exit WITHOUT running
+        // destructors: process::exit never drops the winit backend, so the
+        // display the worker borrows outlives it by construction.
+        let stopped = state
+            .host_clipboard
+            .as_ref()
+            .is_some_and(|hc| hc.wait_stopped(WORKER_STOP_WAIT));
+        if stopped {
+            let _ = worker.join();
+        } else {
+            tracing::warn!("host-clipboard worker still busy; exiting without teardown");
+            std::process::exit(if run_result.is_err() { 1 } else { 0 });
+        }
     }
     run_result?;
     Ok(())
 }
+
+/// How long teardown waits for the host-clipboard worker to finish before
+/// abandoning it (see the exit path above). Its own clear is already bounded by
+/// `hostclip::EXIT_CLEAR_WAIT_MS`; this only covers the thread winding down.
+const WORKER_STOP_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Append a debug line to `/run/veracage/rt/compositor.log` (0644, so the human
 /// uid can read it through the 0711 rt dir). The compositor's stdio is swallowed

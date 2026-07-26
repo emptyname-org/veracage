@@ -15,7 +15,7 @@
 
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::io::FromRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -80,6 +80,18 @@ enum Cmd {
 pub struct HostClipboard {
     tx: Sender<Cmd>,
     wake: Arc<OwnedFd>,
+    /// Set by the worker's Drop guard when its thread is about to end, so
+    /// teardown can tell "finished" from "still inside a host roundtrip".
+    stopped: Arc<AtomicBool>,
+}
+
+/// Sets the worker's stopped flag when the worker thread unwinds or returns.
+struct StopFlag(Arc<AtomicBool>);
+
+impl Drop for StopFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 impl HostClipboard {
@@ -95,11 +107,31 @@ impl HostClipboard {
         let conn = Connection::from_backend(backend);
         let (wake_r, wake_w) = pipe()?;
         let (tx, rx) = mpsc::channel();
+        let stopped = Arc::new(AtomicBool::new(false));
+        // Set from a Drop guard, so it is observed however the worker ends
+        // (normal return, early error return, or a panic unwinding out of it).
+        let guard = StopFlag(stopped.clone());
         let handle = std::thread::Builder::new()
             .name("veracage-hostclip".into())
-            .spawn(move || worker(conn, rx, wake_r))
+            .spawn(move || {
+                let _guard = guard;
+                worker(conn, rx, wake_r)
+            })
             .ok()?;
-        Some((HostClipboard { tx, wake: Arc::new(wake_w) }, handle))
+        Some((HostClipboard { tx, wake: Arc::new(wake_w), stopped }, handle))
+    }
+
+    /// Wait (bounded) for the worker thread to actually finish. False on timeout,
+    /// which means joining it would block: see the exit path in main.rs.
+    pub fn wait_stopped(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while !self.stopped.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
     }
 
     /// Set the host clipboard to `text` (sandbox -> host). This is the ONLY path

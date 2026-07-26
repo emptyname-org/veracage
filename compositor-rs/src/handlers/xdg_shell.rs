@@ -109,6 +109,19 @@ impl XdgShellHandler for State {
         let _ = self.popups.track_popup(PopupKind::Xdg(surface));
     }
 
+    fn toplevel_destroyed(&mut self, _surface: ToplevelSurface) {
+        // A window went away without committing anything, so nothing else marks
+        // the output dirty: without this its pixels stay composited until the
+        // next ~1s scan forces a frame.
+        self.dirty = true;
+        self.wake();
+    }
+
+    fn popup_destroyed(&mut self, _surface: PopupSurface) {
+        self.dirty = true;
+        self.wake();
+    }
+
     fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
         surface.with_pending_state(|state| {
             let geometry = positioner.get_geometry();

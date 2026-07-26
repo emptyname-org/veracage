@@ -91,7 +91,7 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
         "--perms", "0700", "--tmpfs", f"/run/user/{uid}",
         "--bind", str(wayland_socket), f"/run/user/{uid}/wayland-0",
         # HOME is the workspace ROOT so open/save dialogs default to the volumes
-        # (each a folder under /vaults); the file manager also opens here, showing
+        # (each a directory under /vaults); the file manager also opens here, showing
         # every volume side by side. App config/cache/data go to an ephemeral tmpfs
         # (via XDG_*), so nothing app-generated is written into any volume. Files
         # the user saves under /vaults/<label> persist; a stray save to ~ itself
@@ -128,7 +128,7 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
     for fd, dest in seeds or ():
         argv += ["--file", str(fd), dest]
     if exchange is not None:
-        # The idmapped host<->vault shared folder (helper mounted it in this NS,
+        # The idmapped host<->vault shared directory (helper mounted it in this NS,
         # presented as veracage-owned). Bind it at /exchange - a top-level path,
         # NOT under /vaults, so the "everything in HOME is encrypted" invariant
         # holds. The underlying mount already carries nosuid,nodev,noexec.

@@ -151,7 +151,7 @@ In Kate (sandbox), copy text. Paste into Dolphin's address bar (also sandbox) -
 should work (both connect to the same compositor clipboard). Paste into a host
 editor - should fail.
 
-## Test 9: Exchange folder (host <-> volume file transfer)
+## Test 9: Shared directory (host <-> volume file transfer)
 
 `~/Veracage/Exchange` on the host is idmap-mounted into the sandbox at
 `/exchange`.

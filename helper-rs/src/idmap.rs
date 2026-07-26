@@ -26,7 +26,7 @@ const MOVE_MOUNT_F_EMPTY_PATH: libc::c_long = 4;
 const MOUNT_ATTR_IDMAP: u64 = 0x0010_0000;
 
 /// `nosuid,nodev,noexec` as a `mount_setattr` attr_set, pass as `extra_attr` for
-/// the exchange folder (a host-shared dir the sandbox can write, so it must never
+/// the shared directory (a host-shared dir the sandbox can write, so it must never
 /// carry setuid/device/executable semantics). The vault passes `0`.
 pub const ATTR_NOSUID_NODEV_NOEXEC: u64 = 0x2 | 0x4 | 0x8;
 

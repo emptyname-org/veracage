@@ -173,7 +173,7 @@ pub struct Config {
     pub ui_font: String,           // fonts::CHOICES key ("system" default = host)
     pub ui_font_size: String,      // "system" (host size) | a point size
     pub window_size: String,       // "default" | "max" | "<w>x<h>"
-    pub exchange: bool,            // host<->volume shared folder on/off
+    pub exchange: bool,            // host<->volume shared directory on/off
     pub exchange_dir: Option<String>,
     pub clip_clear: bool,          // auto-clear host clipboard after Copy out
     pub clip_clear_timeout: u32,   // seconds before the auto-clear fires

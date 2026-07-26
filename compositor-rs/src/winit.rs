@@ -37,20 +37,27 @@ smithay::backend::renderer::element::render_elements! {
 /// outside the damage tracker, so with a real buffer age the tracker must be
 /// told to re-render what lies beneath the overlay: where it paints this frame
 /// (egui blends, so stale pixels would shine through) and where it painted
-/// before (a closed menu must not linger). A fresh Id every frame covers both:
-/// the tracker damages a vanished element's old geometry and a new element's
-/// current one.
+/// before (a closed menu must not linger).
+///
+/// The id is STABLE across frames and the commit counter is bumped only when
+/// the toolbar's output can actually have changed (input on the strip, an egui
+/// animation, or the ~1s discovery scan). The tracker then damages the old and
+/// new geometry on a change (so a closed menu is repainted) and nothing at all
+/// on an unchanged frame, instead of re-rendering the whole strip on every
+/// frame an app's commit triggers.
 struct EguiDamage {
     id: smithay::backend::renderer::element::Id,
+    commit: smithay::backend::renderer::utils::CommitCounter,
     geometry: Rectangle<i32, smithay::utils::Physical>,
 }
 
 impl EguiDamage {
-    fn new(geometry: Rectangle<i32, smithay::utils::Physical>) -> Self {
-        Self {
-            id: smithay::backend::renderer::element::Id::new(),
-            geometry,
-        }
+    fn new(
+        id: smithay::backend::renderer::element::Id,
+        commit: smithay::backend::renderer::utils::CommitCounter,
+        geometry: Rectangle<i32, smithay::utils::Physical>,
+    ) -> Self {
+        Self { id, commit, geometry }
     }
 }
 
@@ -59,7 +66,7 @@ impl smithay::backend::renderer::element::Element for EguiDamage {
         &self.id
     }
     fn current_commit(&self) -> smithay::backend::renderer::utils::CommitCounter {
-        smithay::backend::renderer::utils::CommitCounter::default()
+        self.commit
     }
     fn src(&self) -> Rectangle<f64, smithay::utils::Buffer> {
         Rectangle::from_size(
@@ -194,6 +201,14 @@ pub fn init_winit(
     // Frames left to render with age 0 (full redraw) after a resize, while the
     // swapchain reallocates and reported buffer ages are unreliable (as anvil).
     let mut full_redraw: u8 = 0;
+    // Damage bookkeeping for the egui overlay (see EguiDamage): a stable id
+    // plus a counter bumped only when the toolbar's output can have changed.
+    let egui_id = smithay::backend::renderer::element::Id::new();
+    let mut egui_commit = smithay::backend::renderer::utils::CommitCounter::default();
+    let mut toolbar_changed = true;
+    // True while the pointer is on the toolbar strip or in an open menu, so a
+    // pointer move that leaves it still gets one frame to drop the highlight.
+    let mut strip_hot = false;
 
     // The backdrop IS the desktop: drawn first, behind every window. Themed:
     // light-gray under the light theme, near-black under dark.
@@ -211,6 +226,18 @@ pub fn init_winit(
     let backend = std::rc::Rc::new(std::cell::RefCell::new(backend));
     let backend_render = backend.clone();
 
+    // Let the parts of the compositor that mark the output dirty (client
+    // commits, input, window destruction) also ask winit for a frame, so the
+    // pacing timer can idle until the next scan instead of polling at 60 Hz.
+    // try_borrow: a failure means we are inside the render path, which is
+    // already producing the frame.
+    let backend_wake = backend.clone();
+    state.request_redraw = Some(std::rc::Rc::new(move || {
+        if let Ok(b) = backend_wake.try_borrow() {
+            b.window().request_redraw();
+        }
+    }));
+
     event_loop.handle().insert_source(winit, move |event, _, state| {
         match event {
             WinitEvent::Resized { size, scale_factor } => {
@@ -224,10 +251,30 @@ pub fn init_winit(
                     None,
                 );
                 full_redraw = 4;
+                state.dirty = true;
+                toolbar_changed = true; // the strip is re-laid out at the new width
+                state.wake();
             }
             WinitEvent::Input(event) => {
                 state.process_input_event(event);
-                state.dirty = true; // cursor/egui may need to repaint
+                // Input changes OUR output in only two ways: through the toolbar
+                // (hover highlight, open menu) and through the drag-and-drop
+                // ghost, which we composite AT the cursor so it must follow
+                // every motion. An app's response to a key or click arrives as a
+                // commit, which marks the output dirty itself. So repaint while
+                // the pointer is on the strip or in a menu (plus one frame after
+                // it leaves, so the highlight clears) or while a drag is live.
+                let hot = state.dnd_icon.is_some()
+                    || state
+                        .toolbar
+                        .as_ref()
+                        .is_some_and(|tb| tb.over_strip() || tb.wants_pointer());
+                if hot || strip_hot {
+                    state.dirty = true;
+                    toolbar_changed = true;
+                    state.wake();
+                }
+                strip_hot = hot;
             }
             WinitEvent::Redraw => {
                 let mut backend = backend_render.borrow_mut();
@@ -306,6 +353,9 @@ pub fn init_winit(
                         }
                     }
                     state.leaders_scan_at = now;
+                    // The scan can change what the strip shows (app list, font,
+                    // shortcut labels, notice), so treat it as a change.
+                    toolbar_changed = true;
                 }
                 // Run the toolbar UI (CPU only) BEFORE compositing: the region
                 // egui will paint goes to the damage tracker (as EguiDamage),
@@ -324,6 +374,32 @@ pub fn init_winit(
                 } else {
                     (crate::toolbar::ToolbarAction::None, None)
                 };
+
+                // Act on a menu selection BEFORE rendering: it needs no GL, so a
+                // frame that later fails to render must not swallow the click.
+                match action {
+                    crate::toolbar::ToolbarAction::ClipPush => {
+                        crate::clipboard::push_from_host(state)
+                    }
+                    crate::toolbar::ToolbarAction::ClipPull => {
+                        crate::clipboard::pull_to_host(state)
+                    }
+                    crate::toolbar::ToolbarAction::LaunchApp { sock, index } => {
+                        crate::toolbar::launch_app(&sock, index)
+                    }
+                    crate::toolbar::ToolbarAction::Command(verb) => {
+                        crate::toolbar::request_command(&verb)
+                    }
+                    crate::toolbar::ToolbarAction::CloseVolume(label) => {
+                        crate::toolbar::request_command(&format!("close-volume:{label}"))
+                    }
+                    crate::toolbar::ToolbarAction::Quit => state.loop_signal.stop(),
+                    crate::toolbar::ToolbarAction::None => {}
+                }
+                if toolbar_changed {
+                    egui_commit.increment();
+                    toolbar_changed = false;
+                }
 
                 // Re-render only what changed since this buffer was last drawn
                 // (its EGL buffer age). Right after a resize the age is forced
@@ -400,7 +476,11 @@ pub fn init_winit(
                         // The egui overlay's region, so the tracker re-renders
                         // beneath it (see EguiDamage).
                         if let Some(rect) = egui_rect {
-                            custom.push(HintElement::Egui(EguiDamage::new(rect)));
+                            custom.push(HintElement::Egui(EguiDamage::new(
+                                egui_id.clone(),
+                                egui_commit,
+                                rect,
+                            )));
                         }
                         smithay::desktop::space::render_output::<
                             _,
@@ -425,7 +505,14 @@ pub fn init_winit(
                 let res = match render_res {
                     Ok(res) => res,
                     Err(e) => {
+                        // Retry on the next frame: this one produced nothing, and
+                        // the toolbar output it ran is still pending (kept, not
+                        // dropped, by Toolbar::run).
                         tracing::warn!("render skipped this frame: {e}");
+                        state.dirty = true;
+                        toolbar_changed = true;
+                        drop(backend);
+                        state.wake();
                         return;
                     }
                 };
@@ -453,30 +540,12 @@ pub fn init_winit(
                         tb.paint((size.w, size.h));
                     }
                 }
-                match action {
-                    crate::toolbar::ToolbarAction::ClipPush => {
-                        crate::clipboard::push_from_host(state)
-                    }
-                    crate::toolbar::ToolbarAction::ClipPull => {
-                        crate::clipboard::pull_to_host(state)
-                    }
-                    crate::toolbar::ToolbarAction::LaunchApp { sock, index } => {
-                        crate::toolbar::launch_app(&sock, index)
-                    }
-                    crate::toolbar::ToolbarAction::Command(verb) => {
-                        crate::toolbar::request_command(&verb)
-                    }
-                    crate::toolbar::ToolbarAction::CloseVolume(label) => {
-                        crate::toolbar::request_command(&format!("close-volume:{label}"))
-                    }
-                    crate::toolbar::ToolbarAction::Quit => state.loop_signal.stop(),
-                    crate::toolbar::ToolbarAction::None => {}
-                }
 
                 // Keep rendering while egui is animating (menu fade, hover, the
                 // notice banner countdown): it asks for another frame.
                 if state.toolbar.as_ref().is_some_and(|tb| tb.wants_repaint()) {
                     state.dirty = true;
+                    toolbar_changed = true;
                 }
 
                 // Swap with the real damage: the host compositor recomposites
@@ -485,6 +554,9 @@ pub fn init_winit(
                 if let Some(damage) = res.damage {
                     if let Err(e) = backend.submit(Some(damage.as_slice())) {
                         tracing::warn!("submit skipped this frame: {e}");
+                        state.dirty = true;
+                        drop(backend);
+                        state.wake();
                         return;
                     }
                 }
@@ -501,6 +573,14 @@ pub fn init_winit(
                 state.space.refresh();
                 state.popups.cleanup();
                 let _ = state.display_handle.flush_clients();
+                // Another frame is already due (an egui animation, a lazily built
+                // toolbar): ask for it directly, since the pacing timer may be
+                // sleeping until the next scan. The backend borrow must go first,
+                // because request_redraw takes it again.
+                drop(backend);
+                if state.dirty {
+                    state.wake();
+                }
             }
             WinitEvent::CloseRequested => {
                 state.loop_signal.stop();
@@ -529,8 +609,22 @@ pub fn init_winit(
                 >= Duration::from_secs(1);
             if state.dirty || scan_due {
                 backend.borrow().window().request_redraw();
+                return TimeoutAction::ToDuration(Duration::from_millis(16));
             }
-            TimeoutAction::ToDuration(Duration::from_millis(16))
+            // Idle: nothing to draw, so sleep until the scan is due instead of
+            // waking 60 times a second (it keeps a laptop out of deep idle).
+            // A client commit, input, or a window closing wakes the loop on its
+            // own source and asks for the frame directly (State::wake), so this
+            // long sleep costs no latency.
+            let since = state
+                .start_time
+                .elapsed()
+                .saturating_sub(state.leaders_scan_at);
+            TimeoutAction::ToDuration(
+                Duration::from_secs(1)
+                    .saturating_sub(since)
+                    .max(Duration::from_millis(16)),
+            )
         })?;
 
     Ok(())

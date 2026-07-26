@@ -35,12 +35,28 @@ struct Shortcuts {
     cfg: config::Config,
     /// The action currently capturing a new combo, if any.
     capturing: Option<String>,
+    /// True while OUR sentinel is on the host clipboard, so it is removed again
+    /// on every exit path. The user's own clipboard is never seeded over.
+    seeded_clipboard: bool,
     status: String,
 }
 
 impl Shortcuts {
     fn new() -> Self {
-        Self { cfg: config::load(), capturing: None, status: String::new() }
+        Self {
+            cfg: config::load(),
+            capturing: None,
+            seeded_clipboard: false,
+            status: String::new(),
+        }
+    }
+
+    /// Drop our sentinel from the host clipboard, if we put one there.
+    fn unseed_clipboard(&mut self) {
+        if self.seeded_clipboard {
+            clear_clipboard();
+            self.seeded_clipboard = false;
+        }
     }
 
     fn bind(&self, action: &str) -> String {
@@ -88,9 +104,23 @@ fn combo_from(mods: egui::Modifiers, key: egui::Key) -> Option<String> {
     Some(s)
 }
 
-/// Clear the host clipboard, removing the sentinel that capture seeds to make
-/// Ctrl+V's Paste event fire. Best-effort, so a headless/odd clipboard can't
-/// break the configurator.
+/// Placeholder text put on an EMPTY host clipboard while capturing, so egui
+/// delivers the Paste event that carries Ctrl+V. Removed again on every exit.
+const SENTINEL: &str = "Veracage";
+
+/// True if the host clipboard already has text. egui only delivers a Paste event
+/// when it does, so this decides whether capture needs a sentinel at all. Errors
+/// read as "no text", the conservative answer (we seed and clean up after).
+fn host_clipboard_has_text() -> bool {
+    match arboard::Clipboard::new() {
+        Ok(mut cb) => cb.get_text().is_ok_and(|t| !t.is_empty()),
+        Err(_) => false,
+    }
+}
+
+/// Remove the sentinel this dialog put on the host clipboard. Best-effort, so a
+/// headless/odd clipboard can't break the configurator. Only ever called when we
+/// seeded it: the user's own clipboard contents are left untouched.
 fn clear_clipboard() {
     if let Ok(mut cb) = arboard::Clipboard::new() {
         let _ = cb.clear();
@@ -132,11 +162,11 @@ impl eframe::App for Shortcuts {
                 Some(Some(combo)) => {
                     self.cfg.shortcuts.insert(action, combo);
                     self.capturing = None;
-                    clear_clipboard();
+                    self.unseed_clipboard();
                 }
                 Some(None) => {
                     self.capturing = None; // cancelled
-                    clear_clipboard();
+                    self.unseed_clipboard();
                 }
                 None => {}
             }
@@ -168,11 +198,16 @@ impl eframe::App for Shortcuts {
                     if ui.add(btn).clicked() {
                         self.capturing = Some((*action).to_string());
                         // egui only emits a Paste event when the clipboard has
-                        // content, so with an empty clipboard Ctrl+V yields no
+                        // content, so with an EMPTY clipboard Ctrl+V yields no
                         // event and the key is uncapturable (Copy always fires,
                         // which is why Ctrl+Shift+C worked but Ctrl+Shift+V did
-                        // not). Seed the clipboard so a paste is always delivered.
-                        ui.ctx().output_mut(|o| o.copied_text = "Veracage".to_string());
+                        // not). Seed a sentinel only in that case: overwriting a
+                        // clipboard the user filled (a passphrase, say) would
+                        // destroy it, and text already there makes Paste fire.
+                        if !host_clipboard_has_text() {
+                            ui.ctx().output_mut(|o| o.copied_text = SENTINEL.to_string());
+                            self.seeded_clipboard = true;
+                        }
                     }
                     ui.add_space(16.0);
                 }
@@ -181,17 +216,27 @@ impl eframe::App for Shortcuts {
                 }
             });
 
+        // Exiting mid-capture must not leave the sentinel behind for the user to
+        // paste later, so clean up before every exit (and on the window close,
+        // via on_exit).
         if do_cancel {
+            self.unseed_clipboard();
             std::process::exit(0);
         }
         if do_save {
             match config::save(&self.cfg) {
                 Ok(_) => {
                     crate::broker::publish_shortcuts(&self.cfg);
+                    self.unseed_clipboard();
                     std::process::exit(0);
                 }
                 Err(e) => self.status = format!("Save failed: {e}"),
             }
         }
+    }
+
+    /// Window closed (titlebar X / compositor): same cleanup as Save and Cancel.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.unseed_clipboard();
     }
 }
