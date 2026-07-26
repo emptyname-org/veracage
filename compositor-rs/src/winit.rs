@@ -473,11 +473,26 @@ pub fn init_winit(
                         state.cursor_status = CursorImageStatus::default_named();
                     }
                 }
-                let cursor_visible = !matches!(state.cursor_status, CursorImageStatus::Surface(_));
+                // Hide the host cursor ONLY when the client's own cursor surface
+                // really has something to draw. Hiding it whenever a client asked
+                // for a surface left NO cursor at all whenever that surface had no
+                // usable buffer - a sandboxed app whose cursor theme did not load,
+                // for instance - which is how the resize cursors vanished.
+                let client_cursor_ready = match &state.cursor_status {
+                    CursorImageStatus::Surface(surface) => {
+                        surface.alive()
+                            && smithay::backend::renderer::utils::with_renderer_surface_state(
+                                surface,
+                                |st| st.buffer().is_some(),
+                            )
+                            .unwrap_or(false)
+                    }
+                    _ => false,
+                };
                 if let CursorImageStatus::Named(icon) = state.cursor_status {
                     backend.window().set_cursor(icon.into());
                 }
-                backend.window().set_cursor_visible(cursor_visible);
+                backend.window().set_cursor_visible(!client_cursor_ready);
 
                 // A transient EGL/GL error (context loss, host-resize race, GL OOM)
                 // must skip the frame, not abort the compositor and every app.
@@ -517,9 +532,12 @@ pub fn init_winit(
                         let mut custom: Vec<HintElement<GlesRenderer>> =
                             dnd.into_iter().map(HintElement::Surface).collect();
                         // A client-drawn cursor surface, composited at the pointer
-                        // minus its hotspot (anvil's cursor path). The host cursor
-                        // is hidden above while this is what we draw.
-                        if let CursorImageStatus::Surface(surface) = state.cursor_status.clone() {
+                        // minus its hotspot (anvil's cursor path). Only when it has
+                        // a buffer, which is also when the host cursor was hidden
+                        // above - so there is always exactly one cursor on screen.
+                        if let (true, CursorImageStatus::Surface(surface)) =
+                            (client_cursor_ready, state.cursor_status.clone())
+                        {
                             let hotspot = smithay::wayland::compositor::with_states(
                                 &surface,
                                 |states| {

@@ -92,54 +92,25 @@ pub struct Toolbar {
     /// composited: tessellated primitives, texture updates, pixels per point.
     pending: Option<(Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32)>,
     /// Set while something slow is happening (unlocking a volume, an app
-    /// starting): a bare spinner is drawn centred over everything. The text is
-    /// not shown, it only names the note in the debug log.
+    /// starting): the spinner artwork is drawn centred over everything. The text
+    /// is not shown, it only names the note in the debug log.
     status: Option<String>,
+    /// The spinner artwork, uploaded once. None if it failed to decode, in which
+    /// case the status shows egui's plain spinner instead of nothing.
+    spinner: Option<egui::TextureHandle>,
     /// A transient user-facing banner (e.g. a failed launch a leader reported),
     /// with the instant it was set. Cleared after NOTICE_TTL.
     notice: Option<(String, std::time::Instant)>,
 }
 
-/// The progress spinner: overall diameter and stroke width in logical points,
-/// how many spokes the ring has, and how long the head takes to go round.
+/// The progress spinner artwork (Icons/spinner.png): a ring of 24 spokes with a
+/// fading tail. Animated by rotating it one spoke at a time.
+const SPINNER_PNG: &[u8] = include_bytes!("../../Icons/spinner.png");
+/// Displayed diameter in logical points, spokes in the artwork, and the time for
+/// the head to travel all the way round.
 const SPINNER_DIAMETER: f32 = 56.0;
-const SPINNER_STROKE: f32 = 5.0;
-const SPINNER_SPOKES: usize = 12;
-const SPINNER_TURN: f32 = 1.0;
-/// Veracage turquoise, the same accent the dialogs use (theme::ACCENT).
-const SPINNER_ACCENT: egui::Color32 = egui::Color32::from_rgb(0x21, 0x9e, 0x96);
-
-/// The progress spinner: a ring of short radial strokes, brightest at the head
-/// and fading backwards around the circle, with the head stepping from spoke to
-/// spoke. The classic throbber, rather than egui's single sweeping arc.
-fn draw_spinner(ui: &mut egui::Ui, diameter: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
-    if !ui.is_rect_visible(rect) {
-        return;
-    }
-    // Keep asking for frames: this animation IS the progress indication.
-    ui.ctx().request_repaint();
-    let center = rect.center();
-    let outer = diameter * 0.5;
-    let inner = outer * 0.52;
-    // The head advances one spoke at a time, so it ticks round like a throbber
-    // instead of sliding.
-    let head = (ui.input(|i| i.time) as f32 * SPINNER_SPOKES as f32 / SPINNER_TURN).floor() as i32;
-    let painter = ui.painter();
-    for spoke in 0..SPINNER_SPOKES {
-        // 0 for the head, counting backwards around the ring.
-        let age = (spoke as i32 - head).rem_euclid(SPINNER_SPOKES as i32) as f32;
-        let fade = 1.0 - age / SPINNER_SPOKES as f32;
-        // Start at the top and go clockwise, as these things do.
-        let angle = std::f32::consts::TAU * (spoke as f32 / SPINNER_SPOKES as f32)
-            - std::f32::consts::FRAC_PI_2;
-        let dir = egui::vec2(angle.cos(), angle.sin());
-        painter.line_segment(
-            [center + dir * inner, center + dir * outer],
-            egui::Stroke::new(SPINNER_STROKE, SPINNER_ACCENT.gamma_multiply(fade)),
-        );
-    }
-}
+const SPINNER_SPOKES: u32 = 24;
+const SPINNER_TURN: f32 = 1.2;
 
 /// How long a transient toolbar notice (e.g. a failed-launch banner) stays up.
 const NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(6);
@@ -171,7 +142,12 @@ pub fn hint_icon_pos(w_logical: i32, h_logical: i32) -> (i32, i32) {
 /// Decode the embedded icon PNG to (width, height, straight-alpha RGBA bytes),
 /// for the smithay memory buffer that draws the desktop hint icon.
 pub fn decode_icon_rgba() -> Option<(u32, u32, Vec<u8>)> {
-    let mut reader = png::Decoder::new(std::io::Cursor::new(DESKTOP_ICON_PNG)).read_info().ok()?;
+    decode_png_rgba(DESKTOP_ICON_PNG)
+}
+
+/// Decode 8-bit RGB/RGBA PNG bytes to (width, height, straight-alpha RGBA).
+fn decode_png_rgba(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().ok()?;
     let mut buf = vec![0u8; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut buf).ok()?;
     if info.bit_depth != png::BitDepth::Eight {
@@ -259,6 +235,7 @@ impl Toolbar {
             menu_icons,
             pending: None,
             status: None,
+            spinner: None,
             notice: None,
         })
     }
@@ -428,6 +405,20 @@ impl Toolbar {
         let icons = &self.icons;
         let name_to_key = &self.name_to_key;
         let menu_icons = &self.menu_icons;
+        // Upload the spinner artwork once (needs the egui context, so not in
+        // `new`, which runs before the first frame).
+        if self.spinner.is_none() {
+            if let Some((w, h, rgba)) = decode_png_rgba(SPINNER_PNG) {
+                let image =
+                    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                self.spinner = Some(self.ctx.load_texture(
+                    "veracage-spinner",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+        let spinner = self.spinner.clone();
         let notice = &self.notice;
         let status = self.status.as_deref();
         let dark = self.dark;
@@ -571,7 +562,31 @@ impl Toolbar {
                     .order(egui::Order::Foreground)
                     .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                     .interactable(false)
-                    .show(ctx, |ui| draw_spinner(ui, SPINNER_DIAMETER));
+                    .show(ctx, |ui| {
+                        // Keep asking for frames: the rotation IS the progress
+                        // indication.
+                        ui.ctx().request_repaint();
+                        match &spinner {
+                            Some(tex) => {
+                                // One spoke per step, so the artwork's own spokes
+                                // land on each other rather than smearing.
+                                let step = (ui.input(|i| i.time) as f32
+                                    * SPINNER_SPOKES as f32
+                                    / SPINNER_TURN)
+                                    .floor();
+                                let angle = step * std::f32::consts::TAU / SPINNER_SPOKES as f32;
+                                let image = egui::Image::from_texture(egui::load::SizedTexture::new(
+                                    tex.id(),
+                                    egui::vec2(SPINNER_DIAMETER, SPINNER_DIAMETER),
+                                ))
+                                .rotate(angle, egui::Vec2::splat(0.5));
+                                ui.add(image);
+                            }
+                            None => {
+                                ui.add(egui::Spinner::new().size(SPINNER_DIAMETER));
+                            }
+                        }
+                    });
             }
 
             // Transient banner (e.g. a leader-reported failed launch), floating
@@ -1086,6 +1101,26 @@ mod tests {
     use super::*;
 
     const HOUR_NS: u128 = 3_600_000_000_000;
+
+    #[test]
+    fn spinner_artwork_decodes_as_a_square_ring() {
+        // The art is compiled in (Icons/spinner.png) and is meant to be swapped
+        // freely, so check the properties the drawing relies on rather than exact
+        // pixels: square, sensibly sized, transparent in the corners (it is a
+        // ring, and it gets rotated about its centre) and actually inked.
+        let (w, h, rgba) = decode_png_rgba(SPINNER_PNG).expect("spinner art must decode");
+        assert_eq!(w, h, "the spinner is rotated about its centre, so it must be square");
+        assert!((64..=2048).contains(&w), "unexpected spinner size {w}");
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
+        let alpha_at = |x: u32, y: u32| rgba[((y * w + x) * 4 + 3) as usize];
+        for (x, y) in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
+            assert_eq!(alpha_at(x, y), 0, "corner {x},{y} should be transparent");
+        }
+        let inked = rgba.chunks_exact(4).filter(|p| p[3] > 32).count();
+        assert!(inked > (w * h / 20) as usize, "only {inked} inked pixels");
+        // A ring: the exact centre is empty.
+        assert_eq!(alpha_at(w / 2, h / 2), 0, "the middle of the ring should be clear");
+    }
 
     #[test]
     fn broker_status_wins_and_is_never_expired() {
