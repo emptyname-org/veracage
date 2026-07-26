@@ -360,24 +360,26 @@ pub fn init_winit(
             }
             WinitEvent::Input(event) => {
                 state.process_input_event(event);
-                // Input changes OUR output in only two ways: through the toolbar
-                // (hover highlight, open menu) and through the drag-and-drop
-                // ghost, which we composite AT the cursor so it must follow
-                // every motion. An app's response to a key or click arrives as a
-                // commit, which marks the output dirty itself. So repaint while
-                // the pointer is on the strip or in a menu (plus one frame after
-                // it leaves, so the highlight clears) or while a drag is live.
+                // ALWAYS repaint on input. It is tempting to repaint only when the
+                // toolbar or a drag is involved, since an app's response to a key
+                // or click comes back as a commit - but plenty of compositor state
+                // moves with the pointer and commits nothing: a window drag
+                // (move_grab maps the element at the new position), an interactive
+                // resize, a popup grab. Gating input cost us those: dragging a
+                // window only repainted when the discovery scan happened to fire.
+                state.dirty = true;
+                // The toolbar's own pixels change only when the strip is involved,
+                // so its damage region is re-reported only then (see EguiDamage).
                 let hot = state.dnd_icon.is_some()
                     || state
                         .toolbar
                         .as_ref()
                         .is_some_and(|tb| tb.over_strip() || tb.wants_pointer());
                 if hot || strip_hot {
-                    state.dirty = true;
                     state.toolbar_changed = true;
-                    state.wake();
                 }
                 strip_hot = hot;
+                state.wake();
             }
             WinitEvent::Redraw => {
                 let mut backend = backend_render.borrow_mut();
@@ -673,7 +675,7 @@ pub fn init_winit(
             // spinning; a client commit, input, a closing window or the scan
             // timer each wake the loop on their own source and ask for the
             // frame directly (State::wake), so nothing waits on this tick.
-            TimeoutAction::ToDuration(Duration::from_millis(100))
+            TimeoutAction::ToDuration(Duration::from_millis(250))
         })?;
 
     // Discovery scan on its own timer: it is pure file polling, so it must not

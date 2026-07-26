@@ -507,22 +507,6 @@ impl Toolbar {
                                 ui.close_menu();
                             }
                         });
-                        // Progress note at the far end of the strip: unlocking a
-                        // volume is seconds of key derivation, and an app takes a
-                        // moment to show its window. The spinner animates, which
-                        // keeps asking for frames until the note clears.
-                        if let Some(text) = status {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.add(egui::Spinner::new().size(14.0));
-                                    ui.label(
-                                        egui::RichText::new(text)
-                                            .color(ui.visuals().weak_text_color()),
-                                    );
-                                },
-                            );
-                        }
                     });
                 });
 
@@ -567,6 +551,29 @@ impl Toolbar {
                             egui::FontId::proportional(16.0),
                             small,
                         );
+                    });
+            }
+
+            // Progress note, floating just under the toolbar: unlocking a volume
+            // is seconds of key derivation, and an app then takes a moment to put
+            // its window up, both with nothing else to see. Top-centre so it is
+            // visible whether the backdrop or an app window is underneath (the
+            // notice banner has the bottom to itself), and non-interactive so it
+            // never eats a click. The spinner animates, which keeps asking for
+            // frames until the note clears.
+            if let Some(text) = status {
+                egui::Area::new(egui::Id::new("veracage_status"))
+                    .order(egui::Order::Foreground)
+                    .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, height + 14.0))
+                    .interactable(false)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Spinner::new().size(16.0));
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new(text).size(base));
+                            });
+                        });
                     });
             }
 
