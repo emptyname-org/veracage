@@ -430,7 +430,7 @@ fn sanitize_label(label: &str, source: &Path) -> String {
         .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
         .collect();
     s.truncate(64);
-    let trimmed = s.trim_matches(['.', '_', '-']);
+    let trimmed = s.trim_matches(|c| matches!(c, '.' | '_' | '-'));
     if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
         return format!("vault-{}", vault_hash(source));
     }
@@ -609,7 +609,10 @@ fn verify_session_leader(sid: &str, vault_uid: u32) -> Option<i32> {
 /// graceful in-helper teardown. Returns true iff every dm is now gone.
 fn close_all_session_dms(sid: &str) -> bool {
     let path = format!("/run/veracage/session-{sid}.lock");
-    let Ok(body) = std::fs::read_to_string(&path) else { return true };
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(_) => return true, // no lock: nothing recorded to close
+    };
     let mut all_ok = true;
     for line in body.lines() {
         if let Some(v) = line.strip_prefix("volume=") {
@@ -647,7 +650,10 @@ fn dm_at_mountpoint(mp: &str) -> Option<String> {
 /// lock is on the shared root fs, so this works from inside the leader's NS too.
 fn session_lock_remove(sid: &str, dm_name: &str) {
     let path = format!("/run/veracage/session-{sid}.lock");
-    let Ok(body) = std::fs::read_to_string(&path) else { return };
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(_) => return,
+    };
     let kept: String = body
         .lines()
         .filter(|l| {
@@ -823,7 +829,11 @@ fn install_signal_forwarding(pid: i32) {
     CHILD_PID.store(pid, Ordering::SeqCst);
     for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         unsafe {
-            libc::signal(sig, forward_signal as usize as libc::sighandler_t);
+            // `sighandler_t` is an integer, and casting a function straight to
+            // one is what `function_casts_as_integer` warns about (the function
+            // item has no address until it becomes a pointer). Take the address
+            // first, then convert that: keep the `*const ()` hop.
+            libc::signal(sig, forward_signal as *const () as libc::sighandler_t);
         }
     }
 }
@@ -856,11 +866,12 @@ fn wait_for(pid: i32) -> i32 {
 /// read-only). `-o export` prints `KEY=value` lines, so a missing key is simply
 /// absent rather than an unlabelled empty line.
 fn probe_fs(dm_path: &str) -> (Option<String>, Option<String>) {
-    let Ok(out) = Command::new(tool("blkid"))
+    let probe = Command::new(tool("blkid"))
         .args(["-p", "-o", "export", dm_path])
-        .output()
-    else {
-        return (None, None);
+        .output();
+    let out = match probe {
+        Ok(out) => out,
+        Err(_) => return (None, None),
     };
     let mut label = None;
     let mut fstype = None;
@@ -891,7 +902,7 @@ fn sanitized(raw: &str) -> Option<String> {
 /// `--exchange /etc`); a symlink to another of the human's OWN dirs is harmless
 /// (their own data, and a same-uid attacker already has it).
 fn validated_exchange(path: &str, human_uid: u32) -> Option<PathBuf> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::MetadataExt;   // OpenOptionsExt is imported at the top
     let f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -1339,15 +1350,18 @@ fn write_launch_request(sid: &str, spec: &str, vault_uid: u32, vault_gid: u32) {
     // Unlink any leftover from a crashed open first: remove_file acts on the
     // NAME, so it drops a planted symlink rather than following it.
     let _ = std::fs::remove_file(&path);
-    let file = std::fs::OpenOptions::new()
+    let opened = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&path);
-    let Ok(mut file) = file else {
-        eprintln!("veracage-helper: launch request not written (no app auto-launched)");
-        return;
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(_) => {
+            eprintln!("veracage-helper: launch request not written (no app auto-launched)");
+            return;
+        }
     };
     use std::io::Write;
     if file.write_all(spec.as_bytes()).is_err() {

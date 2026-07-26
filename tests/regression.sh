@@ -31,12 +31,17 @@ have(){ command -v "$1" >/dev/null 2>&1; }
 
 # ---------------------------------------------------------------- rust ------
 c_helper() { # privilege helper: pinned to DISTRO rustc (1.63 on Debian 12).
-  # Use distro cargo explicitly, not the rustup on PATH - else we'd mask MSRV
-  # breakage the helper would hit on its target platform.
-  local cargo=/usr/bin/cargo
+  # Pin BOTH the distro cargo and the distro rustc. cargo resolves `rustc` from
+  # PATH, which this script prepends rustup to, so pinning cargo alone quietly
+  # tested the rustup toolchain and masked exactly the MSRV breakage this check
+  # exists to catch (it did: four `let...else` and a char-array `trim_matches`
+  # reached the tree unnoticed).
+  local cargo=/usr/bin/cargo rustc=/usr/bin/rustc
   [ -x "$cargo" ] || cargo="$(command -v cargo)"
+  [ -x "$rustc" ] || rustc="$(command -v rustc)"
   [ -n "$cargo" ] || { echo "no cargo"; return 2; }
-  "$cargo" test --manifest-path helper-rs/Cargo.toml
+  echo "helper toolchain: $("$rustc" --version 2>/dev/null || echo unknown)"
+  RUSTC="$rustc" "$cargo" test --manifest-path helper-rs/Cargo.toml
 }
 c_compositor_build() {
   have make || { echo "no make"; return 2; }
