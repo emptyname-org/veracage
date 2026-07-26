@@ -147,10 +147,18 @@ pub struct State {
     /// like the app windows and backdrop.
     pub hint_icon: Option<smithay::backend::renderer::element::memory::MemoryRenderBuffer>,
 
-    /// The launch progress note being shown: its stamp plus how many windows were
-    /// mapped when it arrived. The note clears when the count rises above that,
-    /// i.e. when the app being launched puts ITS window up.
-    pub status_baseline: Option<(u64, usize)>,
+    /// The launch progress note being tracked (see toolbar::LaunchNote): it
+    /// finishes when the launching app maps its own window, and stays finished.
+    pub status_note: Option<crate::toolbar::LaunchNote>,
+
+    /// What the focused client wants the cursor to look like. Applied every frame in
+    /// winit.rs: a named shape goes to the host window, a surface is composited
+    /// by us at the pointer. Without this the cursor never changed shape, which
+    /// is why window borders were so hard to grab.
+    pub cursor_status: smithay::input::pointer::CursorImageStatus,
+
+    /// Per-window drop shadows (scenefx's shader; see shadow.rs).
+    pub shadows: crate::shadow::Shadows,
 
     /// Debug counters, reported once a second when `VERACAGE_DEBUG=1`: frames
     /// rendered and buffers submitted since the last report (a frame with no
@@ -272,7 +280,9 @@ impl State {
             toolbar_failed: false,
             dnd_icon: None,
             hint_icon: build_hint_icon(),
-            status_baseline: None,
+            cursor_status: smithay::input::pointer::CursorImageStatus::default_named(),
+            shadows: Default::default(),
+            status_note: None,
             frames: 0,
             submits: 0,
             debug_logged_at: std::time::Duration::ZERO,

@@ -100,6 +100,50 @@ pub struct Toolbar {
     notice: Option<(String, std::time::Instant)>,
 }
 
+/// The progress spinner's outer diameter and ring thickness, in logical points,
+/// plus how long one turn takes.
+const SPINNER_DIAMETER: f32 = 56.0;
+const SPINNER_STROKE: f32 = 6.0;
+const SPINNER_TURN: f32 = 1.1;
+/// Veracage turquoise, the same accent the dialogs use (theme::ACCENT).
+const SPINNER_ACCENT: egui::Color32 = egui::Color32::from_rgb(0x21, 0x9e, 0x96);
+
+/// The progress spinner: a full ring in a faint neutral, with a bright arc
+/// travelling around it. Drawn from egui primitives rather than
+/// `egui::Spinner`, which offers only the arc and no track.
+fn draw_spinner(ui: &mut egui::Ui, diameter: f32, dark: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    // Keep asking for frames: this animation IS the progress indication.
+    ui.ctx().request_repaint();
+    let center = rect.center();
+    let radius = (diameter - SPINNER_STROKE) * 0.5;
+    let track = if dark {
+        egui::Color32::from_white_alpha(38)
+    } else {
+        egui::Color32::from_black_alpha(38)
+    };
+    let painter = ui.painter();
+    painter.circle_stroke(center, radius, egui::Stroke::new(SPINNER_STROKE, track));
+
+    // One arc, a bit under a third of the ring, going round once per SPINNER_TURN.
+    const ARC_RADIANS: f32 = 1.9;
+    const SEGMENTS: usize = 24;
+    let start = ui.input(|i| i.time) as f32 * std::f32::consts::TAU / SPINNER_TURN;
+    let points: Vec<egui::Pos2> = (0..=SEGMENTS)
+        .map(|i| {
+            let angle = start + ARC_RADIANS * (i as f32 / SEGMENTS as f32);
+            center + radius * egui::vec2(angle.cos(), angle.sin())
+        })
+        .collect();
+    painter.add(egui::Shape::line(
+        points,
+        egui::Stroke::new(SPINNER_STROKE, SPINNER_ACCENT),
+    ));
+}
+
 /// How long a transient toolbar notice (e.g. a failed-launch banner) stays up.
 const NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(6);
 
@@ -570,9 +614,7 @@ impl Toolbar {
                     .order(egui::Order::Foreground)
                     .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                     .interactable(false)
-                    .show(ctx, |ui| {
-                        ui.add(egui::Spinner::new().size(56.0));
-                    });
+                    .show(ctx, |ui| draw_spinner(ui, SPINNER_DIAMETER, dark));
             }
 
             // Transient banner (e.g. a leader-reported failed launch), floating
@@ -766,10 +808,19 @@ const NOTICE_FILE: &str = "notice";
 /// just-launched app has no window yet). The broker deletes its file when the
 /// open finishes; the leader's note cannot know when the app's window appears, so
 /// it is dropped here once a window is mapped or after LAUNCH_STATUS_TTL.
+/// A leader's launch note as the compositor tracks it: which note (its stamp),
+/// how many windows were mapped when it arrived, and whether it is finished.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LaunchNote {
+    stamp: u64,
+    windows_at_arrival: usize,
+    done: bool,
+}
+
 pub fn scan_status(
     windows_now: usize,
-    baseline: Option<(u64, usize)>,
-) -> (Option<String>, Option<(u64, usize)>) {
+    note: Option<LaunchNote>,
+) -> (Option<String>, Option<LaunchNote>) {
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -778,13 +829,12 @@ pub fn scan_status(
         read_status_line(&std::path::Path::new(PUB_DIR).join("status")),
         read_status_line(&std::path::Path::new(RUNTIME_DIR).join("status")),
         windows_now,
-        baseline,
+        note,
         now_ns,
     )
 }
 
-/// Which note to show, and the launch-note baseline to remember. Pure, so it is
-/// unit-tested.
+/// Which note to show, and the note state to remember. Pure, so it is unit-tested.
 ///
 /// The broker's note wins and is trusted to be current: it is deleted when the
 /// open finishes. A leader's launch note ("Starting Kate") cannot know when the
@@ -795,25 +845,31 @@ fn pick_status(
     from_broker: Option<(u64, String)>,
     from_leader: Option<(u64, String)>,
     windows_now: usize,
-    baseline: Option<(u64, usize)>,
+    note: Option<LaunchNote>,
     now_ns: u128,
-) -> (Option<String>, Option<(u64, usize)>) {
+) -> (Option<String>, Option<LaunchNote>) {
     if let Some((_, text)) = from_broker {
-        return (Some(text), baseline);
+        return (Some(text), note);
     }
     let Some((stamp_ns, text)) = from_leader else {
         return (None, None);
     };
     // A note we have not seen before: remember how many windows were up when it
-    // arrived, so the app's OWN window is what clears it.
-    let (stamp, windows_at_arrival) = match baseline {
-        Some(b) if b.0 == stamp_ns => b,
-        _ => (stamp_ns, windows_now),
+    // arrived, so the app's OWN window is what finishes it.
+    let mut note = match note {
+        Some(n) if n.stamp == stamp_ns => n,
+        _ => LaunchNote { stamp: stamp_ns, windows_at_arrival: windows_now, done: false },
     };
-    let expired =
-        now_ns.saturating_sub(stamp_ns as u128) >= LAUNCH_STATUS_TTL.as_nanos();
-    let shown = windows_now <= windows_at_arrival && !expired;
-    (shown.then_some(text), Some((stamp, windows_at_arrival)))
+    // Finished notes stay finished. The leader has no way to delete its file when
+    // the window appears, so without this a note that already did its job came
+    // back the moment the window count dropped again - closing a window brought
+    // the spinner back and left it turning until the note expired.
+    if windows_now > note.windows_at_arrival
+        || now_ns.saturating_sub(stamp_ns as u128) >= LAUNCH_STATUS_TTL.as_nanos()
+    {
+        note.done = true;
+    }
+    ((!note.done).then_some(text), Some(note))
 }
 
 /// A status file's one line: `<text>` (broker) or `<stamp_ns>\t<text>` (leader).
@@ -1095,40 +1151,57 @@ mod tests {
     }
 
     #[test]
-    fn launch_note_clears_when_that_app_maps_its_own_window() {
-        // Regression: the note used to be hidden whenever ANY window existed, so
-        // launching a second app showed no progress at all. What clears it is the
-        // window COUNT rising above what it was when the note arrived.
+    fn launch_note_ends_when_that_app_maps_its_window_and_stays_ended() {
+        // The note is shown until the window COUNT rises above what it was when
+        // the note arrived, so launching a second app still shows progress. And
+        // once finished it must STAY finished: it used to come back when the count
+        // dropped again, so closing a window revived the spinner (bug report).
         let leader = Some((HOUR_NS as u64, "Starting Kate".to_string()));
-        // One app already open: the note still shows, with baseline 1 remembered.
-        let (shown, base) = pick_status(None, leader.clone(), 1, None, HOUR_NS);
+        // One app already open when the note arrives: show it, remember baseline 1.
+        let (shown, note) = pick_status(None, leader.clone(), 1, None, HOUR_NS);
         assert_eq!(shown, Some("Starting Kate".to_string()));
-        assert_eq!(base, Some((HOUR_NS as u64, 1)));
-        // Still only that one window: keep showing it.
-        let (shown, base) = pick_status(None, leader.clone(), 1, base, HOUR_NS);
+        // Still one window: keep showing.
+        let (shown, note) = pick_status(None, leader.clone(), 1, note, HOUR_NS);
         assert_eq!(shown, Some("Starting Kate".to_string()));
-        // Kate's window maps (count 2 > baseline 1): the note is done.
-        let (shown, _) = pick_status(None, leader, 2, base, HOUR_NS);
+        // Kate's window maps: done.
+        let (shown, note) = pick_status(None, leader.clone(), 2, note, HOUR_NS);
+        assert_eq!(shown, None);
+        // A window closes, count back to 1 - and even to 0: still done.
+        let (shown, note) = pick_status(None, leader.clone(), 1, note, HOUR_NS);
+        assert_eq!(shown, None);
+        let (shown, _) = pick_status(None, leader, 0, note, HOUR_NS);
         assert_eq!(shown, None);
     }
 
     #[test]
     fn launch_note_expires_so_the_spinner_cannot_spin_forever() {
         // An app that never maps a window (crashed, or window-less) must not leave
-        // the strip spinning, and neither must a file left by an earlier session.
+        // the spinner turning, and neither must a file left by an earlier session.
         let stamp = HOUR_NS as u64;
         let leader = Some((stamp, "Starting Dolphin".to_string()));
-        let base = Some((stamp, 0));
         let inside = HOUR_NS + LAUNCH_STATUS_TTL.as_nanos() - 1;
         let outside = HOUR_NS + LAUNCH_STATUS_TTL.as_nanos();
-        assert!(pick_status(None, leader.clone(), 0, base, inside).0.is_some());
-        assert_eq!(pick_status(None, leader, 0, base, outside).0, None);
+        let (shown, note) = pick_status(None, leader.clone(), 0, None, inside);
+        assert!(shown.is_some());
+        let (shown, _) = pick_status(None, leader, 0, note, outside);
+        assert_eq!(shown, None);
     }
 
     #[test]
-    fn no_note_forgets_the_baseline() {
-        // Nothing published: the next note starts its own baseline afresh.
-        assert_eq!(pick_status(None, None, 2, Some((1, 0)), HOUR_NS), (None, None));
+    fn a_new_note_starts_fresh_after_the_previous_one_finished() {
+        // Launching another app publishes a new stamp, which must show again even
+        // though the previous note was finished.
+        let first = Some((HOUR_NS as u64, "Starting Kate".to_string()));
+        let (_, note) = pick_status(None, first.clone(), 0, None, HOUR_NS);
+        let (_, note) = pick_status(None, first, 1, note, HOUR_NS); // finished
+        let second = Some((HOUR_NS as u64 + 5, "Starting Dolphin".to_string()));
+        let (shown, _) = pick_status(None, second, 1, note, HOUR_NS + 5);
+        assert_eq!(shown, Some("Starting Dolphin".to_string()));
+    }
+
+    #[test]
+    fn no_note_published_forgets_the_previous_one() {
+        assert_eq!(pick_status(None, None, 2, None, HOUR_NS), (None, None));
     }
 
     #[test]

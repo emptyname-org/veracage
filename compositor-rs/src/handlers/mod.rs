@@ -35,7 +35,15 @@ impl SeatHandler for State {
         &mut self.seat_state
     }
 
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: smithay::input::pointer::CursorImageStatus) {}
+    /// A client asked for a cursor shape or image. We KEEP it (anvil does the
+    /// same): ignoring it left the host's plain arrow over everything, so a
+    /// window's resize edges gave no feedback at all. `winit.rs` either hands a
+    /// named shape to the host window or composites the client's cursor surface.
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: smithay::input::pointer::CursorImageStatus) {
+        self.cursor_status = image;
+        self.dirty = true;
+        self.wake();
+    }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         let dh = &self.display_handle;

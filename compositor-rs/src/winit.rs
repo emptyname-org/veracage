@@ -15,6 +15,9 @@ use smithay::{
     utils::{IsAlive, Rectangle, Transform},
 };
 
+use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
+use smithay::reexports::wayland_server::Resource;
+
 use crate::State;
 
 use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
@@ -30,6 +33,16 @@ smithay::backend::renderer::element::render_elements! {
     Surface = WaylandSurfaceRenderElement<R>,
     Memory = MemoryRenderBufferRenderElement<R>,
     Egui = EguiDamage,
+}
+
+// The full element list for a frame. smithay has this internally but keeps it
+// private, and its `space::render_output` always puts custom elements ON TOP.
+// We need both: the overlay above the windows and the shadows below them.
+smithay::backend::renderer::element::render_elements! {
+    OutputElement<='a, GlesRenderer>;
+    Space = smithay::desktop::space::SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+    Custom = &'a HintElement<GlesRenderer>,
+    Shadow = &'a smithay::backend::renderer::gles::element::PixelShaderElement,
 }
 
 /// A draw-nothing element that reports the egui overlay's region as damaged.
@@ -208,8 +221,8 @@ fn run_discovery_scan(
     // A launch note clears when THAT app's window appears, so the window count
     // when it arrived is carried along.
     let windows_now = state.space.elements().count();
-    let (status, baseline) = crate::toolbar::scan_status(windows_now, state.status_baseline);
-    state.status_baseline = baseline;
+    let (status, note) = crate::toolbar::scan_status(windows_now, state.status_note);
+    state.status_note = note;
     if let Some(tb) = state.toolbar.as_mut() {
         changed |= tb.set_status(status);
     }
@@ -438,6 +451,23 @@ pub fn init_winit(
                     backend.buffer_age().unwrap_or(0)
                 };
 
+                // Cursor, following anvil (smithay's reference compositor): drop a
+                // dead cursor surface back to the default, hand a NAMED shape to
+                // the host window so it draws the themed cursor (this is what
+                // makes a window's resize edges show a resize cursor), and hide
+                // the host cursor only while we are compositing a client's own
+                // cursor surface ourselves.
+                if let CursorImageStatus::Surface(surface) = &state.cursor_status {
+                    if !surface.alive() {
+                        state.cursor_status = CursorImageStatus::default_named();
+                    }
+                }
+                let cursor_visible = !matches!(state.cursor_status, CursorImageStatus::Surface(_));
+                if let CursorImageStatus::Named(icon) = state.cursor_status {
+                    backend.window().set_cursor(icon.into());
+                }
+                backend.window().set_cursor_visible(cursor_visible);
+
                 // A transient EGL/GL error (context loss, host-resize race, GL OOM)
                 // must skip the frame, not abort the compositor and every app.
                 let render_res = match backend.bind() {
@@ -475,6 +505,39 @@ pub fn init_winit(
                         // no egui_glow sRGB-texture fringe.
                         let mut custom: Vec<HintElement<GlesRenderer>> =
                             dnd.into_iter().map(HintElement::Surface).collect();
+                        // A client-drawn cursor surface, composited at the pointer
+                        // minus its hotspot (anvil's cursor path). The host cursor
+                        // is hidden above while this is what we draw.
+                        if let CursorImageStatus::Surface(surface) = state.cursor_status.clone() {
+                            let hotspot = smithay::wayland::compositor::with_states(
+                                &surface,
+                                |states| {
+                                    states
+                                        .data_map
+                                        .get::<std::sync::Mutex<CursorImageAttributes>>()
+                                        .map(|attrs| attrs.lock().unwrap().hotspot)
+                                        .unwrap_or_default()
+                                },
+                            );
+                            let cursor = state
+                                .seat
+                                .get_pointer()
+                                .map(|p| p.current_location())
+                                .unwrap_or_default();
+                            let pos = (cursor - hotspot.to_f64())
+                                .to_physical(scale_f)
+                                .to_i32_round();
+                            let cursor_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                                smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
+                                    renderer,
+                                    &surface,
+                                    pos,
+                                    smithay::utils::Scale::from(scale_f),
+                                    1.0,
+                                    smithay::backend::renderer::element::Kind::Cursor,
+                                );
+                            custom.extend(cursor_elements.into_iter().map(HintElement::Surface));
+                        }
                         if !has_windows {
                             if let Some(buf) = &state.hint_icon {
                                 // Position in LOGICAL points, then scale to
@@ -509,23 +572,53 @@ pub fn init_winit(
                                 rect,
                             )));
                         }
-                        smithay::desktop::space::render_output::<
-                            _,
-                            HintElement<GlesRenderer>,
-                            _,
-                            _,
-                        >(
-                            &output,
+                        // Drop shadows: one shader element per window, drawn under
+                        // the windows (see shadow.rs). Collected first so the
+                        // borrow of `state.space` ends before `state.shadows`.
+                        let geometries: Vec<_> = state
+                            .space
+                            .elements()
+                            .filter_map(|w| {
+                                let geo = state.space.element_geometry(w)?;
+                                Some((w.toplevel()?.wl_surface().id(), geo))
+                            })
+                            .collect();
+                        let shadows = state.shadows.elements(
                             renderer,
-                            &mut framebuffer,
-                            1.0,
-                            age,
+                            geometries.into_iter(),
+                            scale_f,
+                        );
+
+                        // Assemble the element list ourselves, as
+                        // space::render_output does, so the order can be: overlay
+                        // and DnD ghost on top, then the app windows, then their
+                        // shadows underneath.
+                        match smithay::desktop::space::space_render_elements(
+                            renderer,
                             [&state.space],
-                            &custom,
-                            &mut damage_tracker,
-                            clear_color,
-                        )
-                        .map_err(|e| e.to_string())
+                            &output,
+                            1.0,
+                        ) {
+                            Ok(space_elements) => {
+                                let mut elements: Vec<OutputElement<'_>> = Vec::with_capacity(
+                                    custom.len() + space_elements.len() + shadows.len(),
+                                );
+                                elements.extend(custom.iter().map(OutputElement::Custom));
+                                elements
+                                    .extend(space_elements.into_iter().map(OutputElement::Space));
+                                elements.extend(shadows.iter().map(OutputElement::Shadow));
+                                damage_tracker
+                                    .render_output(
+                                        renderer,
+                                        &mut framebuffer,
+                                        age,
+                                        &elements,
+                                        clear_color,
+                                    )
+                                    .map_err(|e| e.to_string())
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
                     }
                     Err(e) => Err(e.to_string()),
                 };
