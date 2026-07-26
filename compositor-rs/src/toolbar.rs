@@ -100,18 +100,19 @@ pub struct Toolbar {
     notice: Option<(String, std::time::Instant)>,
 }
 
-/// The progress spinner's outer diameter and ring thickness, in logical points,
-/// plus how long one turn takes.
+/// The progress spinner: overall diameter and stroke width in logical points,
+/// how many spokes the ring has, and how long the head takes to go round.
 const SPINNER_DIAMETER: f32 = 56.0;
-const SPINNER_STROKE: f32 = 6.0;
-const SPINNER_TURN: f32 = 1.1;
+const SPINNER_STROKE: f32 = 5.0;
+const SPINNER_SPOKES: usize = 12;
+const SPINNER_TURN: f32 = 1.0;
 /// Veracage turquoise, the same accent the dialogs use (theme::ACCENT).
 const SPINNER_ACCENT: egui::Color32 = egui::Color32::from_rgb(0x21, 0x9e, 0x96);
 
-/// The progress spinner: a full ring in a faint neutral, with a bright arc
-/// travelling around it. Drawn from egui primitives rather than
-/// `egui::Spinner`, which offers only the arc and no track.
-fn draw_spinner(ui: &mut egui::Ui, diameter: f32, dark: bool) {
+/// The progress spinner: a ring of short radial strokes, brightest at the head
+/// and fading backwards around the circle, with the head stepping from spoke to
+/// spoke. The classic throbber, rather than egui's single sweeping arc.
+fn draw_spinner(ui: &mut egui::Ui, diameter: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
@@ -119,29 +120,25 @@ fn draw_spinner(ui: &mut egui::Ui, diameter: f32, dark: bool) {
     // Keep asking for frames: this animation IS the progress indication.
     ui.ctx().request_repaint();
     let center = rect.center();
-    let radius = (diameter - SPINNER_STROKE) * 0.5;
-    let track = if dark {
-        egui::Color32::from_white_alpha(38)
-    } else {
-        egui::Color32::from_black_alpha(38)
-    };
+    let outer = diameter * 0.5;
+    let inner = outer * 0.52;
+    // The head advances one spoke at a time, so it ticks round like a throbber
+    // instead of sliding.
+    let head = (ui.input(|i| i.time) as f32 * SPINNER_SPOKES as f32 / SPINNER_TURN).floor() as i32;
     let painter = ui.painter();
-    painter.circle_stroke(center, radius, egui::Stroke::new(SPINNER_STROKE, track));
-
-    // One arc, a bit under a third of the ring, going round once per SPINNER_TURN.
-    const ARC_RADIANS: f32 = 1.9;
-    const SEGMENTS: usize = 24;
-    let start = ui.input(|i| i.time) as f32 * std::f32::consts::TAU / SPINNER_TURN;
-    let points: Vec<egui::Pos2> = (0..=SEGMENTS)
-        .map(|i| {
-            let angle = start + ARC_RADIANS * (i as f32 / SEGMENTS as f32);
-            center + radius * egui::vec2(angle.cos(), angle.sin())
-        })
-        .collect();
-    painter.add(egui::Shape::line(
-        points,
-        egui::Stroke::new(SPINNER_STROKE, SPINNER_ACCENT),
-    ));
+    for spoke in 0..SPINNER_SPOKES {
+        // 0 for the head, counting backwards around the ring.
+        let age = (spoke as i32 - head).rem_euclid(SPINNER_SPOKES as i32) as f32;
+        let fade = 1.0 - age / SPINNER_SPOKES as f32;
+        // Start at the top and go clockwise, as these things do.
+        let angle = std::f32::consts::TAU * (spoke as f32 / SPINNER_SPOKES as f32)
+            - std::f32::consts::FRAC_PI_2;
+        let dir = egui::vec2(angle.cos(), angle.sin());
+        painter.line_segment(
+            [center + dir * inner, center + dir * outer],
+            egui::Stroke::new(SPINNER_STROKE, SPINNER_ACCENT.gamma_multiply(fade)),
+        );
+    }
 }
 
 /// How long a transient toolbar notice (e.g. a failed-launch banner) stays up.
@@ -394,7 +391,6 @@ impl Toolbar {
         scale: f64,
         leaders: &[LeaderApps],
         cfg_apps: &[ConfigApp],
-        has_windows: bool,
     ) -> (ToolbarAction, Option<Rectangle<i32, Physical>>) {
         let ppp = (scale as f32).max(1.0);
         self.ctx.set_pixels_per_point(ppp);
@@ -560,49 +556,10 @@ impl Toolbar {
                     });
                 });
 
-            // The compositor backdrop IS the desktop (rendered first, behind every
-            // window), there is no opaque egui desktop panel, so app windows open
-            // ON the desktop like any normal compositor. When nothing is open we
-            // draw only a centred hint on a TRANSPARENT panel (so the backdrop shows
-            // through); once a window maps it covers the hint, as a desktop should.
-            if !has_windows {
-                // A mounted volume with no open windows is NOT "no volume
-                // mounted" - the leaders tell us what is actually mounted.
-                let mounted = leaders.iter().any(|l| !l.volumes.is_empty());
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::none())
-                    .show(ctx, |ui| {
-                        // The icon itself is drawn by the smithay renderer
-                        // (winit.rs) at hint_icon_pos; here we draw only the
-                        // text, centered under it. All in LOGICAL points.
-                        let painter = ui.painter();
-                        let (w_l, h_l) = ((pw / ppp) as i32, (ph / ppp) as i32);
-                        let (_icon_x, icon_y) = crate::toolbar::hint_icon_pos(w_l, h_l);
-                        let icon_px = crate::toolbar::HINT_ICON_PX;
-                        let (big, small) = hint_colors(dark);
-                        let (line1, line2) = if mounted {
-                            (volumes_title(leaders), "Use the Apps menu to launch an app")
-                        } else {
-                            ("No volume mounted".to_string(), "File > Mount volume")
-                        };
-                        let cx = (w_l / 2) as f32;
-                        let ty = (icon_y + icon_px + 16) as f32;
-                        painter.text(
-                            egui::pos2(cx, ty),
-                            egui::Align2::CENTER_TOP,
-                            line1,
-                            egui::FontId::proportional(28.0),
-                            big,
-                        );
-                        painter.text(
-                            egui::pos2(cx, ty + 40.0),
-                            egui::Align2::CENTER_TOP,
-                            line2,
-                            egui::FontId::proportional(16.0),
-                            small,
-                        );
-                    });
-            }
+            // There is no egui desktop: the desktop IS the compositor's backdrop
+            // colour plus the Veracage icon, both drawn by the renderer below the
+            // app windows (see winit.rs). egui only adds the strip, the spinner
+            // and the notice banner, all of which belong above the windows.
 
             // Something slow is happening (unlocking a volume, an app starting):
             // just a spinner, centred over everything, no frame and no text - it
@@ -614,7 +571,7 @@ impl Toolbar {
                     .order(egui::Order::Foreground)
                     .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                     .interactable(false)
-                    .show(ctx, |ui| draw_spinner(ui, SPINNER_DIAMETER, dark));
+                    .show(ctx, |ui| draw_spinner(ui, SPINNER_DIAMETER));
             }
 
             // Transient banner (e.g. a leader-reported failed launch), floating
@@ -734,14 +691,6 @@ pub fn volumes_title(leaders: &[LeaderApps]) -> String {
 }
 
 /// Backdrop-hint text colors (big line, small line) for the theme. Solid, not
-/// weak, so the text reads as plain type rather than embossed on the backdrop.
-fn hint_colors(dark: bool) -> (egui::Color32, egui::Color32) {
-    if dark {
-        (egui::Color32::from_gray(150), egui::Color32::from_gray(120))
-    } else {
-        (egui::Color32::from_gray(105), egui::Color32::from_gray(130))
-    }
-}
 
 /// A menu item widget: a small host-theme icon (when cached) + text. Icon-less
 /// items fall back to text only.

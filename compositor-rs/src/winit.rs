@@ -23,11 +23,11 @@ use crate::State;
 use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::renderer::{ImportAll, ImportMem};
 
-// Custom render elements composited on top of the app windows: the DnD ghost
-// (a wayland surface, needs ImportAll), the "No volume mounted" hint icon (a
-// memory buffer drawn directly by the renderer, needs ImportMem, bypasses
-// egui, whose sRGB texture path fringes the icon's transparent edges), and the
-// draw-nothing damage marker for the egui overlay.
+// The renderer's own elements: wayland surfaces (the DnD ghost and a client's
+// cursor, needs ImportAll), memory buffers (the backdrop's Veracage icon, needs
+// ImportMem - drawn by the renderer rather than egui, whose sRGB texture path
+// fringes a transparent-edged icon), and the draw-nothing damage marker for the
+// egui overlay.
 smithay::backend::renderer::element::render_elements! {
     HintElement<R> where R: ImportMem + ImportAll;
     Surface = WaylandSurfaceRenderElement<R>,
@@ -134,6 +134,14 @@ fn apply_window_size(window: &dyn smithay::reexports::winit::window::Window, siz
     }
 }
 
+/// True when the human side asked for the dark theme (same env the toolbar
+/// reads). Read once; it decides the backdrop text's ink.
+fn dark_theme() -> bool {
+    use std::sync::OnceLock;
+    static DARK: OnceLock<bool> = OnceLock::new();
+    *DARK.get_or_init(|| std::env::var("VERACAGE_THEME").as_deref() == Ok("dark"))
+}
+
 /// How often the discovery scan runs: it is what makes a mounted volume show up
 /// in the title and the Apps menu, and what picks up a progress note, so it also
 /// bounds how stale those look. Cheap (a few stats on tmpfs) and it only wakes
@@ -172,9 +180,13 @@ fn run_discovery_scan(
     let font = crate::toolbar::scan_font();
     if let Some(tb) = state.toolbar.as_mut() {
         tb.refresh_icons(&state.cfg_apps);
-        if let Some((path, base)) = font {
+        if let Some((path, base)) = font.clone() {
             changed |= tb.refresh_font(&path, base);
         }
+    }
+    if font.is_some() && font != state.font {
+        state.font = font;   // the backdrop text re-rasterises with it
+        changed = true;
     }
     // Live window resize: pick up a Settings change to the default window size
     // (published to /run/veracage/pub/window.size).
@@ -394,7 +406,6 @@ pub fn init_winit(
                 state.dirty = false;
                 state.frames = state.frames.saturating_add(1);
                 let size = backend.window_size();
-                let has_windows = state.space.elements().next().is_some();
                 let scale_f = output.current_scale().fractional_scale();
 
                 // Run the toolbar UI (CPU only) BEFORE compositing: the region
@@ -409,7 +420,6 @@ pub fn init_winit(
                         scale_f,
                         &state.leaders,
                         &state.cfg_apps,
-                        has_windows,
                     )
                 } else {
                     (crate::toolbar::ToolbarAction::None, None)
@@ -555,6 +565,52 @@ pub fn init_winit(
                             );
                             let loc = smithay::utils::Point::<f64, smithay::utils::Physical>::from(
                                 (lx as f64 * scale_f, ly as f64 * scale_f),
+                            );
+                            if let Ok(el) = smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement::from_buffer(
+                                renderer,
+                                loc,
+                                buf,
+                                None,
+                                None,
+                                None,
+                                smithay::backend::renderer::element::Kind::Unspecified,
+                            ) {
+                                backdrop.push(HintElement::Memory(el));
+                            }
+                        }
+                        // ... and the two text lines under it, also rasterised
+                        // into a buffer (hint_text.rs) so they belong to the
+                        // backdrop rather than to the on-top egui layer.
+                        let mounted: Vec<&str> = state
+                            .leaders
+                            .iter()
+                            .flat_map(|l| l.volumes.iter().map(|s| s.as_str()))
+                            .collect();
+                        let (line1, line2) = if mounted.is_empty() {
+                            ("No volume mounted".to_string(), "File > Mount volume")
+                        } else {
+                            (crate::toolbar::volumes_title(&state.leaders), "")
+                        };
+                        let (font_path, base) = state
+                            .font
+                            .clone()
+                            .unwrap_or_else(|| (String::new(), 16.0));
+                        let (w_l, h_l) = (
+                            (size.w as f64 / scale_f) as i32,
+                            (size.h as f64 / scale_f) as i32,
+                        );
+                        let (_, icon_y) = crate::toolbar::hint_icon_pos(w_l, h_l);
+                        if let Some((buf, (tw, _th))) = state.hint_text.buffer(
+                            &line1,
+                            line2,
+                            &font_path,
+                            base,
+                            dark_theme(),
+                        ) {
+                            let tx = (w_l - tw) / 2;
+                            let ty = icon_y + crate::toolbar::HINT_ICON_PX + 16;
+                            let loc = smithay::utils::Point::<f64, smithay::utils::Physical>::from(
+                                (tx as f64 * scale_f, ty as f64 * scale_f),
                             );
                             if let Ok(el) = smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement::from_buffer(
                                 renderer,

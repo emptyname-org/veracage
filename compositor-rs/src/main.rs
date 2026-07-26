@@ -11,6 +11,7 @@ mod fonts;
 mod grabs;
 mod hostclip;
 mod handlers;
+mod hint_text;
 mod input;
 mod mono_icons;
 mod shadow;

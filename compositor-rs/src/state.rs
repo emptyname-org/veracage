@@ -157,6 +157,11 @@ pub struct State {
     /// is why window borders were so hard to grab.
     pub cursor_status: smithay::input::pointer::CursorImageStatus,
 
+    /// The desktop's text lines, rasterised for the backdrop (hint_text.rs), and
+    /// the font they are drawn with (path + base size, from the discovery scan).
+    pub hint_text: crate::hint_text::HintText,
+    pub font: Option<(String, f32)>,
+
     /// Per-window drop shadows (scenefx's shader; see shadow.rs).
     pub shadows: crate::shadow::Shadows,
 
@@ -281,6 +286,8 @@ impl State {
             dnd_icon: None,
             hint_icon: build_hint_icon(),
             cursor_status: smithay::input::pointer::CursorImageStatus::default_named(),
+            hint_text: Default::default(),
+            font: None,
             shadows: Default::default(),
             status_note: None,
             frames: 0,
