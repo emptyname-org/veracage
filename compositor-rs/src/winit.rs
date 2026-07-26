@@ -538,29 +538,34 @@ pub fn init_winit(
                                 );
                             custom.extend(cursor_elements.into_iter().map(HintElement::Surface));
                         }
-                        if !has_windows {
-                            if let Some(buf) = &state.hint_icon {
-                                // Position in LOGICAL points, then scale to
-                                // physical for the element (it renders at the
-                                // buffer's logical size = 96pt).
-                                let (lx, ly) = crate::toolbar::hint_icon_pos(
-                                    (size.w as f64 / scale_f) as i32,
-                                    (size.h as f64 / scale_f) as i32,
-                                );
-                                let loc = smithay::utils::Point::<f64, smithay::utils::Physical>::from(
-                                    (lx as f64 * scale_f, ly as f64 * scale_f),
-                                );
-                                if let Ok(el) = smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement::from_buffer(
-                                    renderer,
-                                    loc,
-                                    buf,
-                                    None,
-                                    None,
-                                    None,
-                                    smithay::backend::renderer::element::Kind::Unspecified,
-                                ) {
-                                    custom.push(HintElement::Memory(el));
-                                }
+                        // The Veracage icon belongs to the BACKDROP, so it is drawn
+                        // below the app windows and stays there when they open,
+                        // like a desktop wallpaper. (It used to be part of the
+                        // on-top overlay, which is why it could only be shown with
+                        // nothing open.) The hint TEXT under it is egui, which
+                        // paints above the windows, so that stays conditional.
+                        let mut backdrop: Vec<HintElement<GlesRenderer>> = Vec::new();
+                        if let Some(buf) = &state.hint_icon {
+                            // Position in LOGICAL points, then scale to physical
+                            // for the element (it renders at the buffer's logical
+                            // size = 96pt).
+                            let (lx, ly) = crate::toolbar::hint_icon_pos(
+                                (size.w as f64 / scale_f) as i32,
+                                (size.h as f64 / scale_f) as i32,
+                            );
+                            let loc = smithay::utils::Point::<f64, smithay::utils::Physical>::from(
+                                (lx as f64 * scale_f, ly as f64 * scale_f),
+                            );
+                            if let Ok(el) = smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement::from_buffer(
+                                renderer,
+                                loc,
+                                buf,
+                                None,
+                                None,
+                                None,
+                                smithay::backend::renderer::element::Kind::Unspecified,
+                            ) {
+                                backdrop.push(HintElement::Memory(el));
                             }
                         }
                         // The egui overlay's region, so the tracker re-renders
@@ -600,13 +605,22 @@ pub fn init_winit(
                             1.0,
                         ) {
                             Ok(space_elements) => {
+                                // Earlier in the list is higher up: the overlay
+                                // (cursor, DnD ghost, egui damage), then the app
+                                // windows, then their shadows, then the backdrop
+                                // icon at the very bottom so window shadows fall
+                                // ON it rather than under it.
                                 let mut elements: Vec<OutputElement<'_>> = Vec::with_capacity(
-                                    custom.len() + space_elements.len() + shadows.len(),
+                                    custom.len()
+                                        + space_elements.len()
+                                        + shadows.len()
+                                        + backdrop.len(),
                                 );
                                 elements.extend(custom.iter().map(OutputElement::Custom));
                                 elements
                                     .extend(space_elements.into_iter().map(OutputElement::Space));
                                 elements.extend(shadows.iter().map(OutputElement::Shadow));
+                                elements.extend(backdrop.iter().map(OutputElement::Custom));
                                 damage_tracker
                                     .render_output(
                                         renderer,
