@@ -41,6 +41,9 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "Everything else lives in memory: the home directory apps start in, \
              their settings, caches and downloads. It is discarded when Veracage \
              quits, without asking.",
+            "That memory is private to Veracage. It is held in Veracage's own \
+             mount namespace, owned by the Veracage system user, so no other \
+             program running as you can read it or even reach its path.",
             "So save your work into one of the volume directories, or into \
              /exchange to pass it to the host.",
         ],

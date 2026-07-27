@@ -154,8 +154,14 @@ pub struct State {
     /// like the app windows and backdrop.
     pub hint_icon: Option<smithay::backend::renderer::element::memory::MemoryRenderBuffer>,
 
+    /// When a client last announced a new window, as a wall-clock nanosecond
+    /// count. A progress note ends when a window appeared AFTER the note was
+    /// written (see toolbar::pick_status): comparing counts instead cannot tell a
+    /// window that mapped inside the scan gap from one that was already there.
+    pub last_window_ns: u128,
+
     /// The launch progress note being tracked (see toolbar::LaunchNote): it
-    /// finishes when the launching app maps its own window, and stays finished.
+    /// finishes when a window appears after it, and stays finished.
     pub status_note: Option<crate::toolbar::LaunchNote>,
 
     /// What the focused client wants the cursor to look like. Applied every frame in
@@ -298,6 +304,7 @@ impl State {
             hint_text: Default::default(),
             font: None,
             shadows: Default::default(),
+            last_window_ns: 0,
             status_note: None,
             frames: 0,
             submits: 0,

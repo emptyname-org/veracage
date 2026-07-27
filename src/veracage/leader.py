@@ -221,6 +221,11 @@ def _launch_app(state: _LeaderState, spec) -> dict:
         # exactly what a launch problem looks like - it is opt-in, and the trade
         # is documented in docs/debugging.md.
         app_out = None if state.debug else subprocess.DEVNULL
+        # An app takes a second or two to put its first window up, with nothing on
+        # screen meanwhile: ask the compositor for a progress note. Written BEFORE
+        # the spawn, because the compositor ends the note when a window appears
+        # after it, and a note written afterwards could be younger than the window.
+        _post_status(f"Starting {label}")
         proc = subprocess.Popen(
             argv,
             stdin=subprocess.DEVNULL,
@@ -229,12 +234,14 @@ def _launch_app(state: _LeaderState, spec) -> dict:
             pass_fds=[fd for fd, _ in seeds],
         )
     except FileNotFoundError as e:
+        _clear_status()
         return {"ok": False, "error": f"missing dependency: {e.filename}"}
     except OSError as e:
         # Anything else the spawn can fail with (EMFILE/ENOMEM/EAGAIN under
         # load) is reported like any other launch failure. It must NOT escape:
         # the callers run inside the serve loop, whose unwind path terminates
         # every app in the session.
+        _clear_status()
         return {"ok": False, "error": f"cannot launch {label}: {e}"}
     finally:
         for fd, _ in seeds:
@@ -248,10 +255,6 @@ def _launch_app(state: _LeaderState, spec) -> dict:
     state.children[proc.pid] = (label, time.monotonic())
     _debug(state, f"launch {label!r}: pid={proc.pid} spawned in "
                   f"{(time.monotonic() - t0) * 1000:.0f}ms")
-    # An app takes a second or two to put its first window up, with nothing on
-    # screen meanwhile: ask the compositor to show a progress note until the
-    # window appears (it clears the note itself, see scan_status).
-    _post_status(f"Starting {label}")
     return {"ok": True, "pid": proc.pid}
 
 

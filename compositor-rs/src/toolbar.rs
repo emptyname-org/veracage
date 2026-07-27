@@ -779,12 +779,11 @@ const NOTICE_FILE: &str = "notice";
 /// Read the transient notice a leader published (e.g. a failed launch), as
 /// `(nonce, text)`. The nonce (a wall-clock ns stamp) lets the caller show each
 /// distinct notice once. Bounded read, control chars stripped, malformed ignored.
-/// A progress note the compositor is tracking: which note (its file's timestamp),
-/// how many windows were mapped when it arrived, and whether it has finished.
+/// A progress note the compositor is tracking: which note (its file's timestamp)
+/// and whether it has finished.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LaunchNote {
     stamp: u128,
-    windows_at_arrival: usize,
     done: bool,
 }
 
@@ -801,26 +800,26 @@ const STATUS_TTL_BROKER: std::time::Duration = std::time::Duration::from_secs(90
 /// Also deletes a leader note left behind by an earlier session: `rt/status` lives
 /// in a runtime directory shared by every session, and the compositor owns it.
 pub fn scan_status(
-    windows_now: usize,
+    last_window_ns: u128,
     note: Option<LaunchNote>,
 ) -> (Option<String>, Option<LaunchNote>) {
     let leader_path = std::path::Path::new(RUNTIME_DIR).join("status");
     let from_leader = read_status_line(&leader_path);
     if from_leader.as_ref().is_some_and(|(stamp, _)| *stamp < session_start_ns()) {
         let _ = std::fs::remove_file(&leader_path);
-        return pick_status(None, None, windows_now, note, now_ns(), session_start_ns());
+        return pick_status(None, None, last_window_ns, note, now_ns(), session_start_ns());
     }
     pick_status(
         read_status_line(&std::path::Path::new(PUB_DIR).join("status")),
         from_leader,
-        windows_now,
+        last_window_ns,
         note,
         now_ns(),
         session_start_ns(),
     )
 }
 
-fn now_ns() -> u128 {
+pub fn now_ns() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -847,9 +846,11 @@ fn session_start_ns() -> u128 {
 ///   1. its file is gone, because the publisher resolved the operation;
 ///   2. it predates this compositor, so it is a leftover from an earlier session
 ///      (the runtime directory outlives one session);
-///   3. a window appeared that was not there when the note arrived - the launched
-///      app's own window - and then it STAYS finished, so closing a window later
-///      cannot revive the spinner;
+///   3. a window appeared AFTER it was written - the launched app putting its window
+///      up - and then it STAYS finished, so a later window cannot revive it. This is
+///      a timestamp comparison, not a window count: an app can map its window inside
+///      the gap between two scans, and a count taken when the note is first READ
+///      would then already include it and never rise;
 ///   4. it is older than its TTL (see the constants above).
 ///
 /// The broker's note wins while both exist: unlocking is the operation the user is
@@ -857,7 +858,7 @@ fn session_start_ns() -> u128 {
 fn pick_status(
     from_broker: Option<(u128, String)>,
     from_leader: Option<(u128, String)>,
-    windows_now: usize,
+    last_window_ns: u128,
     note: Option<LaunchNote>,
     now_ns: u128,
     session_start_ns: u128,
@@ -873,13 +874,11 @@ fn pick_status(
     let Some((stamp, text)) = fresh(from_leader, STATUS_TTL_LAUNCH) else {
         return (None, None);
     };
-    // A note we have not seen before: remember how many windows were up when it
-    // arrived, so the app's OWN window is what finishes it.
     let mut note = match note {
         Some(n) if n.stamp == stamp => n,
-        _ => LaunchNote { stamp, windows_at_arrival: windows_now, done: false },
+        _ => LaunchNote { stamp, done: false },
     };
-    if windows_now > note.windows_at_arrival {
+    if last_window_ns > stamp {
         note.done = true;
     }
     ((!note.done).then_some(text), Some(note))
@@ -1166,35 +1165,47 @@ mod tests {
     #[test]
     fn broker_note_wins_while_unlocking() {
         // The broker deletes its file when the open ends, so whatever is there is
-        // what the user is waiting on - even with windows mapped, or with a leader
-        // note beside it.
+        // what the user is waiting on - even with a window mapped since, or with a
+        // leader note beside it.
         let broker = note_at(START, "Unlocking work.vc");
         let leader = note_at(START, "Starting Dolphin");
-        for windows in [0, 3] {
+        for last_window in [0, START + 1] {
             let (shown, _) =
-                pick_status(broker.clone(), leader.clone(), windows, None, START, START);
+                pick_status(broker.clone(), leader.clone(), last_window, None, START, START);
             assert_eq!(shown, Some("Unlocking work.vc".to_string()));
         }
     }
 
     #[test]
-    fn launch_note_ends_when_that_app_maps_its_window_and_stays_ended() {
-        // Shown until the window COUNT rises above what it was when the note
-        // arrived, so launching a second app still shows progress. Once finished it
-        // STAYS finished: otherwise closing a window revives the spinner.
+    fn launch_note_ends_when_a_window_appears_after_it_and_stays_ended() {
         let leader = note_at(START, "Starting Kate");
-        let (shown, note) = pick_status(None, leader.clone(), 1, None, START, START);
+        // A window that was already there (mapped BEFORE the note) proves nothing.
+        let (shown, note) = pick_status(None, leader.clone(), START - 5, None, START, START);
         assert_eq!(shown, Some("Starting Kate".to_string()));
-        let (shown, note) = pick_status(None, leader.clone(), 1, note, START, START);
+        let (shown, note) = pick_status(None, leader.clone(), START - 5, note, START, START);
         assert_eq!(shown, Some("Starting Kate".to_string()));
-        // Kate's window maps: done.
-        let (shown, note) = pick_status(None, leader.clone(), 2, note, START, START);
+        // Kate puts its window up: done.
+        let (shown, note) = pick_status(None, leader.clone(), START + 1, note, START, START);
         assert_eq!(shown, None);
-        // Windows close again, even all of them: still done.
-        let (shown, note) = pick_status(None, leader.clone(), 1, note, START, START);
+        // And it stays done, whatever happens to windows afterwards.
+        let (shown, note) = pick_status(None, leader.clone(), START + 1, note, START, START);
         assert_eq!(shown, None);
         let (shown, _) = pick_status(None, leader, 0, note, START, START);
         assert_eq!(shown, None);
+    }
+
+    #[test]
+    fn a_window_that_maps_before_the_note_is_first_read_still_ends_it() {
+        // The compositor reads the status file on a timer, so an app can put its
+        // window up between the note being written and the note being seen. The
+        // note must end at once: a window COUNT taken at first sight would already
+        // include that window and could never rise, which left the spinner turning
+        // for the whole timeout (the reported Konsole case).
+        let leader = note_at(START, "Starting Konsole");
+        let window_mapped = START + 700_000_000; // 0.7s after the note, before the scan
+        let (shown, note) = pick_status(None, leader, window_mapped, None, START + 1_000_000_000, START);
+        assert_eq!(shown, None, "the note should be finished the first time it is seen");
+        assert!(note.map_or(false, |n| n.done));
     }
 
     #[test]
@@ -1240,15 +1251,15 @@ mod tests {
         // though the previous note was finished.
         let first = note_at(START, "Starting Kate");
         let (_, note) = pick_status(None, first.clone(), 0, None, START, START);
-        let (_, note) = pick_status(None, first, 1, note, START, START); // finished
+        let (_, note) = pick_status(None, first, START + 1, note, START + 1, START); // finished
         let second = note_at(START + 5, "Starting Dolphin");
-        let (shown, _) = pick_status(None, second, 1, note, START + 5, START);
+        let (shown, _) = pick_status(None, second, START + 1, note, START + 5, START);
         assert_eq!(shown, Some("Starting Dolphin".to_string()));
     }
 
     #[test]
     fn no_note_published_forgets_the_previous_one() {
-        assert_eq!(pick_status(None, None, 2, None, START, START), (None, None));
+        assert_eq!(pick_status(None, None, START, None, START, START), (None, None));
     }
 
     #[test]

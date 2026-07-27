@@ -231,10 +231,9 @@ fn run_discovery_scan(
         }
     }
     // Progress note (unlocking a volume, starting an app), shown with a spinner.
-    // A launch note clears when THAT app's window appears, so the window count
-    // when it arrived is carried along.
-    let windows_now = state.space.elements().count();
-    let (status, note) = crate::toolbar::scan_status(windows_now, state.status_note);
+    // A launch note clears when a window appears after it, so the moment the last
+    // one did is carried along.
+    let (status, note) = crate::toolbar::scan_status(state.last_window_ns, state.status_note);
     state.status_note = note;
     if let Some(tb) = state.toolbar.as_mut() {
         changed |= tb.set_status(status);

@@ -250,6 +250,24 @@ def test_reap_takes_the_progress_note_down(tmp_path, monkeypatch):
         assert not status.exists(), f"note survived the {label} exit"
 
 
+def test_launch_app_that_cannot_spawn_takes_the_note_down(tmp_path, monkeypatch):
+    # The note is written before the spawn (so it can never be younger than the
+    # window that ends it), which means a spawn that fails has to take it down or
+    # the spinner turns for nothing.
+    monkeypatch.setattr(leader, "COMPOSITOR_RUNTIME", tmp_path)
+    monkeypatch.setattr(leader, "bwrap_command", lambda *a, **k: ["bwrap"])
+
+    def boom(argv, **kw):
+        raise FileNotFoundError(2, "no such file", "bwrap")
+
+    monkeypatch.setattr(leader.subprocess, "Popen", boom)
+    st = _state(wl_socket=Path("/run/x/wayland-1"))
+    reply = leader._launch_app(st, {"name": "Kate", "exec": "kate"})
+
+    assert reply["ok"] is False
+    assert not (tmp_path / "status").exists(), "a failed launch left the spinner on"
+
+
 def test_launch_app_missing_dependency(monkeypatch):
     monkeypatch.setattr(leader, "bwrap_command", lambda *a, **k: ["bwrap"])
 

@@ -68,6 +68,11 @@ contract.
 - **Root on the host reads everything.** The dm-crypt device is kernel-global
   (the kernel doesn't namespace device-mapper). Deny-by-uid stores the human's
   *own* data. Inherent: a normal VM doesn't seal host root either.
+- **Memory can still reach the disk through swap.** The temporary workspace and
+  every app's config/cache/data live in tmpfs, and the kernel may swap tmpfs pages
+  out; so may the decrypted volume's page cache. Veracage removes the *file*
+  channels (`~/.cache`, recent-files, thumbnails) but cannot stop the kernel
+  swapping. Use encrypted swap or zram if that matters to you.
 - **No network** from the sandbox, even opt-in (v1 non-goal).
 - **Clipboard is text-only** in v1.
 - **Apps and the compositor render on the host GPU** (`/dev/dri` is passed

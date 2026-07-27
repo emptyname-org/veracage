@@ -36,6 +36,8 @@ impl XdgShellHandler for State {
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface.clone());
+        // A window appeared: this is what ends a launch's progress note.
+        self.last_window_ns = crate::toolbar::now_ns();
 
         // Advertise output bounds so KDE dialogs size themselves sanely, and
         // cascade placement (deterministic, no `rand`) so a new window/dialog
