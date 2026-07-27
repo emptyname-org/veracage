@@ -28,15 +28,17 @@ impl CompositorHandler for State {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
-        if crate::debug_enabled() {
-            // A commit on the CURRENT cursor surface is a client changing what the
-            // pointer looks like (a resize shape at a window edge, typically)
-            // without asking for a new cursor, so nothing else would report it.
-            if let smithay::input::pointer::CursorImageStatus::Surface(cursor) = &self.cursor_status
-                && cursor == surface
-            {
-                crate::vcdebug(&format!("cursor content commit: {}", crate::describe_cursor(&self.cursor_status)));
-            }
+        // A commit on the CURRENT cursor surface is a client changing what the
+        // pointer looks like (a resize shape at a window edge, typically) without
+        // asking for a new cursor, so nothing else would report it.
+        if crate::debug_enabled()
+            && let smithay::input::pointer::CursorImageStatus::Surface(cursor) = &self.cursor_status
+            && cursor == surface
+        {
+            crate::vcdebug(&format!(
+                "cursor content commit: {}",
+                crate::describe_cursor(&self.cursor_status)
+            ));
         }
         // A client committed new content: a frame must be rendered, now.
         self.dirty = true;

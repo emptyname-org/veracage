@@ -526,9 +526,9 @@ pub fn init_winit(
                         let mut custom: Vec<HintElement<GlesRenderer>> =
                             dnd.into_iter().map(HintElement::Surface).collect();
                         // A client-drawn cursor surface, composited at the pointer
-                        // minus its hotspot (anvil's cursor path). Only when it has
-                        // a buffer, which is also when the host cursor was hidden
-                        // above - so there is always exactly one cursor on screen.
+                        // minus its hotspot (anvil's cursor path). The host cursor is
+                        // hidden for exactly this case, so there is one cursor on
+                        // screen: whichever of the two is ours to draw.
                         let mut cursor_drawn = 0usize;
                         if let CursorImageStatus::Surface(surface) = state.cursor_status.clone() {
                             let hotspot = smithay::wayland::compositor::with_states(
