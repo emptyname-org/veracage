@@ -107,9 +107,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 const WORKER_STOP_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// One-line description of what a client asked the cursor to be, for the debug
-/// log: which named shape, or - for a client-drawn cursor - which surface it is
-/// and whether that surface is mapped. Toolkits use a new surface per shape, so a
-/// changing surface id means a changing cursor.
+/// log: which named shape, or - for a client-drawn cursor - which surface it is,
+/// which version of that surface's content, and whether it is mapped. Both parts
+/// are needed: a toolkit may hand over a new surface per shape, or keep one
+/// surface and commit a new buffer into it.
 pub fn describe_cursor(status: &smithay::input::pointer::CursorImageStatus) -> String {
     use smithay::input::pointer::CursorImageStatus;
     use smithay::utils::IsAlive;
@@ -121,9 +122,17 @@ pub fn describe_cursor(status: &smithay::input::pointer::CursorImageStatus) -> S
                 st.buffer().is_some()
             });
             use smithay::reexports::wayland_server::Resource;
+            // The version matters as much as the identity: a toolkit swaps a resize
+            // shape in by committing a NEW BUFFER to the SAME cursor surface, which
+            // shows up here only as a bumped commit count.
+            let version = smithay::backend::renderer::utils::with_renderer_surface_state(
+                surface,
+                |st| format!("{:?} {:?}", st.current_commit(), st.buffer_size()),
+            );
             format!(
-                "client surface {:?} (alive {}, mapped {mapped:?})",
+                "client surface {} v{} (alive {}, mapped {mapped:?})",
                 surface.id().protocol_id(),
+                version.unwrap_or_else(|| "-".into()),
                 surface.alive()
             )
         }
