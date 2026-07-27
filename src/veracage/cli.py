@@ -74,6 +74,9 @@ _FORWARD_ENV = (
     "XDG_SESSION_TYPE",
     "DISPLAY",
     "LANG",
+    "XCURSOR_THEME",         # cursor theme + size the SANDBOX needs: apps load
+    "XCURSOR_SIZE",          # their own cursors, and without these they pick the
+                             # theme's next size up (50% larger than the host's)
     "VERACAGE_THEME",        # compositor egui theme (light default; "dark" opts in)
     "VERACAGE_FONT_FILE",    # compositor UI font FILE (resolved from config ui_font)
     "VERACAGE_FONT_SIZE",    # compositor UI base point size (config ui_font_size)

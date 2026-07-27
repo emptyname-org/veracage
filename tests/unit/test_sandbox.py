@@ -185,6 +185,26 @@ def test_chdir_to_vault(argv):
     assert ("--chdir", "/vaults") in list(zip(argv, argv[1:]))
 
 
+def test_cursor_theme_forwarded_from_the_session(monkeypatch):
+    """The pointer must match the host session. Without XCURSOR_SIZE an app picks
+    the theme's next size up, which showed as visibly larger cursors inside
+    Veracage; the theme name and size are forwarded when the session sets them."""
+    monkeypatch.setenv("XCURSOR_THEME", "breeze_cursors")
+    monkeypatch.setenv("XCURSOR_SIZE", "24")
+    argv = sandbox.bwrap_command("/run/veracage/abc", _KATE, Path("/tmp/s.sock"))
+    triples = list(zip(argv, argv[1:], argv[2:]))
+    assert ("--setenv", "XCURSOR_THEME", "breeze_cursors") in triples
+    assert ("--setenv", "XCURSOR_SIZE", "24") in triples
+
+
+def test_cursor_theme_absent_when_the_session_has_none(monkeypatch):
+    monkeypatch.delenv("XCURSOR_THEME", raising=False)
+    monkeypatch.delenv("XCURSOR_SIZE", raising=False)
+    argv = sandbox.bwrap_command("/run/veracage/abc", _KATE, Path("/tmp/s.sock"))
+    assert "XCURSOR_THEME" not in argv
+    assert "XCURSOR_SIZE" not in argv
+
+
 def test_etc_is_not_wholesale_bound(argv):
     """Security: the whole host /etc must not be exposed, only curated paths."""
     pairs = list(zip(argv, argv[1:]))

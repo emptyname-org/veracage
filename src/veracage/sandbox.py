@@ -133,9 +133,12 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
         "--setenv", "SHELL", "/bin/bash",
         "--chdir", "/vaults",
     ]
-    # Preserve locale (an explicit allowlist, not blanket inheritance) so dates,
-    # numbers and fonts render correctly; everything else stays cleared.
-    for var in ("LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_TIME", "LC_NUMERIC"):
+    # Preserve locale and the cursor theme (an explicit allowlist, not blanket
+    # inheritance) so dates, numbers, fonts and the pointer match the host session;
+    # everything else stays cleared. Without XCURSOR_SIZE an app picks the theme's
+    # next size up - visibly larger cursors inside Veracage than outside.
+    for var in ("LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_TIME", "LC_NUMERIC",
+                "XCURSOR_THEME", "XCURSOR_SIZE"):
         val = os.environ.get(var)
         if val:
             argv += ["--setenv", var, val]

@@ -77,6 +77,8 @@ const ALLOWED_SETENV: &[&str] = &[
     "XDG_SESSION_TYPE",
     "DISPLAY",
     "LANG",
+    "XCURSOR_THEME",
+    "XCURSOR_SIZE",
     "VERACAGE_THEME",
     "VERACAGE_FONT_FILE",
     "VERACAGE_FONT_SIZE",
