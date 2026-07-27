@@ -65,8 +65,13 @@ Full topology in `uid-isolation.md`. In brief:
   runs the config picker, edits settings. The one human-side process: it does
   what a `veracage`-uid process can't (`pkexec`, host-file dialogs).
 - **Root helper** (`helper-rs`, runs for seconds, via pkexec):
-  `cryptsetup open` -> idmap-mount into the workspace namespace -> drop to
-  `veracage` -> exec the session leader. Does not trust its caller (§6).
+  `cryptsetup open` -> check the filesystem -> idmap-mount into the workspace
+  namespace -> drop to `veracage` -> exec the session leader. Does not trust its
+  caller (§6). The check is `fsck -p` on the decrypted device, before anything
+  mounts it: a volume that was not unmounted cleanly is repaired where preen mode
+  can do it unambiguously, and is otherwise left closed and unmounted with a
+  message, rather than mounted dirty. ext2/3/4, FAT and exFAT are checked; a
+  filesystem with no preen-capable checker installed is mounted as before.
 - **`veracage`-uid compositor** (`veracage-compositor`, Rust/smithay): ONE
   persistent instance. Renders every volume's apps into one host window, owns
   the clipboard, hosts the egui menu bar. First-party (not weston/cage), so

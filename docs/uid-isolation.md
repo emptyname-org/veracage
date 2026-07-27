@@ -100,9 +100,9 @@ a `veracage`-uid process cannot (`pkexec`) and mediates host files.
                 • Mount volume -> pkexec helper (mount)
                      │ pkexec
                      ▼
-  root        helper (seconds): cryptsetup open (LUKS|VeraCrypt) → idmap-mount
-              as the veracage uid into the private workspace NS → drop to
-              veracage → exec the session leader.
+  root        helper (seconds): cryptsetup open (LUKS|VeraCrypt) → fsck -p the
+              decrypted filesystem → idmap-mount as the veracage uid into the
+              private workspace NS → drop to veracage → exec the session leader.
                      │
   veracage    compositor (persistent, ONE): renders every volume's apps into
   uid         one host window, owns the clipboard, hosts the egui menu bar.

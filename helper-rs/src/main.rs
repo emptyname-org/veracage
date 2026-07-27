@@ -61,6 +61,11 @@ const PUB_DIR: &str = "/run/veracage/pub";
 /// errors (2) so the GUI can re-prompt for the passphrase on exactly this case.
 const EXIT_CRYPT_FAILED: i32 = 4;
 
+/// Exit code for "the decrypted filesystem needs a repair we will not do": the
+/// volume was opened, checked, and left unmounted. Distinct so the GUI can say
+/// what happened instead of showing a bare exit code.
+const EXIT_FSCK_FAILED: i32 = 5;
+
 /// Shared-workspace model (docs/shared-workspace.md): the ONE
 /// session's private mount NS holds every open volume under this tmpfs, each at
 /// `<WORKSPACE>/<label>`. A tmpfs so the whole tree (and every idmap mount on it)
@@ -921,6 +926,72 @@ fn validated_exchange(path: &str, human_uid: u32) -> Option<PathBuf> {
 /// The label is read from the decrypted device, so the mountpoint is only known
 /// here. Returns (mountpoint, label). Fails (closing the dm) on any mount error.
 #[allow(clippy::too_many_arguments)]
+/// Filesystems checked before mounting, and their checker is `fsck.<type>`. All of
+/// them take `-p`: fix what is unambiguous, never ask a question, since there is no
+/// terminal here. NTFS is deliberately absent, `fsck.ntfs` is not a repair tool.
+const FSCK_TYPES: &[&str] = &["ext2", "ext3", "ext4", "vfat", "exfat"];
+
+/// The fsck exit bits that still allow the mount: 0 (clean), 1 (errors corrected),
+/// 2 (corrected, a reboot would be advised for a system disk). Anything else means
+/// uncorrected errors (4), an operational error (8), bad usage (16) or a cancelled
+/// run (32), and the filesystem needs attention this cannot give it.
+const FSCK_CORRECTED: i32 = 1 | 2;
+
+fn fsck_ok(code: Option<i32>) -> bool {
+    match code {
+        Some(code) => code & !FSCK_CORRECTED == 0,
+        None => false, // killed by a signal: nothing was concluded
+    }
+}
+
+/// The checker for this filesystem, if it is one we check and its binary is
+/// installed. A checker the host does not have is no reason to refuse a volume.
+fn fsck_checker(fstype: Option<&str>) -> Option<String> {
+    let fstype = match fstype {
+        Some(t) if FSCK_TYPES.contains(&t) => t,
+        _ => return None,
+    };
+    let bin = tool(&format!("fsck.{fstype}"));
+    Path::new(&bin).is_absolute().then_some(bin)
+}
+
+/// Check and repair the decrypted filesystem BEFORE mounting it. A volume that was
+/// not unmounted cleanly (a crash, a lost device, a pulled disk) carries a dirty
+/// filesystem, and mounting one dirty compounds the damage. Preen mode fixes what
+/// it safely can; anything left is reported so the caller refuses the mount, which
+/// leaves the user free to run a full check themselves instead of Veracage guessing
+/// at their data.
+fn fsck_volume(dm_path: &str, fstype: Option<&str>) -> Result<(), String> {
+    let checker = match fsck_checker(fstype) {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+    let st = match Command::new(&checker).args(["-p", dm_path]).status() {
+        Ok(st) => st,
+        Err(e) => {
+            // The binary is there but would not run: still not a reason to
+            // withhold the volume.
+            eprintln!("veracage: {checker} did not run: {e}");
+            return Ok(());
+        }
+    };
+    if fsck_ok(st.code()) {
+        if st.code() != Some(0) {
+            eprintln!("veracage: {checker} repaired the filesystem before mounting");
+        }
+        return Ok(());
+    }
+    Err(format!(
+        "the filesystem on this volume needs a repair Veracage will not make for you \
+         ({checker} exit {}). Open the volume with your usual tool and run a full \
+         check on it, then try again.",
+        match st.code() {
+            Some(c) => c.to_string(),
+            None => "signal".to_string(),
+        }
+    ))
+}
+
 fn mount_volume_at_workspace(
     source: &Path,
     backend: Option<Backend>,
@@ -943,6 +1014,13 @@ fn mount_volume_at_workspace(
     let label = probed_label.unwrap_or_else(|| {
         source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Volume".into())
     });
+    // Check the filesystem while nothing has it mounted: this is the only moment
+    // when a repair is both possible and safe. A volume that fails leaves nothing
+    // behind (the dm is closed) so the user can check it themselves.
+    if let Err(e) = fsck_volume(&dm_path, fstype.as_deref()) {
+        let _ = crypt::close(dm_name);
+        fail(&e, EXIT_FSCK_FAILED);
+    }
     let mountpoint = workspace_path(&label, source);
     // Staging mount target: a DOT-prefixed sibling of the volume dir under the
     // workspace (`<WORKSPACE>/.<label>.raw`). The leading dot means the leader's
@@ -1481,6 +1559,39 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fsck_lets_a_clean_or_repaired_filesystem_through_and_nothing_else() {
+        // 0 clean, 1 corrected, 2 corrected + reboot advised, 3 both bits.
+        for code in [0, 1, 2, 3] {
+            assert!(fsck_ok(Some(code)), "exit {code} should allow the mount");
+        }
+        // 4 uncorrected, 8 operational, 12 both, 16 usage, 32 cancelled, 128 lib.
+        for code in [4, 8, 12, 16, 32, 128] {
+            assert!(!fsck_ok(Some(code)), "exit {code} must refuse the mount");
+        }
+        // Killed by a signal: nothing was concluded, so do not mount.
+        assert!(!fsck_ok(None));
+    }
+
+    #[test]
+    fn only_filesystems_with_a_preen_checker_are_checked() {
+        // No type probed, and types we deliberately leave alone.
+        assert_eq!(fsck_checker(None), None);
+        assert_eq!(fsck_checker(Some("ntfs")), None);
+        assert_eq!(fsck_checker(Some("btrfs")), None);
+        assert_eq!(fsck_checker(Some("")), None);
+        // The ones we do check, when the host has the checker installed (a host
+        // without it must simply skip the check, which is what None means here).
+        for fstype in ["ext4", "vfat", "exfat"] {
+            let installed = Path::new(&tool(&format!("fsck.{fstype}"))).is_absolute();
+            assert_eq!(
+                fsck_checker(Some(fstype)).is_some(),
+                installed,
+                "{fstype}: checker presence and decision disagree"
+            );
+        }
+    }
 
     #[test]
     fn ownerless_filesystems_get_uid_mount_options() {

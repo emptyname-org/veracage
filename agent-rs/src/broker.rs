@@ -48,6 +48,9 @@ const COMPOSITOR_FIRST_WAIT: Duration = Duration::from_secs(180);
 /// The helper's "decrypt failed" exit code (EXIT_CRYPT_FAILED in helper-rs):
 /// almost always a wrong passphrase: re-prompt instead of failing silently.
 const EXIT_CRYPT_FAILED: i32 = 4;
+/// The helper's "the filesystem needs repair" exit code (EXIT_FSCK_FAILED): the
+/// volume decrypted fine but was left unmounted, so say what to do about it.
+const EXIT_FSCK_FAILED: i32 = 5;
 
 pub fn run_broker() -> ! {
     let dir = human_runtime_dir();
@@ -328,6 +331,12 @@ impl Broker {
                     Some(EXIT_CRYPT_FAILED) => {
                         retries.push((j.volume.clone(), j.app.take()));
                     }
+                    Some(EXIT_FSCK_FAILED) => errors.push(format!(
+                        "The filesystem on {} needs repair, so it was not mounted.\n\
+                         Open the volume with your usual tool and run a full check \
+                         on it, then try again.",
+                        base(&j.volume)
+                    )),
                     Some(126) | Some(127) => {} // polkit auth cancelled / denied
                     Some(c) => errors.push(format!(
                         "Could not mount {} (exit {c}).\nSee `journalctl --user` for details.",
