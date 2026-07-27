@@ -290,9 +290,10 @@ def _consume_launch_request(state: _LeaderState) -> None:
 
 def _post_status(message: str) -> None:
     """Publish a short progress note (`<nonce>\\t<text>`) to
-    `/run/veracage/rt/status` for the compositor's toolbar. The compositor stops
-    showing it once the app's window is mapped, or after its own timeout, so
-    there is nothing to clear here. Best-effort."""
+    `/run/veracage/rt/status`, which turns the compositor's spinner on. It must be
+    cleared with `_clear_status` when the launch resolves: the compositor's own
+    rules (a window appears, or a timeout) are backstops, not the primary signal.
+    Best-effort."""
     text = "".join(c for c in message if c.isprintable())[:80]
     tmp = COMPOSITOR_RUNTIME / f"status.{os.getpid()}.tmp"
     try:
@@ -301,6 +302,14 @@ def _post_status(message: str) -> None:
     except OSError:
         with contextlib.suppress(OSError):
             tmp.unlink()
+
+
+def _clear_status() -> None:
+    """Take the progress note down: this launch is resolved (the app is up, or it
+    died), so the spinner must stop. Leaving the file behind is what let a stale
+    note spin on a later session's desktop."""
+    with contextlib.suppress(OSError):
+        (COMPOSITOR_RUNTIME / "status").unlink()
 
 
 def _post_notice(message: str) -> None:
@@ -351,6 +360,7 @@ def _reap_children(state: _LeaderState) -> None:
         label, launched_at = state.children.pop(pid)
         _debug(state, f"exit {label!r}: pid={pid} status={status} "
                       f"after {now - launched_at:.1f}s")
+        _clear_status()
         if now - launched_at < _EARLY_EXIT_SECONDS:
             _post_notice(f"{label} failed to launch (exited immediately)")
 
@@ -684,6 +694,7 @@ def run_leader(mountpoint: str, app_specs: list, first_app: dict | None,
         finally:
             sel.close()
             _terminate_children(state)
+            _clear_status()
         return 0
     finally:
         _unpublish_apps(state)

@@ -62,6 +62,10 @@ pub fn run_broker() -> ! {
         std::process::exit(0);
     }
     claim_pidfile(&dir); // best-effort; failure must not stop us
+    // Any progress note here is ours from a previous run that did not get to clear
+    // it (a crash, a kill). Left in place it turns the new session's spinner on with
+    // nothing happening behind it.
+    publish_status("");
 
     let mut b = Broker {
         jobs: Vec::new(),

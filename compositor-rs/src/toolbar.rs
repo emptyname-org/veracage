@@ -92,65 +92,77 @@ pub struct Toolbar {
     /// composited: tessellated primitives, texture updates, pixels per point.
     pending: Option<(Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32)>,
     /// Set while something slow is happening (unlocking a volume, an app
-    /// starting): the spinner is drawn centred over everything. The text is not
-    /// shown, it only names the note in the debug log.
+    /// starting): the spinner turns over the desktop icon. The text itself is not
+    /// drawn, it only names the note in the debug log.
     status: Option<String>,
     /// A transient user-facing banner (e.g. a failed launch a leader reported),
     /// with the instant it was set. Cleared after NOTICE_TTL.
     notice: Option<(String, std::time::Instant)>,
 }
 
-/// The progress spinner: overall diameter and stroke width in logical points,
-/// how many strokes the arc has, and how long one cycle takes.
-const SPINNER_DIAMETER: f32 = 56.0;
+/// The progress spinner (see the status spec above `pick_status`): a full ring of
+/// short radial strokes over the desktop icon, with a brightness wave running
+/// clockwise. Diameter and stroke width are logical points.
+const SPINNER_DIAMETER: f32 = 46.0;
 const SPINNER_STROKE: f32 = 4.0;
-const SPINNER_STROKES: usize = 16;
+const SPINNER_STROKES: usize = 12;
+/// Inner end of each stroke, as a fraction of the outer radius.
+const SPINNER_INNER: f32 = 0.6;
+/// How long the wave takes to go round once.
 const SPINNER_CYCLE: f32 = 1.2;
-/// Where the arc starts and how far round it goes: an open ring, not a circle.
-const SPINNER_START: f32 = -std::f32::consts::FRAC_PI_2 - 1.1;
-const SPINNER_SWEEP: f32 = std::f32::consts::TAU * 0.82;
+/// Alpha of the stroke the wave has just left, and how sharply the tail decays
+/// (>1 keeps the bright part short without ever making a stroke vanish).
+const SPINNER_DIM: f32 = 0.14;
+const SPINNER_DECAY: f32 = 1.7;
 const SPINNER_ACCENT: egui::Color32 = egui::Color32::from_rgb(237, 100, 75);
-/// Strokes not yet reached are drawn at this alpha instead of being hidden, so
-/// the ring reads as a loading bar filling up rather than strokes appearing.
-const SPINNER_FAINT: f32 = 45.0 / 255.0;
 
-/// The progress spinner: an open ring of short radial strokes that fills up
-/// stroke by stroke, then starts over.
-fn draw_spinner(ui: &mut egui::Ui, diameter: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
-    if !ui.is_rect_visible(rect) {
-        return;
-    }
-    // Keep asking for frames: this animation IS the progress indication.
+/// Alpha of the stroke sitting `at` (a fraction of the way round the ring) while
+/// the wave's head is at `head`: full at the head itself, decaying with the
+/// distance the head has already travelled past it, down to SPINNER_DIM for the
+/// stroke the head is about to reach. Continuous in both arguments and across the
+/// wrap, which is what makes the ring read as one brightness moving rather than
+/// strokes switching on and off.
+fn stroke_alpha(head: f32, at: f32) -> f32 {
+    let behind = (head - at).rem_euclid(1.0);
+    SPINNER_DIM + (1.0 - SPINNER_DIM) * (1.0 - behind).powf(SPINNER_DECAY)
+}
+
+/// Where the spinner is drawn: centred on the desktop icon, the one fixed landmark
+/// on the backdrop, so it appears in the same place whether or not app windows are
+/// open.
+fn spinner_center(w_logical: i32, h_logical: i32) -> egui::Pos2 {
+    let (x, y) = hint_icon_pos(w_logical, h_logical);
+    egui::pos2(
+        x as f32 + HINT_ICON_PX as f32 * 0.5,
+        y as f32 + HINT_ICON_PX as f32 * 0.5,
+    )
+}
+
+/// Draw the ring centred on `center`. Every stroke is drawn every frame, only its
+/// alpha moves.
+fn draw_spinner(ui: &mut egui::Ui, center: egui::Pos2, diameter: f32) {
+    // This animation IS the progress indication, so keep asking for frames.
     ui.ctx().request_repaint();
-    let center = rect.center();
-    let radius = diameter * 0.5;
-    let time = ui.input(|i| i.time);
-    let progress = ((time / SPINNER_CYCLE as f64) % 1.0) as f32;
-    let active = (progress * SPINNER_STROKES as f32).ceil() as usize;
+    let outer = diameter * 0.5;
+    let head = (ui.input(|i| i.time) / SPINNER_CYCLE as f64).rem_euclid(1.0) as f32;
     let painter = ui.painter();
     for i in 0..SPINNER_STROKES {
-        let t = i as f32 / (SPINNER_STROKES - 1) as f32;
-        let angle = SPINNER_START + SPINNER_SWEEP * t;
+        let at = i as f32 / SPINNER_STROKES as f32;
+        // Screen y grows downward, so increasing the angle turns clockwise.
+        let angle = std::f32::consts::TAU * at - std::f32::consts::FRAC_PI_2;
         let dir = egui::vec2(angle.cos(), angle.sin());
-        let color = if i < active {
-            SPINNER_ACCENT
-        } else {
-            SPINNER_ACCENT.gamma_multiply(SPINNER_FAINT)
-        };
         painter.line_segment(
-            [center + dir * radius * 0.78, center + dir * radius],
-            egui::Stroke::new(SPINNER_STROKE, color),
+            [center + dir * outer * SPINNER_INNER, center + dir * outer],
+            egui::Stroke::new(
+                SPINNER_STROKE,
+                SPINNER_ACCENT.gamma_multiply(stroke_alpha(head, at)),
+            ),
         );
     }
 }
 
 /// How long a transient toolbar notice (e.g. a failed-launch banner) stays up.
 const NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(6);
-
-/// How long a leader's "Starting <app>" note may stay up when no window ever
-/// appears (a crashed or window-less app), so the spinner can't spin forever.
-const LAUNCH_STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// The shared app icon PNG (192px = 2x the 96pt display box, for HiDPI), the
 /// same file the About window uses. Regenerate with `convert
@@ -571,11 +583,22 @@ impl Toolbar {
             // it never eats a click. Its animation is what keeps asking for frames
             // until the note clears.
             if status.is_some() {
+                // Over the desktop icon, the one fixed landmark on the backdrop, so
+                // the spinner always appears in the same place whether or not app
+                // windows are open.
+                let screen = ctx.screen_rect();
+                let center = spinner_center(screen.width() as i32, screen.height() as i32);
                 egui::Area::new(egui::Id::new("veracage_status"))
                     .order(egui::Order::Foreground)
-                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .fixed_pos(center - egui::vec2(SPINNER_DIAMETER, SPINNER_DIAMETER) * 0.5)
                     .interactable(false)
-                    .show(ctx, |ui| draw_spinner(ui, SPINNER_DIAMETER));
+                    .show(ctx, |ui| {
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(SPINNER_DIAMETER, SPINNER_DIAMETER),
+                            egui::Sense::hover(),
+                        );
+                        draw_spinner(ui, rect.center(), SPINNER_DIAMETER);
+                    });
             }
 
             // Transient banner (e.g. a leader-reported failed launch), floating
@@ -756,88 +779,129 @@ const NOTICE_FILE: &str = "notice";
 /// Read the transient notice a leader published (e.g. a failed launch), as
 /// `(nonce, text)`. The nonce (a wall-clock ns stamp) lets the caller show each
 /// distinct notice once. Bounded read, control chars stripped, malformed ignored.
-/// The progress note to show, from either publisher: `pub/status` (the human-side
-/// broker, while a volume is being unlocked) or `rt/status` (a leader, while a
-/// just-launched app has no window yet). The broker deletes its file when the
-/// open finishes; the leader's note cannot know when the app's window appears, so
-/// it is dropped here once a window is mapped or after LAUNCH_STATUS_TTL.
-/// A leader's launch note as the compositor tracks it: which note (its stamp),
-/// how many windows were mapped when it arrived, and whether it is finished.
+/// A progress note the compositor is tracking: which note (its file's timestamp),
+/// how many windows were mapped when it arrived, and whether it has finished.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LaunchNote {
-    stamp: u64,
+    stamp: u128,
     windows_at_arrival: usize,
     done: bool,
 }
 
+/// How long a note may keep the spinner turning. A launch note is bounded tightly:
+/// an app that never maps a window (it crashed, or it has no window) must not leave
+/// the spinner going, and the failure banner explains it anyway. A broker note is
+/// deleted when the open resolves, so its bound is only a backstop for a broker
+/// that died mid-open.
+const STATUS_TTL_LAUNCH: std::time::Duration = std::time::Duration::from_secs(10);
+const STATUS_TTL_BROKER: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Read both status files and decide what the spinner shows.
+///
+/// Also deletes a leader note left behind by an earlier session: `rt/status` lives
+/// in a runtime directory shared by every session, and the compositor owns it.
 pub fn scan_status(
     windows_now: usize,
     note: Option<LaunchNote>,
 ) -> (Option<String>, Option<LaunchNote>) {
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let leader_path = std::path::Path::new(RUNTIME_DIR).join("status");
+    let from_leader = read_status_line(&leader_path);
+    if from_leader.as_ref().is_some_and(|(stamp, _)| *stamp < session_start_ns()) {
+        let _ = std::fs::remove_file(&leader_path);
+        return pick_status(None, None, windows_now, note, now_ns(), session_start_ns());
+    }
     pick_status(
         read_status_line(&std::path::Path::new(PUB_DIR).join("status")),
-        read_status_line(&std::path::Path::new(RUNTIME_DIR).join("status")),
+        from_leader,
         windows_now,
         note,
-        now_ns,
+        now_ns(),
+        session_start_ns(),
     )
+}
+
+fn now_ns() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// When this compositor started, as a wall-clock nanosecond count. Notes older
+/// than this belong to a previous session (see `pick_status`).
+fn session_start_ns() -> u128 {
+    use std::sync::OnceLock;
+    static START: OnceLock<u128> = OnceLock::new();
+    *START.get_or_init(now_ns)
 }
 
 /// Which note to show, and the note state to remember. Pure, so it is unit-tested.
 ///
-/// The broker's note wins and is trusted to be current: it is deleted when the
-/// open finishes. A leader's launch note ("Starting Kate") cannot know when the
-/// app's window appears, so it runs until the window COUNT rises above what it was
-/// when that note arrived (a window merely EXISTING proves nothing - one may
-/// already be open), or until it expires.
+/// THE SPEC. Two publishers ask for a spinner, each with one file whose modification
+/// time is the note's identity and its age:
+///   * `pub/status` - the human-side broker, while a volume is being unlocked.
+///   * `rt/status` - a session leader, while a just-launched app has no window yet.
+///
+/// A note stops being shown as soon as ANY of these holds, which is what keeps the
+/// spinner honest:
+///   1. its file is gone, because the publisher resolved the operation;
+///   2. it predates this compositor, so it is a leftover from an earlier session
+///      (the runtime directory outlives one session);
+///   3. a window appeared that was not there when the note arrived - the launched
+///      app's own window - and then it STAYS finished, so closing a window later
+///      cannot revive the spinner;
+///   4. it is older than its TTL (see the constants above).
+///
+/// The broker's note wins while both exist: unlocking is the operation the user is
+/// waiting on, and an app launch that follows publishes a fresher note anyway.
 fn pick_status(
-    from_broker: Option<(u64, String)>,
-    from_leader: Option<(u64, String)>,
+    from_broker: Option<(u128, String)>,
+    from_leader: Option<(u128, String)>,
     windows_now: usize,
     note: Option<LaunchNote>,
     now_ns: u128,
+    session_start_ns: u128,
 ) -> (Option<String>, Option<LaunchNote>) {
-    if let Some((_, text)) = from_broker {
+    let fresh = |src: Option<(u128, String)>, ttl: std::time::Duration| {
+        src.filter(|(stamp, _)| {
+            *stamp >= session_start_ns && now_ns.saturating_sub(*stamp) < ttl.as_nanos()
+        })
+    };
+    if let Some((_, text)) = fresh(from_broker, STATUS_TTL_BROKER) {
         return (Some(text), note);
     }
-    let Some((stamp_ns, text)) = from_leader else {
+    let Some((stamp, text)) = fresh(from_leader, STATUS_TTL_LAUNCH) else {
         return (None, None);
     };
     // A note we have not seen before: remember how many windows were up when it
     // arrived, so the app's OWN window is what finishes it.
     let mut note = match note {
-        Some(n) if n.stamp == stamp_ns => n,
-        _ => LaunchNote { stamp: stamp_ns, windows_at_arrival: windows_now, done: false },
+        Some(n) if n.stamp == stamp => n,
+        _ => LaunchNote { stamp, windows_at_arrival: windows_now, done: false },
     };
-    // Finished notes stay finished. The leader has no way to delete its file when
-    // the window appears, so without this a note that already did its job came
-    // back the moment the window count dropped again - closing a window brought
-    // the spinner back and left it turning until the note expired.
-    if windows_now > note.windows_at_arrival
-        || now_ns.saturating_sub(stamp_ns as u128) >= LAUNCH_STATUS_TTL.as_nanos()
-    {
+    if windows_now > note.windows_at_arrival {
         note.done = true;
     }
     ((!note.done).then_some(text), Some(note))
 }
 
-/// A status file's one line: `<text>` (broker) or `<stamp_ns>\t<text>` (leader).
-/// The stamp is 0 when absent.
-fn read_status_line(path: &std::path::Path) -> Option<(u64, String)> {
+/// A status file's one line, as `(modification time in ns, text)`. The leader
+/// writes `<nonce>\t<text>` and the broker writes bare text: the nonce is dropped,
+/// since the file's own timestamp dates every note uniformly.
+fn read_status_line(path: &std::path::Path) -> Option<(u128, String)> {
     let md = std::fs::metadata(path).ok()?;
     if !md.is_file() || md.len() > 4096 {
         return None;
     }
+    let stamp = md
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
     let body = std::fs::read_to_string(path).ok()?;
     let line = body.lines().next()?;
-    let (stamp, raw) = match line.split_once('\t') {
-        Some((s, rest)) => (s.parse().unwrap_or(0), rest),
-        None => (0, line),
-    };
+    let raw = line.split_once('\t').map_or(line, |(_, rest)| rest);
     let text: String = raw.chars().filter(|c| !c.is_control()).take(80).collect();
     (!text.is_empty()).then_some((stamp, text))
 }
@@ -1091,92 +1155,168 @@ mod tests {
 
     const HOUR_NS: u128 = 3_600_000_000_000;
 
+    /// A session that started an hour into the epoch, so notes can be dated
+    /// before it (an earlier session) or after it.
+    const START: u128 = HOUR_NS;
+
+    fn note_at(stamp: u128, text: &str) -> Option<(u128, String)> {
+        Some((stamp, text.to_string()))
+    }
+
     #[test]
-    fn broker_status_wins_and_is_never_expired() {
+    fn broker_note_wins_while_unlocking() {
         // The broker deletes its file when the open ends, so whatever is there is
-        // current - even with windows mapped, or with an old leader stamp beside it.
-        let broker = Some((0, "Unlocking work.vc".to_string()));
-        let leader = Some((HOUR_NS as u64, "Starting Dolphin".to_string()));
+        // what the user is waiting on - even with windows mapped, or with a leader
+        // note beside it.
+        let broker = note_at(START, "Unlocking work.vc");
+        let leader = note_at(START, "Starting Dolphin");
         for windows in [0, 3] {
-            let (shown, _) = pick_status(broker.clone(), leader.clone(), windows, None, HOUR_NS);
+            let (shown, _) =
+                pick_status(broker.clone(), leader.clone(), windows, None, START, START);
             assert_eq!(shown, Some("Unlocking work.vc".to_string()));
         }
     }
 
     #[test]
     fn launch_note_ends_when_that_app_maps_its_window_and_stays_ended() {
-        // The note is shown until the window COUNT rises above what it was when
-        // the note arrived, so launching a second app still shows progress. And
-        // once finished it must STAY finished: it used to come back when the count
-        // dropped again, so closing a window revived the spinner (bug report).
-        let leader = Some((HOUR_NS as u64, "Starting Kate".to_string()));
-        // One app already open when the note arrives: show it, remember baseline 1.
-        let (shown, note) = pick_status(None, leader.clone(), 1, None, HOUR_NS);
+        // Shown until the window COUNT rises above what it was when the note
+        // arrived, so launching a second app still shows progress. Once finished it
+        // STAYS finished: otherwise closing a window revives the spinner.
+        let leader = note_at(START, "Starting Kate");
+        let (shown, note) = pick_status(None, leader.clone(), 1, None, START, START);
         assert_eq!(shown, Some("Starting Kate".to_string()));
-        // Still one window: keep showing.
-        let (shown, note) = pick_status(None, leader.clone(), 1, note, HOUR_NS);
+        let (shown, note) = pick_status(None, leader.clone(), 1, note, START, START);
         assert_eq!(shown, Some("Starting Kate".to_string()));
         // Kate's window maps: done.
-        let (shown, note) = pick_status(None, leader.clone(), 2, note, HOUR_NS);
+        let (shown, note) = pick_status(None, leader.clone(), 2, note, START, START);
         assert_eq!(shown, None);
-        // A window closes, count back to 1 - and even to 0: still done.
-        let (shown, note) = pick_status(None, leader.clone(), 1, note, HOUR_NS);
+        // Windows close again, even all of them: still done.
+        let (shown, note) = pick_status(None, leader.clone(), 1, note, START, START);
         assert_eq!(shown, None);
-        let (shown, _) = pick_status(None, leader, 0, note, HOUR_NS);
+        let (shown, _) = pick_status(None, leader, 0, note, START, START);
         assert_eq!(shown, None);
     }
 
     #[test]
-    fn launch_note_expires_so_the_spinner_cannot_spin_forever() {
-        // An app that never maps a window (crashed, or window-less) must not leave
-        // the spinner turning, and neither must a file left by an earlier session.
-        let stamp = HOUR_NS as u64;
-        let leader = Some((stamp, "Starting Dolphin".to_string()));
-        let inside = HOUR_NS + LAUNCH_STATUS_TTL.as_nanos() - 1;
-        let outside = HOUR_NS + LAUNCH_STATUS_TTL.as_nanos();
-        let (shown, note) = pick_status(None, leader.clone(), 0, None, inside);
+    fn a_launch_that_never_maps_a_window_stops_at_the_ttl() {
+        // A crashed or window-less app must not leave the spinner turning.
+        let leader = note_at(START, "Starting Dolphin");
+        let inside = START + STATUS_TTL_LAUNCH.as_nanos() - 1;
+        let outside = START + STATUS_TTL_LAUNCH.as_nanos();
+        let (shown, note) = pick_status(None, leader.clone(), 0, None, inside, START);
         assert!(shown.is_some());
-        let (shown, _) = pick_status(None, leader, 0, note, outside);
+        let (shown, _) = pick_status(None, leader, 0, note, outside, START);
         assert_eq!(shown, None);
+    }
+
+    #[test]
+    fn a_broker_note_that_is_never_deleted_stops_at_its_own_ttl() {
+        // The broker deletes its file; this only covers one that died mid-open.
+        let broker = note_at(START, "Unlocking work.vc");
+        let inside = START + STATUS_TTL_BROKER.as_nanos() - 1;
+        let outside = START + STATUS_TTL_BROKER.as_nanos();
+        assert!(pick_status(broker.clone(), None, 0, None, inside, START).0.is_some());
+        assert_eq!(pick_status(broker, None, 0, None, outside, START).0, None);
+    }
+
+    #[test]
+    fn a_note_from_an_earlier_session_is_never_shown() {
+        // Both status files live in directories that outlive one session, so a note
+        // written before this compositor started belongs to a session that is gone:
+        // showing it spins on a fresh desktop with nothing happening.
+        let before = START - 1;
+        let leader = note_at(before, "Starting Konsole");
+        let broker = note_at(before, "Unlocking work.vc");
+        assert_eq!(pick_status(None, leader, 0, None, START, START).0, None);
+        assert_eq!(pick_status(broker, None, 0, None, START, START).0, None);
+        // A note written after startup is fine.
+        let live = note_at(START + 1, "Starting Konsole");
+        assert!(pick_status(None, live, 0, None, START + 2, START).0.is_some());
     }
 
     #[test]
     fn a_new_note_starts_fresh_after_the_previous_one_finished() {
-        // Launching another app publishes a new stamp, which must show again even
+        // Launching another app writes the file again, which must show again even
         // though the previous note was finished.
-        let first = Some((HOUR_NS as u64, "Starting Kate".to_string()));
-        let (_, note) = pick_status(None, first.clone(), 0, None, HOUR_NS);
-        let (_, note) = pick_status(None, first, 1, note, HOUR_NS); // finished
-        let second = Some((HOUR_NS as u64 + 5, "Starting Dolphin".to_string()));
-        let (shown, _) = pick_status(None, second, 1, note, HOUR_NS + 5);
+        let first = note_at(START, "Starting Kate");
+        let (_, note) = pick_status(None, first.clone(), 0, None, START, START);
+        let (_, note) = pick_status(None, first, 1, note, START, START); // finished
+        let second = note_at(START + 5, "Starting Dolphin");
+        let (shown, _) = pick_status(None, second, 1, note, START + 5, START);
         assert_eq!(shown, Some("Starting Dolphin".to_string()));
     }
 
     #[test]
     fn no_note_published_forgets_the_previous_one() {
-        assert_eq!(pick_status(None, None, 2, None, HOUR_NS), (None, None));
+        assert_eq!(pick_status(None, None, 2, None, START, START), (None, None));
     }
 
     #[test]
-    fn status_line_parses_both_writers_and_rejects_junk() {
+    fn status_line_takes_the_text_from_both_writers_and_the_time_from_the_file() {
         let dir = std::env::temp_dir().join(format!("veracage-status-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("status");
-        // Leader form: "<stamp_ns>\t<text>".
+        let now = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        };
+        // Leader form: "<nonce>\t<text>" - the nonce is dropped, the mtime dates it.
+        let before = now();
         std::fs::write(&p, "12345\tStarting Kate\n").unwrap();
-        assert_eq!(read_status_line(&p), Some((12345, "Starting Kate".to_string())));
-        // Broker form: bare text, no stamp.
+        let (stamp, text) = read_status_line(&p).unwrap();
+        assert_eq!(text, "Starting Kate");
+        // The file's own clock, so allow a second of slack against ours.
+        assert!(
+            stamp.abs_diff(before) < 2_000_000_000,
+            "stamp {stamp} is not around the write time {before}"
+        );
+        // Broker form: bare text, no nonce.
         std::fs::write(&p, "Unlocking work.vc\n").unwrap();
-        assert_eq!(read_status_line(&p), Some((0, "Unlocking work.vc".to_string())));
+        assert_eq!(read_status_line(&p).unwrap().1, "Unlocking work.vc");
         // Control characters are stripped; an empty result is no status.
         std::fs::write(&p, "1\t\u{1b}[31mred\u{7}\n").unwrap();
-        assert_eq!(read_status_line(&p), Some((1, "[31mred".to_string())));
+        assert_eq!(read_status_line(&p).unwrap().1, "[31mred");
         std::fs::write(&p, "\n").unwrap();
         assert_eq!(read_status_line(&p), None);
         std::fs::write(&p, "").unwrap();
         assert_eq!(read_status_line(&p), None);
         assert_eq!(read_status_line(&dir.join("absent")), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_spinner_wave_is_brightest_at_the_head_and_fades_backwards() {
+        // The head is full brightness, and strokes the head has already passed fade
+        // with distance, all the way round: no stroke is ever invisible, and none
+        // brighter than the head.
+        let head = 0.5;
+        assert!((stroke_alpha(head, head) - 1.0).abs() < 1e-6);
+        let mut previous = 1.0;
+        for step in 1..=11 {
+            let at = (head - step as f32 / 12.0).rem_euclid(1.0);
+            let alpha = stroke_alpha(head, at);
+            assert!(alpha < previous, "stroke {step} behind the head did not fade");
+            assert!(alpha >= SPINNER_DIM, "stroke {step} fell below the floor");
+            previous = alpha;
+        }
+    }
+
+    #[test]
+    fn the_spinner_wave_is_continuous_across_the_wrap() {
+        // A stroke just behind the head is bright even when the head has wrapped
+        // past zero, otherwise the ring flickers once per turn.
+        let just_behind = stroke_alpha(0.0, 0.99);
+        assert!(just_behind > 0.9, "wrap makes the wave jump: {just_behind}");
+    }
+
+    #[test]
+    fn the_spinner_sits_on_the_desktop_icon() {
+        let (ix, iy) = hint_icon_pos(1024, 680);
+        let c = spinner_center(1024, 680);
+        assert_eq!(c.x, ix as f32 + HINT_ICON_PX as f32 / 2.0);
+        assert_eq!(c.y, iy as f32 + HINT_ICON_PX as f32 / 2.0);
     }
 
     #[test]

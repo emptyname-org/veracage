@@ -232,6 +232,24 @@ def test_reap_does_not_report_normal_quit(tmp_path, monkeypatch):
     assert not (tmp_path / "notice").exists()
 
 
+def test_reap_takes_the_progress_note_down(tmp_path, monkeypatch):
+    # The note turns the compositor's spinner on, so an exited app must take it
+    # down: whether the launch failed or the app simply quit, it is resolved. A
+    # note left behind spins on, and outlives the session in the shared runtime
+    # directory.
+    monkeypatch.setattr(leader, "COMPOSITOR_RUNTIME", tmp_path)
+    monkeypatch.setattr(leader.os, "waitpid", lambda pid, flags: (pid, 0))
+    status = tmp_path / "status"
+
+    for launched_at, label in [(time.monotonic(), "VeraCrypt"),                    # failed
+                               (time.monotonic() - 60.0, "Kate")]:                 # quit later
+        status.write_text("1\tStarting something\n")
+        st = _state(wl_socket=Path("/run/x/wayland-1"))
+        st.children = {11: (label, launched_at)}
+        leader._reap_children(st)
+        assert not status.exists(), f"note survived the {label} exit"
+
+
 def test_launch_app_missing_dependency(monkeypatch):
     monkeypatch.setattr(leader, "bwrap_command", lambda *a, **k: ["bwrap"])
 

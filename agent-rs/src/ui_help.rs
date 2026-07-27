@@ -29,10 +29,20 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "Apps run isolated inside Veracage. They see the mounted volumes, a \
              temporary workspace and the shared directory, nothing else of your \
              system, and they have no network.",
-            "Apps also work before any volume is mounted. Everything they \
-             write outside the shared directory lands in the temporary \
-             workspace, which is discarded when Veracage quits, so an empty \
-             Veracage is a private scratchpad.",
+            "Apps also work before any volume is mounted, which makes an empty \
+             Veracage a private scratchpad.",
+        ],
+    ),
+    (
+        "Nothing is stored in Veracage",
+        &[
+            "Veracage has no storage of its own. A file is kept only if you save \
+             it into a mounted volume or into the shared directory.",
+            "Everything else lives in memory: the home directory apps start in, \
+             their settings, caches and downloads. It is discarded when Veracage \
+             quits, without asking.",
+            "So save your work into one of the volume directories, or into \
+             /exchange to pass it to the host.",
         ],
     ),
     (
