@@ -74,6 +74,14 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
         "--ro-bind-try", "/etc/ld.so.cache", "/etc/ld.so.cache",
         "--ro-bind-try", "/etc/ld.so.conf.d", "/etc/ld.so.conf.d",
         "--ro-bind-try", "/etc/alternatives", "/etc/alternatives",
+        # The cursor theme. Toolkits load cursors themselves from the theme named
+        # "default", which resolves /usr/share/icons/default/index.theme ->
+        # /etc/alternatives/x-cursor-theme -> /etc/X11/cursors/<theme>.theme. With
+        # that last hop missing the symlink dangles, no theme loads, and an app
+        # falls back to its own built-in bitmaps: those cover the arrow and the
+        # I-beam but NOT the resize shapes, so a window edge gave no resize cursor
+        # (measured: 10x16 fallback bitmaps instead of the theme's 48x48).
+        "--ro-bind-try", "/etc/X11/cursors", "/etc/X11/cursors",
         "--ro-bind-try", "/etc/fonts", "/etc/fonts",
         "--ro-bind-try", "/etc/localtime", "/etc/localtime",
         "--ro-bind-try", "/etc/machine-id", "/etc/machine-id",

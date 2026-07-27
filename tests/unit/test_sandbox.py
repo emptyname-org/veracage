@@ -194,12 +194,14 @@ def test_etc_is_not_wholesale_bound(argv):
 
 def test_essential_etc_paths_bound(argv):
     """Rendering deps from /etc must survive the curation: fontconfig, the
-    dynamic linker, NSS for getpwuid, timezone, machine-id for Qt/D-Bus."""
+    dynamic linker, NSS for getpwuid, timezone, machine-id for Qt/D-Bus, and both
+    hops of the cursor-theme symlink chain (alternatives -> X11/cursors), without
+    which apps show no resize cursors."""
     pairs = list(zip(argv, argv[1:]))
     bound = {b for a, b in pairs if a in {"--ro-bind", "--ro-bind-try"}}
     for needed in ("/etc/fonts", "/etc/ld.so.cache", "/etc/passwd",
                    "/etc/group", "/etc/nsswitch.conf", "/etc/localtime",
-                   "/etc/machine-id"):
+                   "/etc/machine-id", "/etc/alternatives", "/etc/X11/cursors"):
         assert needed in bound, f"{needed} not bound into sandbox"
 
 
