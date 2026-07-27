@@ -144,7 +144,7 @@ impl HostClipboard {
         }
     }
 
-    /// Update the auto-clear policy live (from the compositor's ~1s scan of the
+    /// Update the auto-clear policy live (from the compositor's scan of the
     /// published `clipclear` file). The worker keeps its secure default until
     /// the first policy arrives.
     pub fn set_policy(&self, enabled: bool, secs: u32) {
@@ -429,8 +429,8 @@ fn clear_pushed(state: &mut State, conn: &Connection, queue: &mut wayland_client
     let Some(pushed) = state.pushed.take() else {
         return;
     };
-    // Read the current primary selection (if the device supports it) so the plan
-    // can decide whether it still holds our value.
+    // Read the current primary selection (if the device supports it) so
+    // `plan_clear` can decide whether it still holds our value.
     let current_primary = if state.has_primary {
         read_selection(state, conn, queue, true)
     } else {

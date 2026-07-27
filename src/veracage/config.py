@@ -332,9 +332,9 @@ def load() -> Config:
                       file=sys.stderr)
                 continue
             try:
-                # A legacy `args` key is ignored (apps launch bare). Dedupe by
-                # exec basename, first entry wins: older configs could hold the
-                # same app twice (e.g. `dolphin` and `/usr/bin/dolphin`).
+                # An `args` key is ignored (apps launch bare). Dedupe by exec
+                # basename, first entry wins: a config can name the same app
+                # twice (e.g. `dolphin` and `/usr/bin/dolphin`).
                 exec_ = entry["exec"]
                 base = os.path.basename(str(exec_))
                 if base in seen_basenames:
@@ -355,8 +355,8 @@ def load() -> Config:
     last = default.get("last_used_app")
     if not isinstance(last, str):
         last = None
-    # A legacy `gpu` key (the removed per-app GPU toggle: the GPU is always
-    # passed through now) is silently ignored on load and dropped on save.
+    # A `gpu` key is ignored on load and dropped on save: the GPU is always
+    # passed through to the sandbox.
     exchange = _coerce_bool(default.get("exchange", True), "default.exchange")
     exchange_dir = default.get("exchange_dir") or None
     clip_clear = _coerce_bool(default.get("clip_clear", True), "default.clip_clear")

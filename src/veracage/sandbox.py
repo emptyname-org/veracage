@@ -76,11 +76,10 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
         "--ro-bind-try", "/etc/alternatives", "/etc/alternatives",
         # The cursor theme. Toolkits load cursors themselves from the theme named
         # "default", which resolves /usr/share/icons/default/index.theme ->
-        # /etc/alternatives/x-cursor-theme -> /etc/X11/cursors/<theme>.theme. With
-        # that last hop missing the symlink dangles, no theme loads, and an app
-        # falls back to its own built-in bitmaps: those cover the arrow and the
-        # I-beam but NOT the resize shapes, so a window edge gave no resize cursor
-        # (measured: 10x16 fallback bitmaps instead of the theme's 48x48).
+        # /etc/alternatives/x-cursor-theme -> /etc/X11/cursors/<theme>.theme.
+        # Both hops must be present: with a dangling symlink no theme loads at all
+        # and an app falls back to its own built-in bitmaps, which have an arrow and
+        # an I-beam but no resize shapes.
         "--ro-bind-try", "/etc/X11/cursors", "/etc/X11/cursors",
         "--ro-bind-try", "/etc/fonts", "/etc/fonts",
         "--ro-bind-try", "/etc/localtime", "/etc/localtime",
@@ -111,12 +110,10 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
         # the user saves under /vaults/<label> persist; a stray save to ~ itself
         # (the tmpfs workspace root) would not - but that is not a volume.
         "--perms", "0700", "--tmpfs", "/xdg",
-        # Env - start from EMPTY (`--clearenv`) so the possibly-hostile app does
-        # NOT inherit the leader's environment (host DISPLAY, session tokens, auth
-        # sockets, etc.); set only what it needs below. Inheriting was inert today
-        # (--unshare-net kills the X11/abstract-socket paths) but left isolation
-        # implicit; this makes it explicit. PATH is required for bwrap to resolve
-        # a bare `app.exec`; locale is added from an allowlist further down.
+        # Env - start from EMPTY (`--clearenv`) so the app does NOT inherit the
+        # leader's environment (host DISPLAY, session tokens, auth sockets, etc.);
+        # set only what it needs below. PATH is required for bwrap to resolve a bare
+        # `app.exec`; locale and the cursor theme come from an allowlist below.
         "--clearenv",
         "--setenv", "HOME", "/vaults",
         "--setenv", "PATH", "/usr/bin:/bin:/usr/local/bin",
@@ -135,8 +132,8 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
     ]
     # Preserve locale and the cursor theme (an explicit allowlist, not blanket
     # inheritance) so dates, numbers, fonts and the pointer match the host session;
-    # everything else stays cleared. Without XCURSOR_SIZE an app picks the theme's
-    # next size up - visibly larger cursors inside Veracage than outside.
+    # everything else stays cleared. XCURSOR_SIZE matters: without it an app picks
+    # the theme's next nominal size up, drawing larger cursors than the host.
     for var in ("LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_TIME", "LC_NUMERIC",
                 "XCURSOR_THEME", "XCURSOR_SIZE"):
         val = os.environ.get(var)

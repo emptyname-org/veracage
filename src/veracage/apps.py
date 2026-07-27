@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 # Known file-manager binaries - matched on the `exec` basename. Used to: auto-launch
 # one when a volume opens with no app named (cli), nudge the user to enable one (the
-# picker), and tell the compositor which app "opens the volume" (the desktop tile).
+# picker), and name the app that "opens the volume" for the compositor.
 # Not a catalog, just a hint set.
 FILE_MANAGERS = frozenset({
     "dolphin", "nautilus", "nemo", "thunar", "pcmanfm", "pcmanfm-qt",

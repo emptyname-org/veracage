@@ -76,9 +76,9 @@ impl SelectionHandler for State {
         _seat: Seat<Self>,
         _user_data: &(),
     ) {
-        // Fires when an app requests the selection bytes (i.e. pastes). No log
-        // here: the old `eprintln!` leaked paste metadata (mime + byte length) to
-        // the journal on every paste.
+        // Fires when an app requests the selection bytes (i.e. pastes). Nothing
+        // is logged here: even paste metadata (mime type, byte length) would
+        // describe the user's clipboard to the journal.
         // `clip_source` is an Arc, so this clone is a refcount bump, not a copy of
         // the (up to 16 MiB) buffer. The write runs on a bounded, non-panicking
         // worker: a hostile app looping `receive` can't exhaust threads/fds or
@@ -142,7 +142,7 @@ impl WaylandDndGrabHandler for State {
                 ptr.set_grab(self, grab, serial, Focus::Keep);
             }
             GrabType::Touch => {
-                // smallvil lacks touch handling
+                // No touch input: this compositor drives a pointer and a keyboard.
                 source.cancel();
             }
         }

@@ -1,7 +1,6 @@
 //! The desktop's text lines, rasterised into a memory buffer so they can live on
-//! the BACKDROP next to the Veracage icon - below the app windows - instead of
-//! being painted by egui, which draws above everything and so could only show
-//! them while nothing was open.
+//! the BACKDROP next to the Veracage icon, below the app windows. egui paints
+//! above everything, so text drawn there could not sit behind a window.
 //!
 //! epaint (egui's own text stack, already a dependency) does the font loading,
 //! shaping and glyph rasterising. All this module adds is the blit: copy each

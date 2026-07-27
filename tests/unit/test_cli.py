@@ -143,7 +143,7 @@ def test_open_forwards_xdg_runtime_dir(monkeypatch, configured, fake_vault):
 
 
 def test_open_omits_compositor_flag(monkeypatch, configured, fake_vault):
-    """Phase 2: the leader no longer spawns a compositor, so cmd_open threads no
+    """The leader does not spawn a compositor, so cmd_open threads no
     --compositor to it. It attaches to the shared /run/veracage socket."""
     _, argv = _run_open(monkeypatch, fake_vault, "kate")
     sep = argv.index("--")
@@ -248,7 +248,7 @@ def test_open_refuses_when_bootstrap_volume_still_mounted(
 def test_open_proceeds_after_per_volume_close_of_bootstrap(
         monkeypatch, configured, fake_vault):
     """Regression: the leader keeps serving the bootstrap vault's socket for the
-    whole session, so a bare ok:true reply used to make the vault unopenable
+    whole session, so a bare ok:true reply must not make the vault unopenable
     after its volume was closed via Close volume, until the session ended."""
     monkeypatch.setattr(
         "veracage.cli.leader.send_request",
@@ -322,7 +322,7 @@ def test_up_brings_compositor_then_empty_session(monkeypatch):
 
 def test_list_and_close_survive_a_stale_socket(monkeypatch, tmp_path, capsys):
     """Regression: a socket file with a dead leader raises ConnectionRefusedError,
-    which cmd_list/cmd_close used to let traceback."""
+    which cmd_list/cmd_close must handle rather than traceback."""
     stale = tmp_path / "stale.sock"
     stale.write_text("")
     monkeypatch.setattr("veracage.cli.leader.send_request",

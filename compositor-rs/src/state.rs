@@ -92,7 +92,7 @@ pub struct State {
     /// dropped - otherwise the worker faults on the freed display (SIGSEGV).
     pub host_clipboard_worker: Option<std::thread::JoinHandle<()>>,
 
-    /// In-window egui toolbar (Phase 3). Built lazily on the first Redraw (needs
+    /// In-window egui toolbar. Built lazily on the first Redraw (needs
     /// the GL context current); `toolbar_failed` latches a construction failure so
     /// we don't retry every frame. The compositor then just runs with no toolbar.
     pub toolbar: Option<crate::toolbar::Toolbar>,
@@ -101,7 +101,7 @@ pub struct State {
     /// Something changed and a frame must be (re)rendered: a client committed, an
     /// input arrived, or egui is animating. The compositor software-renders
     /// (llvmpipe), so redrawing an unchanged frame is pure CPU waste - the timer
-    /// only wakes the renderer when this is set (or the ~1s scan is due). Starts
+    /// only wakes the renderer when this is set (or the scan is due). Starts
     /// true so the first frame paints.
     pub dirty: bool,
 
@@ -134,11 +134,11 @@ pub struct State {
     pub window_size_applied: String,
 
     /// Active Veracage keyboard shortcuts (clipboard transfers), refreshed from
-    /// `/run/veracage/pub/shortcuts` on the ~1s scan.
+    /// `/run/veracage/pub/shortcuts` on the discovery scan.
     pub binds: crate::shortcuts::Binds,
 
     /// The host-clipboard auto-clear policy (enabled, timeout secs) last pushed
-    /// to the clipboard worker, so the ~1s scan only sends it on a change.
+    /// to the clipboard worker, so the scan only sends it on a change.
     /// Initialized to the worker's own secure default (enabled, 30s).
     pub clip_clear_applied: (bool, u32),
 

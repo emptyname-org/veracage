@@ -8,7 +8,7 @@
 //! The optional `error` argument (e.g. "Wrong passphrase, try again") is shown
 //! in red above the field on a retry.
 //!
-//! The field is hardened exactly like the old launcher: `Zeroizing<String>`,
+//! The field is hardened: `Zeroizing<String>`,
 //! pre-reserved so growth doesn't scatter copies, wiped before exit, and egui's
 //! per-widget undo history (which snapshots plaintext) is reset on leave.
 

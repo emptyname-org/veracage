@@ -292,7 +292,7 @@ mod tests {
             cleanup();
             panic!("idmap_mount failed: {e}");
         }
-        // The vault uid must be able to CREATE a file (the bug was read-only).
+        // The vault uid must be able to CREATE a file, not only read one.
         let newf = target.join("vault-write.txt");
         let wrote = Command::new("setpriv")
             .args([

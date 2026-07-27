@@ -161,10 +161,9 @@ fn default_true() -> bool {
 struct AppEntry {
     name: String,
     exec: String,
-    // A legacy `args`/`category`/`note` key from an older config is simply
-    // ignored (serde drops unknown fields), we neither require nor write them.
-    // `args` in particular (the old "open at /vaults" launch argument) was
-    // removed: apps always launch bare and start in the workspace directory.
+    // Unknown keys in an existing config (`args`, `category`, `note`) are
+    // ignored: serde drops them, and they are never written back. Apps launch
+    // bare and start in the workspace directory.
 }
 
 // --- public config ----------------------------------------------------------

@@ -1,9 +1,9 @@
 //! The Veracage broker, the human-uid session helper, **windowless**.
 //!
-//! Replaces the old standalone launcher window. It does the host-side things a
-//! `veracage`-uid process cannot: pick a volume, collect its passphrase,
-//! `pkexec` the mount, run the config picker, edit settings, but shows no
-//! persistent window: only transient dialogs (an `rfd` file picker, and one-shot
+//! It does the host-side things a `veracage`-uid process cannot: pick a volume,
+//! collect its passphrase, `pkexec` the mount, run the config picker, edit
+//! settings. It shows no persistent window, only transient dialogs (an `rfd`
+//! file picker, and one-shot
 //! `veracage-agent _passphrase`/`_settings`/`_help`/`configure` subprocesses;
 //! each is a fresh process because winit can't reopen an EventLoop in one
 //! process).

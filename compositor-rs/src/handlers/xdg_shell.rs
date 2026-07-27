@@ -39,8 +39,7 @@ impl XdgShellHandler for State {
 
         // Advertise output bounds so KDE dialogs size themselves sanely, and
         // cascade placement (deterministic, no `rand`) so a new window/dialog
-        // doesn't land exactly on top of the previous one. Smallvil mapped
-        // everything at (0,0).
+        // doesn't land exactly on top of the previous one.
         let output_geo = self
             .space
             .outputs()
@@ -112,7 +111,7 @@ impl XdgShellHandler for State {
     fn toplevel_destroyed(&mut self, _surface: ToplevelSurface) {
         // A window went away without committing anything, so nothing else marks
         // the output dirty: without this its pixels stay composited until the
-        // next ~1s scan forces a frame.
+        // next discovery scan forces a frame.
         self.dirty = true;
         self.wake();
     }

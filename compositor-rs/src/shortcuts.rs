@@ -1,6 +1,6 @@
 //! Veracage keyboard shortcuts (the compositor-level clipboard transfers). The
 //! human side publishes them to `/run/veracage/pub/shortcuts`; the compositor
-//! reads them on its ~1s scan and matches them in `input.rs`. Bindings are a
+//! reads them on its discovery scan and matches them in `input.rs`. Bindings are a
 //! `+`-joined combo like "Ctrl+Alt+C" with a single letter/digit key.
 
 use smithay::input::keyboard::{Keysym, ModifiersState};

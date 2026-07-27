@@ -43,7 +43,7 @@ use crypt::Backend;
 /// `make install`.
 const VAULT_USER: &str = "veracage";
 
-/// Shared runtime dir for the ONE persistent compositor (Phase 2). Root-created,
+/// Shared runtime dir for the ONE persistent compositor. Root-created,
 /// veracage-owned, mode 0711 (the human can traverse to stat the socket/pidfile
 /// for a liveness check, but only veracage-uid apps can connect). Holds the fixed
 /// `wl-vc` Wayland socket and `compositor.pid`.
@@ -146,7 +146,7 @@ struct Args {
     session: Option<String>,
     /// `--close-volume <label>`: setns into the session and close JUST this volume
     /// (unmount + `cryptsetup close --deferred` + drop it from the lock), leaving
-    /// the rest of the session running (Phase 5). Needs --session.
+    /// the rest of the session running. Needs --session.
     close_volume: Option<String>,
     /// `--exchange <dir>`: a human-owned host directory to idmap-mount into the
     /// sandbox as the shared directory. Caller-supplied, so validated (owner
@@ -547,7 +547,7 @@ fn lock_dms_for_vhash(body: &str, vhash: &str) -> Vec<String> {
 }
 
 /// Record the session leader's pid + start-time (`session-<sid>.pid`, root 0600):
-/// the add-volume path (Phase 3) reads it to find the workspace NS holder, and the
+/// the add-volume path reads it to find the workspace NS holder, and the
 /// start-time pins it against pid reuse. Root-only (consumed by another pkexec
 /// helper / the root cleanup, never the human side).
 fn write_session_pidfile(sid: &str, pid: i32) {
@@ -673,7 +673,7 @@ fn session_lock_remove(sid: &str, dm_name: &str) {
     }
 }
 
-/// Phase 5: close JUST one volume of a running session: join the leader's NS,
+/// Close JUST one volume of a running session: join the leader's NS,
 /// unmount `<WORKSPACE>/<label>` (lazy: a running app keeps its own copy), then
 /// `cryptsetup close --deferred` the dm (so a volume still held by an app closes
 /// when released) and drop it from the session lock. The rest of the session runs
@@ -1097,7 +1097,7 @@ fn session_child(
     fail(&format!("exec continuation {}: {err}", cont.display()), 127);
 }
 
-/// Shared-workspace bootstrap parent (Phase 2). Brings up the compositor if
+/// Shared-workspace bootstrap parent. Brings up the compositor if
 /// needed, records the session lock (pre-fork, for crash safety), forks the
 /// session leader (`session_child`), records its pid, and on its exit closes the
 /// volume's dm + drops the session lock/pid/socket. The vault mounts died with
@@ -1115,8 +1115,8 @@ fn run_session_bootstrap(
     check_session_caller(sid, human_uid);
     let runtime_dir = setenv_value(args, "XDG_RUNTIME_DIR")
         .unwrap_or_else(|| fail("XDG_RUNTIME_DIR not forwarded; need it for the control socket", 2));
-    // Key the control socket by the source vault hash (as the legacy path does),
-    // so `veracage list/close <vault>` keeps finding it (one bootstrap vault per
+    // Key the control socket by the source vault hash, so `veracage list/close
+    // <vault>` keeps finding it (one bootstrap vault per
     // session). An EMPTY session has no vault, so it keys by the session id; the
     // add-volume path finds the leader by `session-<sid>.pid`, not this socket.
     let ctl_path = PathBuf::from(&runtime_dir)
@@ -1237,7 +1237,7 @@ fn run_session_bootstrap(
     std::process::exit(rc);
 }
 
-/// Subsequent open (Phase 3): a live session already holds the workspace NS, so
+/// Subsequent open: a live session already holds the workspace NS, so
 /// JOIN it (setns) and mount this volume there, then EXIT. The session leader
 /// keeps holding the mount, and teardown closes this dm from the session lock. No
 /// leader, no compositor bring-up, no ExecStopPost teardown (the CLI's
@@ -1303,7 +1303,6 @@ fn run_session_add(
             source, args.backend, args.passphrase.as_deref(),
             human_uid, human_gid, vault_uid, vault_gid, &dm_name,
         );
-        // Phase 4 TODO: signal the leader to re-seed Places for the new volume.
         std::process::exit(0);
     }
 
@@ -1417,7 +1416,7 @@ fn main() {
         spawn_compositor(human_uid, human_gid, vault_uid, vault_gid, &args, &args.rest);
     }
 
-    // `--close-volume <label>`: close ONE volume of a running session (Phase 5).
+    // `--close-volume <label>`: close ONE volume of a running session.
     // No --source; joins the leader's NS and unmounts/closes just that volume.
     if args.close_volume.is_some() {
         run_close_volume(&args, human_uid, vault_uid);
@@ -1650,7 +1649,7 @@ mod tests {
             lock_generation("user_uid=1000\ngeneration=00aabbccddeeff11\nvolume=x\ty\tz\n"),
             Some("00aabbccddeeff11")
         );
-        // legacy / headerless locks have no generation, teardown must then
+        // A lock with no header carries no generation, so teardown must
         // treat the lock as not-ours and leave it to the ExecStopPost cleanup
         assert_eq!(lock_generation("user_uid=1000\nvolume=x\ty\tz\n"), None);
         assert_eq!(lock_generation(""), None);

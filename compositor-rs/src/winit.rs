@@ -55,7 +55,7 @@ smithay::backend::renderer::element::render_elements! {
 ///
 /// The id is STABLE across frames and the commit counter is bumped only when
 /// the toolbar's output can actually have changed (input on the strip, an egui
-/// animation, or the ~1s discovery scan). The tracker then damages the old and
+/// animation, or the discovery scan). The tracker then damages the old and
 /// new geometry on a change (so a closed menu is repainted) and nothing at all
 /// on an unchanged frame, instead of re-rendering the whole strip on every
 /// frame an app's commit triggers.
@@ -476,12 +476,12 @@ pub fn init_winit(
                         state.cursor_status = CursorImageStatus::default_named();
                     }
                 }
-                // Anvil's rule, unchanged: the host cursor is hidden exactly
-                // while a client provides its own cursor surface, which we then
-                // composite below. Requiring that surface to be mapped before
-                // hiding the host cursor (an earlier attempt at "always show
-                // something") means a client's resize cursors never appear, since
-                // by then the host is drawing its own plain arrow instead.
+                // Anvil's rule: the host cursor is hidden exactly while a client
+                // provides its own cursor surface, which we composite below. The
+                // condition must be the status alone, not whether that surface is
+                // already mapped - a toolkit's cursor surface is unmapped at the
+                // moment it hands it over, and deferring would show the host's
+                // plain arrow in place of the shape the client asked for.
                 let cursor_visible = !matches!(state.cursor_status, CursorImageStatus::Surface(_));
                 if let CursorImageStatus::Named(icon) = state.cursor_status {
                     backend.window().set_cursor(icon.into());
@@ -571,11 +571,9 @@ pub fn init_winit(
                                 cursor_logged = Some(now);
                             }
                         }
-                        // The Veracage icon belongs to the BACKDROP, so it is drawn
-                        // below the app windows and stays there when they open,
-                        // like a desktop wallpaper. (It used to be part of the
-                        // on-top overlay, which is why it could only be shown with
-                        // nothing open.) The hint TEXT under it is egui, which
+                        // The Veracage icon belongs to the BACKDROP: drawn below the
+                        // app windows, so it stays visible behind them like a
+                        // desktop wallpaper. The hint TEXT under it is egui, which
                         // paints above the windows, so that stays conditional.
                         let mut backdrop: Vec<HintElement<GlesRenderer>> = Vec::new();
                         if let Some(buf) = &state.hint_icon {
@@ -665,8 +663,8 @@ pub fn init_winit(
                         //
                         // Dead windows are skipped, so a window and its shadow
                         // disappear in the same frame: the space keeps an element
-                        // until its next refresh, which is why the shadow used to
-                        // outlive the window by a frame or more.
+                        // until its next refresh, and a shadow drawn for one would
+                        // outlive its window.
                         //
                         // The window list is collected first so its borrow of
                         // `state.space` ends before `state.shadows` is touched.
@@ -832,9 +830,8 @@ pub fn init_winit(
             TimeoutAction::ToDuration(Duration::from_millis(250))
         })?;
 
-    // Discovery scan on its own timer: it is pure file polling, so it must not
-    // be tied to rendering (that forced a frame every second whether or not
-    // anything changed). Now a frame happens only when the scan finds something.
+    // Discovery scan on its own timer: it is pure file polling, so it is not tied
+    // to rendering - a frame happens only when the scan finds something changed.
     event_loop
         .handle()
         .insert_source(Timer::immediate(), move |_, _, state| {

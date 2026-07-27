@@ -433,7 +433,7 @@ def cmd_open(args: argparse.Namespace) -> int:
     # whitespace, so an install/checkout path containing a space would otherwise
     # split into wrong args and the on-stop dismount would silently never run.
     # Session teardown: closes EVERY volume's dm from session-<sid>.lock (the
-    # workspace mounts died with the leader NS). Phase 2 = one volume per session.
+    # workspace mounts died with the leader NS).
     exec_stop_post = _exec_stop_post(sid)
     # Unique per invocation: a fixed `veracage-<hash>.service` collides on a retry
     # if a prior attempt left the unit loaded ("Unit ... was already loaded").
@@ -465,10 +465,9 @@ def cmd_open(args: argparse.Namespace) -> int:
         *leader_args,
     ]
 
-    # The controls now live in the compositor's toolbar (Phase 3), so we no
-    # longer spawn a separate agent window - that would be a redundant second
-    # floating window. The scriptable `veracage-agent` CLI still exists for
-    # automation; the GUI is the in-compositor toolbar.
+    # No agent window is spawned: the controls live in the compositor's toolbar,
+    # and a second floating window would only duplicate them. The scriptable
+    # `veracage-agent` CLI remains for automation.
     joining = _any_live_session()
     rc = subprocess.run(cmd).returncode
     if rc == 0 and joining:

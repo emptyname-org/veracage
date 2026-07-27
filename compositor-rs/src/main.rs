@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --socket <name>  the wayland socket name apps connect to (the leader picks
     //                  it, like `weston --socket=`, so it knows it). The clipboard
-    //                  is owned in-process now (clipboard.rs), no clip socket.
+    //                  is owned in-process, see clipboard.rs.
     let mut socket: Option<String> = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -59,10 +59,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     crate::state::install_exit_signals(&event_loop);
 
     // Flush queued events to the clients after EVERY batch of loop events, as
-    // smallvil and anvil do. Flushing only at the end of a successful render (as
-    // this used to) left an app that connected while nothing was dirty waiting for
-    // its globals until something else happened to trigger a frame - a mouse move,
-    // say - which is a launch that hangs for no visible reason.
+    // smallvil and anvil do. It must not be tied to rendering: an app that connects
+    // while nothing is dirty would then wait for its globals until something else
+    // happened to trigger a frame, which is a launch that hangs for no reason.
     let run_result = event_loop.run(None, &mut state, move |state| {
         state.space.refresh();
         state.popups.cleanup();
@@ -112,23 +111,21 @@ const WORKER_STOP_WAIT: std::time::Duration = std::time::Duration::from_millis(5
 /// are needed: a toolkit may hand over a new surface per shape, or keep one
 /// surface and commit a new buffer into it.
 pub fn describe_cursor(status: &smithay::input::pointer::CursorImageStatus) -> String {
+    use smithay::backend::renderer::utils::with_renderer_surface_state;
     use smithay::input::pointer::CursorImageStatus;
+    use smithay::reexports::wayland_server::Resource;
     use smithay::utils::IsAlive;
     match status {
         CursorImageStatus::Hidden => "hidden".to_string(),
         CursorImageStatus::Named(icon) => format!("named {}", icon.name()),
         CursorImageStatus::Surface(surface) => {
-            let mapped = smithay::backend::renderer::utils::with_renderer_surface_state(surface, |st| {
-                st.buffer().is_some()
-            });
-            use smithay::reexports::wayland_server::Resource;
+            let mapped = with_renderer_surface_state(surface, |st| st.buffer().is_some());
             // The version matters as much as the identity: a toolkit swaps a resize
             // shape in by committing a NEW BUFFER to the SAME cursor surface, which
             // shows up here only as a bumped commit count.
-            let version = smithay::backend::renderer::utils::with_renderer_surface_state(
-                surface,
-                |st| format!("{:?} {:?}", st.current_commit(), st.buffer_size()),
-            );
+            let version = with_renderer_surface_state(surface, |st| {
+                format!("{:?} {:?}", st.current_commit(), st.buffer_size())
+            });
             format!(
                 "client surface {} v{} (alive {}, mapped {mapped:?})",
                 surface.id().protocol_id(),
@@ -139,8 +136,9 @@ pub fn describe_cursor(status: &smithay::input::pointer::CursorImageStatus) -> S
     }
 }
 
-/// True when `VERACAGE_DEBUG=1` was forwarded (config `debug`): the compositor
-/// then writes a periodic render/scan summary through `vcdebug`. Read once.
+/// True when `VERACAGE_DEBUG=1` was forwarded (config `debug`): the compositor then
+/// writes a per-second render summary and the cursor decisions through `vcdebug`.
+/// Read once.
 pub fn debug_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();

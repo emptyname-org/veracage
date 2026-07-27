@@ -330,7 +330,7 @@ def _post_notice(message: str) -> None:
 
 # A tracked app that exits within this many seconds of launch is reported as a
 # failed launch, not a normal quit. The window covers the reaper's own latency (it
-# runs once per serve-loop pass, at most ~1s apart) plus the app's brief startup.
+# runs once per serve-loop pass, a quarter second apart) plus the app's startup.
 _EARLY_EXIT_SECONDS = 2.0
 
 

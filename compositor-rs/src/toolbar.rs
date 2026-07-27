@@ -1,10 +1,10 @@
-//! Phase 3 spike: an egui toolbar rendered INTO the compositor's own GL context.
+//! The egui toolbar, rendered INTO the compositor's own GL context.
 //!
 //! `egui_glow` shares smithay's EGL context via
-//! `smithay::backend::egl::get_proc_address`. This is the "one real UI unknown"
-//! the plan flagged. We drive egui manually (no `egui-winit`): the compositor
-//! already decodes pointer events, so we feed those in and paint into the
-//! currently-bound framebuffer each Redraw, on top of the sandbox windows.
+//! `smithay::backend::egl::get_proc_address`. egui is driven manually (no
+//! `egui-winit`): the compositor already decodes pointer events, so we feed those
+//! in and paint into the currently-bound framebuffer each Redraw, on top of the
+//! sandbox windows.
 //!
 //! What this module guarantees: it constructs against smithay's context, paints
 //! every frame, and NEVER crashes or hangs the compositor: if the GL painter
@@ -38,8 +38,8 @@ pub enum ToolbarAction {
 
 /// One session's launchers, discovered from `/run/veracage/rt/<id>.apps`:
 /// the app socket to poke, the window-title label, the open-volume labels, the
-/// enabled app names (button labels, in order), and the "opener", the app index
-/// the desktop tile launches (kept in the wire format; currently unused here).
+/// enabled app names (button labels, in order), and the "opener" app index
+/// (carried in the wire format, not used here).
 pub struct LeaderApps {
     pub sock: std::path::PathBuf,
     pub label: String,
@@ -791,9 +791,9 @@ pub fn scan_status(
 ///
 /// The broker's note wins and is trusted to be current: it is deleted when the
 /// open finishes. A leader's launch note ("Starting Kate") cannot know when the
-/// app's window appears, so it is shown until the window COUNT rises above what
-/// it was when that note arrived - not merely until some window exists, which
-/// hid the note whenever an app was already open - or until it expires.
+/// app's window appears, so it runs until the window COUNT rises above what it was
+/// when that note arrived (a window merely EXISTING proves nothing - one may
+/// already be open), or until it expires.
 fn pick_status(
     from_broker: Option<(u64, String)>,
     from_leader: Option<(u64, String)>,
@@ -1047,7 +1047,7 @@ pub fn scan_leaders() -> Vec<LeaderApps> {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect();
-        // Opener index: which app the desktop tile launches. `-1` (or an
+        // Opener index: the session's opening app. `-1` (or an
         // out-of-range value, checked once names are known) means "no opener".
         let opener_raw: i64 = lines.next().and_then(|s| s.trim().parse().ok()).unwrap_or(-1);
         let names: Vec<String> = lines.filter(|l| !l.is_empty()).map(str::to_string).collect();
