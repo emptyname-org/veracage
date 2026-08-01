@@ -134,6 +134,14 @@ def test_home_is_vault_xdg_is_ephemeral_off_vault(argv):
     ), "an XDG dir points into the vault"
 
 
+def test_qt_platform_theme_is_set_so_the_seeded_kdeglobals_applies(argv):
+    """The seeded kdeglobals only reaches a Qt app through the KDE platform
+    theme. Without this the app keeps the generic theme (fusion style, its own
+    font, light palette) and the configured theme and font are ignored."""
+    triples = list(zip(argv, argv[1:], argv[2:]))
+    assert ("--setenv", "QT_QPA_PLATFORMTHEME", "kde") in triples
+
+
 def test_no_share_user_no_share_net_no_network(argv):
     """Belt-and-suspenders: no --share-net and no --share-user flags."""
     assert "--share-net" not in argv

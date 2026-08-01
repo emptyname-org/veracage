@@ -7,6 +7,7 @@ observes it.
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 
@@ -107,10 +108,13 @@ def test_pid_alive_false_for_zombie():
     if pid == 0:  # child: exit immediately, become a zombie (parent won't reap yet)
         os._exit(0)
     try:
-        # Give the child a moment to exit and enter Z; poll rather than sleep long.
-        for _ in range(100):
-            if not wayland._pid_alive(pid):
-                break
+        # The child has to be scheduled before it can reach state Z, so wait for
+        # it against a deadline. A fixed number of busy polls (what this used to
+        # do) burns through them before the child has run at all on a fast or
+        # loaded machine, which made this test flaky.
+        deadline = time.monotonic() + 5.0
+        while wayland._pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.005)
         assert wayland._pid_alive(pid) is False
     finally:
         os.waitpid(pid, 0)

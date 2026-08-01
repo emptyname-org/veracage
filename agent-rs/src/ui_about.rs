@@ -81,10 +81,6 @@ impl eframe::App for About {
                     ui.heading("Veracage");
                     ui.label("Encrypted volumes, isolated.");
                     ui.add_space(6.0);
-                    // The one thing a user can lose work to, so it is said here too
-                    // (Help has the full section).
-                    ui.label("Veracage stores nothing itself: files are kept only in\na mounted volume or the shared directory.");
-                    ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(format!("version {}", env!("CARGO_PKG_VERSION"))).weak(),
                     );

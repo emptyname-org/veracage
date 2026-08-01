@@ -18,6 +18,10 @@ Three uids are in play:
   (the desktop analogue of Android's per-app uid). Code identifiers still
   call it `vault_uid`.
 
+**Host** is the machine's own desktop session, outside Veracage. **System** is
+wider: the Host plus Veracage's own session (compositor, leader, sandboxed
+apps). Settings that touch both live under Settings > System Integration.
+
 ## The processes
 
 - **launcher** - what `veracage open` runs as, in the human's shell. Resolves
@@ -79,10 +83,12 @@ Three uids are in play:
   `/exchange`, `exchange` in config/code). Files dropped in on either side
   appear on the other, owned by the human. The file-transfer path.
 - **pub dir** - `/run/veracage/pub`, root-created and human-owned: where the
-  human side publishes the configured app list (`config.apps`) and menu
-  icons for the compositor's Apps menu, plus the `mimeapps.list` seed the
-  leader copies into each sandbox (default-app associations). Same trust
-  level as config.toml.
+  human side publishes what the vault side cannot read from `~/.config`. The
+  configured app list (`config.apps`) and menu icons for the Apps menu, the
+  compositor's live look (`theme`, `font`, `window.size`, `shortcuts`,
+  `clipclear`, `keyboard`), and the two seeds the leader copies into each
+  sandbox: `mimeapps.list` (default-app associations) and `appfont`, which with
+  `theme` becomes the sandbox's `kdeglobals`. Same trust level as config.toml.
 
 ## Privilege & lifecycle
 

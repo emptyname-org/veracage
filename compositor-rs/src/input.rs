@@ -15,6 +15,8 @@ use crate::state::State;
 
 impl State {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
+        // Any input is activity: it is what the idle dismount times out on.
+        self.last_input = std::time::Instant::now();
         match event {
             InputEvent::Keyboard { event, .. } => {
                 let serial = SERIAL_COUNTER.next_serial();

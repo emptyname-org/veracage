@@ -65,6 +65,17 @@ WORKSPACE = Path("/run/veracage/vaults")
 # human's chosen apps. Human-trust UX data, same as the enabled-app list.
 MIMEAPPS_SEED = Path("/run/veracage/pub/mimeapps.list")
 
+# The human-published theme and app font (config.publish_apps writes both), used
+# to build the sandbox's kdeglobals so apps follow the Veracage look. The colour
+# values are the desktop's own scheme files, not ours.
+THEME_PUB = Path("/run/veracage/pub/theme")
+APPFONT_PUB = Path("/run/veracage/pub/appfont")
+COLOR_SCHEMES = {
+    "dark": Path("/usr/share/color-schemes/BreezeDark.colors"),
+    "light": Path("/usr/share/color-schemes/BreezeLight.colors"),
+}
+ICON_THEMES = {"dark": "breeze-dark", "light": "breeze"}
+
 
 def scan_volumes(root: Path | None = None) -> list[str]:
     """The open volumes' labels: the directory names under the workspace root
@@ -192,8 +203,11 @@ def _launch_app(state: _LeaderState, spec) -> dict:
     # copy into the sandbox tmpfs (apps rewrite these on startup, so a
     # read-only bind would error). A missing seed is skipped.
     seeds: list[tuple[int, str]] = []
+    # Rebuilt per launch, so an app started after a Settings change gets the
+    # new theme and font (a running app keeps what it was launched with).
     for src, dest in ((state.places_file, "/xdg/data/user-places.xbel"),
-                      (MIMEAPPS_SEED, "/xdg/config/mimeapps.list")):
+                      (MIMEAPPS_SEED, "/xdg/config/mimeapps.list"),
+                      (_write_kdeglobals_file(), "/xdg/config/kdeglobals")):
         if src is None:
             continue
         try:
@@ -565,6 +579,68 @@ def _places_xbel(labels: list[str], with_exchange: bool) -> str:
     )
 
 
+def _qt_font(family: str, points: float) -> str:
+    """A Qt font description as kdeglobals stores it: family, point size, then
+    the fields Qt fills with defaults (pixel size, style hint, weight, ...)."""
+    return f"{family},{points:g},-1,5,50,0,0,0,0,0"
+
+
+def _kdeglobals_body(theme: str, family: str, points: float) -> str:
+    """The kdeglobals seeded into the sandbox: the Veracage font and theme, so
+    apps match the compositor instead of falling back to their built-in look.
+
+    The colours are the desktop's own scheme file verbatim (its [Colors:*] and
+    [ColorEffects:*] groups are exactly what kdeglobals reads), minus its
+    [General] group, which is just the scheme's translated names and would
+    collide with the font settings written here. Without a scheme file (a
+    non-KDE host) only the fonts are set."""
+    small = max(6.0, round(points * 0.85))
+    lines = [
+        "[General]",
+        f"font={_qt_font(family, points)}",
+        f"menuFont={_qt_font(family, points)}",
+        f"toolBarFont={_qt_font(family, points)}",
+        f"smallestReadableFont={_qt_font(family, small)}",
+        f"fixed={_qt_font('Monospace', points)}",
+        "",
+        "[Icons]",
+        f"Theme={ICON_THEMES.get(theme, 'breeze')}",
+        "",
+    ]
+    scheme = COLOR_SCHEMES.get(theme)
+    if scheme is not None:
+        try:
+            in_general = False
+            for line in scheme.read_text().splitlines():
+                if line.startswith("["):
+                    in_general = line.strip() == "[General]"
+                    # The style lives with the colours: a scheme without Breeze
+                    # widgets looks half-applied.
+                    if line.strip() == "[KDE]":
+                        lines += [line, "widgetStyle=Breeze"]
+                        continue
+                if not in_general:
+                    lines.append(line)
+        except OSError as e:
+            print(f"veracage: could not read {scheme}: {e}", file=sys.stderr)
+    return "\n".join(lines) + "\n"
+
+
+def _write_kdeglobals_file() -> Path | None:
+    """Build the sandbox kdeglobals from the published theme and app font, write
+    it to the vault runtime dir and return its path. None (no seed, so the app
+    keeps its own defaults) if either is unpublished or it can't be written."""
+    try:
+        theme = THEME_PUB.read_text().strip()
+        family, points = APPFONT_PUB.read_text().split("\n")[:2]
+        path = Path(os.environ["XDG_RUNTIME_DIR"]) / "kdeglobals"
+        path.write_text(_kdeglobals_body(theme, family.strip(), float(points)))
+        return path
+    except (OSError, KeyError, ValueError) as e:
+        print(f"veracage: could not seed the app theme: {e}", file=sys.stderr)
+        return None
+
+
 def _write_places_file(labels: list[str], with_exchange: bool = False) -> Path | None:
     """Write the seeded Places file (one entry per open volume) to the vault
     runtime dir and return its path, or None if it can't be written (the sandbox
@@ -591,7 +667,7 @@ def run_leader(mountpoint: str, app_specs: list, first_app: dict | None,
     the compositor going away. The leader does NOT own the compositor (it
     survives every app opening and closing) but when the compositor itself exits
     (the user closed the vault window) the leader exits too, so the session tears
-    down cleanly (unit stop → ExecStopPost → dm close + unmount) instead of
+    down cleanly (unit stop → ExecStopPost → dm close + dismount) instead of
     leaving the vault mounted and blocking the next open.
     """
     vr = os.environ.get("VERACAGE_VAULT_RUNTIME")
@@ -643,7 +719,7 @@ def run_leader(mountpoint: str, app_specs: list, first_app: dict | None,
         # Tie our lifetime to the compositor's: once it has been seen up, its
         # disappearance (the user closed the vault window → the compositor exits)
         # means the session is over. Exiting here lets the systemd unit stop and
-        # its ExecStopPost cleanup close the dm device + unmount. Otherwise the
+        # its ExecStopPost cleanup close the dm device + dismount. Otherwise the
         # leader would keep the vault mounted forever and block the next open.
         comp_seen = False
         seen_labels = labels
@@ -675,7 +751,7 @@ def run_leader(mountpoint: str, app_specs: list, first_app: dict | None,
                     comp_seen = True
                 elif comp_seen:
                     print("veracage: compositor gone (window closed) - "
-                          "unmounting and exiting.", file=sys.stderr)
+                          "dismounting and exiting.", file=sys.stderr)
                     break
                 # A quarter second, not a second: this timeout also bounds how
                 # long a just-mounted volume waits for its app to be launched

@@ -14,12 +14,14 @@ mod config;
 mod detect;
 mod fonts;
 mod gl_icon;
+mod keyboard;
 mod proto;
 mod theme;
 mod ui_about;
 mod ui_config;
 mod ui_help;
 mod ui_passphrase;
+mod ui_appearance;
 mod ui_settings;
 mod ui_shortcuts;
 
@@ -43,6 +45,14 @@ session cmds (need a running `veracage open`):
 }
 
 fn main() -> ExitCode {
+    // Never dump core: the agent collects the volume passphrase and pipes it to
+    // the helper, and a core would write it to a host-readable file under
+    // /var/lib/systemd/coredump. Clearing `coredump_filter` leaves a dump with no
+    // memory in it; `RLIMIT_CORE` would not help, the kernel ignores it when
+    // `core_pattern` is a pipe (the systemd default). See the helper's
+    // `suppress_core_dumps`, which does the same for the vault side.
+    let _ = std::fs::write("/proc/self/coredump_filter", "0\n");
+
     let args: Vec<String> = std::env::args().collect();
 
     // No args (the `.desktop` app / double-click): run the headless broker, the
@@ -105,6 +115,17 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("veracage-agent: help: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // Appearance window: `veracage-agent _appearance` (Settings > Appearance).
+    if args.get(1).map(String::as_str) == Some("_appearance") {
+        return match ui_appearance::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("veracage-agent: appearance: {e}");
                 ExitCode::FAILURE
             }
         };

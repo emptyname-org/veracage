@@ -63,12 +63,12 @@ by an explicit per-volume close.
 
 ### Close
 
-- **One volume**: `veracage close-volume <label>` (or **File > Unmount** in
-  the menu) unmounts `/vaults/<label>`, `cryptsetup close`s its dm device, and
+- **One volume**: `veracage close-volume <label>` (or **File > Dismount** in
+  the menu) dismounts `/vaults/<label>`, `cryptsetup close`s its dm device, and
   drops it from the session lock. The rest of the session keeps running.
 - **Session** (compositor window closed, or crash): the leader exits -> the
   anchor unit stops -> its `ExecStopPost` cleanup walks the session lock and
-  closes every dm device + unmounts every `/vaults/*`.
+  closes every dm device + dismounts every `/vaults/*`.
 
 ## Security
 

@@ -31,7 +31,7 @@ data from leaking out, not to confine the app. **Non-goals:** local root
 trust domain), network from the sandbox, X11, multi-user. Full analysis in
 `uid-isolation.md`.
 
-**Functional:** F1 mount/unmount a LUKS or VeraCrypt volume with a passphrase
+**Functional:** F1 mount/dismount a LUKS or VeraCrypt volume with a passphrase
 prompt. F2 launch any user-enabled app in the sandbox. F3 multiple apps and
 multiple volumes share one compositor session. F4 clean teardown on exit,
 crash, SIGKILL, suspend. F5 read-write volume access. F6 explicit,
@@ -68,8 +68,8 @@ Full topology in `uid-isolation.md`. In brief:
   `cryptsetup open` -> check the filesystem -> idmap-mount into the workspace
   namespace -> drop to `veracage` -> exec the session leader. Does not trust its
   caller (§6). The check is `fsck -p` on the decrypted device, before anything
-  mounts it: a volume that was not unmounted cleanly is repaired where preen mode
-  can do it unambiguously, and is otherwise left closed and unmounted with a
+  mounts it: a volume that was not dismounted cleanly is repaired where preen mode
+  can do it unambiguously, and is otherwise left closed and dismounted with a
   message, rather than mounted dirty. ext2/3/4, FAT and exFAT are checked; a
   filesystem with no preen-capable checker installed is mounted as before.
 - **`veracage`-uid compositor** (`veracage-compositor`, Rust/smithay): ONE
@@ -136,7 +136,7 @@ bwrap --unshare-pid --unshare-uts --unshare-ipc --unshare-cgroup --unshare-net \
 
 ## 6. Privilege model
 
-No setuid, no long-lived root daemon. The only root steps (mount/unmount and
+No setuid, no long-lived root daemon. The only root steps (mount/dismount and
 the compositor spawn) are done by the small polkit-authorised `helper-rs`,
 which exits in seconds. **The helper does not trust its caller:**
 
@@ -164,9 +164,9 @@ lock + `veracage-<12hex>` device only) and `PKEXEC_UID`-owner-checked.
 - The **compositor** is spawned once (its own `systemd --user` unit) and
   persists across sessions. The **session leader** dies on session close (or
   when the compositor window closes), the compositor does not. Individual
-  volumes unmount without ending the session (`shared-workspace.md`).
+  volumes dismount without ending the session (`shared-workspace.md`).
 - **Suspend**: a static root `/usr/lib/systemd/system-sleep/veracage` hook
-  unmounts every session before sleep (systemd blocks the transition until it
+  dismounts every session before sleep (systemd blocks the transition until it
   returns, and honors per-owner `suspend_action=ignore`). No D-Bus watcher.
 
 ---
@@ -178,7 +178,7 @@ lock + `veracage-<12hex>` device only) and `PKEXEC_UID`-owner-checked.
 ```toml
 [default]
 last_used_app  = "kate"
-suspend_action = "dismount"     # unmount on suspend, or "ignore"
+suspend_action = "dismount"     # dismount on suspend, or "ignore"
 clip_clear     = true           # auto-clear host clipboard after Copy out
 clip_clear_timeout = 30         # seconds before the auto-clear fires
 

@@ -37,16 +37,16 @@ and delegates host-side actions to the broker.
 
 | Menu | Items |
 |---|---|
-| **File** | Mount volume... / Shared directory / Unmount > (one item per mounted volume) / Quit |
+| **File** | Mount volume... / Shared directory / Dismount > (one item per mounted volume) / Quit |
 | **Clipboard** | Copy out / Paste in (configurable shortcuts, defaults Ctrl+Alt+C / Ctrl+Alt+V) |
 | **Apps** | one item per app, with its host icon / Configure apps... |
-| **Settings** | Settings... (theme, window size, font, clipboard clear, shared directory, suspend) / Configure shortcuts... |
+| **Settings** | System Integration... (clipboard clear, idle dismount, suspend, shared directory) / Appearance... (theme, window size, font) / Keyboard and Shortcuts... (modifier mapping, clipboard binds) |
 | **Help** | Help... / About Veracage... |
 
 **Clipboard** and **Apps** (launch, with a volume mounted) act in-process in the
 compositor: the clipboard is compositor-owned, and an app launch goes to the
 leader over the veracage-owned socket. Everything needing host-side work
-(open, exchange, configure, settings, help, about, unmount) emits a command
+(open, exchange, configure, settings, help, about, dismount) emits a command
 to the broker.
 
 ## Compositor -> broker command channel
@@ -80,6 +80,18 @@ broker republishes whenever config.toml changes. Trust level: the dir is
 writable only by the human uid, the same trust as config.toml itself. The
 compositor validates everything it reads from there (sizes, key shapes,
 icon dimensions).
+
+The same channel carries the compositor's live look: `theme`, `font`,
+`window.size`, `shortcuts`, `clipclear` and `keyboard` (the host desktop's XKB
+configuration with the configured modifier mapping applied). The discovery scan
+picks each up within 250ms, so a Settings change applies to the running session
+instead of waiting for a restart.
+
+It also carries `appfont` (family + point size). The leader builds the sandbox's
+`$XDG_CONFIG_HOME/kdeglobals` from it and `theme`: the Veracage font in Qt's own
+unit, plus the desktop's own Breeze colour scheme file verbatim, so a dark
+Veracage launches dark apps. An app reads it at startup, so a change applies to
+the next app launched, not to a running one.
 
 The same channel carries `mimeapps.list`, the default-app associations the
 leader seeds into each sandbox at `$XDG_CONFIG_HOME/mimeapps.list` (the

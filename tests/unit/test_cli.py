@@ -115,6 +115,17 @@ def test_open_unit_name_includes_vault_hash(monkeypatch, configured, fake_vault)
     assert expected in unit
 
 
+def test_open_unit_description_omits_the_volume_filename(monkeypatch, configured, fake_vault):
+    """The unit description reaches the journal and outlives the session, so it
+    names the volume by the same hash as the unit, never by its filename."""
+    from veracage import cleanup
+    _, argv = _run_open(monkeypatch, fake_vault, "kate")
+    desc = next((a for a in argv if a.startswith("--description=")), None)
+    assert desc is not None
+    assert fake_vault.name not in desc
+    assert cleanup.vault_hash(str(fake_vault))[:8] in desc
+
+
 def test_open_passes_vault_but_not_identity(monkeypatch, configured, fake_vault):
     """The launcher passes the vault path but NOT uid/gid/continuation: the
     privileged helper derives identity from PKEXEC_UID and pins the

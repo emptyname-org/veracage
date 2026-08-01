@@ -455,7 +455,9 @@ def cmd_open(args: argparse.Namespace) -> int:
         "--quiet",
         "--collect",
         f"--unit={unit}",
-        f"--description=Veracage session for {vault.name}",
+        # The description outlives the session in the journal, so identify the
+        # volume by the same hash as the unit name, never by its filename.
+        f"--description=Veracage session {vh[:8]}",
         "--property", exec_stop_post,
         "pkexec",
         HELPER_PATH,
@@ -535,7 +537,7 @@ def cmd_close(args: argparse.Namespace) -> int:
 def cmd_close_volume(args: argparse.Namespace) -> int:
     """Close ONE volume of the running session (Phase 5). `label` is the workspace
     directory name (a single component). pkexecs the helper's --close-volume,
-    which setns'es into the session and unmounts + deferred-closes just that
+    which setns'es into the session and dismounts + deferred-closes just that
     volume, leaving the rest running. Driven by the compositor's per-volume close.
     """
     label = args.label
@@ -582,11 +584,11 @@ def main() -> int:
     p_list.add_argument("volume")
     p_list.set_defaults(func=cmd_list)
 
-    p_close = sub.add_parser("close", help="close the running session (unmount every volume)")
+    p_close = sub.add_parser("close", help="close the running session (dismount every volume)")
     p_close.add_argument("volume")
     p_close.set_defaults(func=cmd_close)
 
-    p_cv = sub.add_parser("close-volume", help="unmount one volume of the session")
+    p_cv = sub.add_parser("close-volume", help="dismount one volume of the session")
     p_cv.add_argument("label", help="the volume's label (workspace directory name)")
     p_cv.set_defaults(func=cmd_close_volume)
 

@@ -56,11 +56,11 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "Clipboard > Copy out puts what you last copied inside Veracage \
              onto the host clipboard. Clipboard > Paste in puts the host \
              clipboard onto the Veracage clipboard. Text only. The keyboard \
-             shortcuts are configurable under Settings > Configure shortcuts.",
+             shortcuts are configurable under Settings > Keyboard and Shortcuts.",
             "After a Copy out, the host clipboard is cleared automatically after \
-             a timeout (default 30 seconds), and again when Veracage quits, so \
-             a copied secret does not linger on the host. Both are configurable \
-             under Settings.",
+             a delay (default 30 seconds), and again when Veracage quits, so \
+             a copied secret does not linger on the host. Settings > System \
+             Integration sets the delay, or turns it off.",
         ],
     ),
     (
@@ -72,6 +72,35 @@ const SECTIONS: &[(&str, &[&str])] = &[
              is /exchange.",
             "Settings lets you turn the shared directory off or point it at a \
              different host path.",
+        ],
+    ),
+    (
+        "Idle dismount",
+        &[
+            "Settings > System Integration > Auto-dismount after closes the mounted volumes \
+             Veracage has been left alone for that long. Using the Veracage \
+             window resets the timer.",
+            "The session stays open as an empty scratchpad, so mounting again \
+             is one click.",
+        ],
+    ),
+    (
+        "Theme and font",
+        &[
+            "Settings > Appearance changes the Veracage window straight away.",
+            "Apps pick them up when they start, so change them first and then \
+             launch the app. An app that is already open keeps the look it \
+             started with.",
+        ],
+    ),
+    (
+        "Keyboard",
+        &[
+            "Veracage uses the keyboard layout your desktop is set to, including \
+             its Compose key and modifier mapping, so keys behave the same in \
+             and out of Veracage.",
+            "Settings > Keyboard and Shortcuts overrides just the Ctrl / Alt / \
+             Win mapping, for example to make Ctrl act as Win as well.",
         ],
     ),
     (
@@ -92,32 +121,20 @@ const SECTIONS: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Unmount",
+        "Dismount",
         &[
-            "File > Unmount lists the mounted volumes. Unmounting one locks \
+            "File > Dismount lists the mounted volumes. Dismounting one locks \
              its data again and leaves the rest of the session running.",
-            "Closing the Veracage window (or File > Quit) unmounts everything.",
+            "Closing the Veracage window (or File > Quit) dismounts everything.",
         ],
     ),
 ];
 
 pub fn run() -> Result<(), eframe::Error> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Veracage Help")
-            .with_app_id("veracage")
-            .with_inner_size([560.0, 660.0])
-            .with_min_inner_size([440.0, 400.0]),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "veracage-help",
-        options,
-        Box::new(|cc| {
-            crate::theme::apply_config(&cc.egui_ctx, &config::load());
-            Ok(Box::new(Help) as Box<dyn eframe::App>)
-        }),
-    )
+    crate::theme::dialog("veracage-help", "Veracage Help", [560.0, 660.0], [440.0, 400.0], |cc| {
+        crate::theme::apply_config(&cc.egui_ctx, &config::load());
+        Box::new(Help)
+    })
 }
 
 struct Help;

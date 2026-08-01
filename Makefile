@@ -155,9 +155,12 @@ install: build build-agent build-compositor
 	$(SUDO) chmod 0644 "$(DESTDIR)$(APPDIR)/veracage.desktop"
 	$(SUDO) install -m 0644 "$(ICON_SRC)" "$(DESTDIR)$(ICONDIR)/veracage.png"
 	$(SUDO) install -m 0644 "$(ICON_SRC)" "$(DESTDIR)$(PIXMAPDIR)/veracage.png"
-	# udev rule: hide the decrypted vault dm devices from UDisks/the drive menu.
+	# udev rule: keep the decrypted vault dm devices out of the drive menu and
+	# out of /dev/disk/by-label,by-uuid. Numbered 57 (was 99, which ran too late
+	# to stop the symlinks), so drop the old file if this box still has it.
 	$(SUDO) install -d "$(DESTDIR)$(UDEVDIR)"
-	$(SUDO) install -m 0644 install/99-veracage.rules "$(DESTDIR)$(UDEVDIR)/99-veracage.rules"
+	$(SUDO) rm -f "$(DESTDIR)$(UDEVDIR)/99-veracage.rules"
+	$(SUDO) install -m 0644 install/57-veracage.rules "$(DESTDIR)$(UDEVDIR)/57-veracage.rules"
 	@[ -n "$(DESTDIR)" ] || sudo udevadm control --reload 2>/dev/null || true
 	# system-sleep hook: dismount every session before the machine sleeps so the
 	# dm-crypt key never sits in RAM across suspend/hibernate.
@@ -188,7 +191,7 @@ install-dev: veracage-user build
 uninstall:
 	sudo rm -f "$(POLKIT_DIR)/org.veracage.policy"
 	sudo rm -f "$(APPDIR)/veracage.desktop" "$(ICONDIR)/veracage.png" "$(PIXMAPDIR)/veracage.png"
-	sudo rm -f "$(UDEVDIR)/99-veracage.rules"; sudo udevadm control --reload 2>/dev/null || true
+	sudo rm -f "$(UDEVDIR)/57-veracage.rules" "$(UDEVDIR)/99-veracage.rules"; sudo udevadm control --reload 2>/dev/null || true
 	sudo rm -f "$(SLEEPDIR)/veracage"
 	sudo rm -rf "$(LIBDIR)" "$(LIBEXEC)" "$(BINDIR)/veracage" \
 	    "$(BINDIR)/veracage-agent" "$(BINDIR)/veracage-compositor"

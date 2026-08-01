@@ -87,6 +87,8 @@ struct DefaultSection {
     ui_font_size: String,
     #[serde(default = "default_window_size")]
     window_size: String,
+    #[serde(default = "default_modifier_keys")]
+    modifier_keys: String,
     #[serde(default = "default_true")]
     exchange: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,6 +97,9 @@ struct DefaultSection {
     clip_clear: bool,
     #[serde(default = "default_clip_clear_timeout")]
     clip_clear_timeout: u32,
+    /// Idle minutes before the session dismounts itself (0 = off).
+    #[serde(default)]
+    auto_dismount: u32,
     /// Verbose timing logs across the components (see docs/debugging.md).
     #[serde(default)]
     debug: bool,
@@ -109,10 +114,12 @@ impl Default for DefaultSection {
             ui_font: default_font(),
             ui_font_size: default_font_size(),
             window_size: default_window_size(),
+            modifier_keys: default_modifier_keys(),
             exchange: true,
             exchange_dir: None,
             clip_clear: true,
             clip_clear_timeout: default_clip_clear_timeout(),
+            auto_dismount: 0,
             debug: false,
         }
     }
@@ -121,6 +128,14 @@ impl Default for DefaultSection {
 fn default_suspend() -> String {
     "dismount".into()
 }
+
+/// Default modifier mapping: whatever the host desktop is configured with.
+fn default_modifier_keys() -> String {
+    "system".into()
+}
+
+/// Longest idle timeout before an automatic dismount, in minutes (a day).
+pub const AUTO_DISMOUNT_MAX: u32 = 1440;
 
 /// Default host-clipboard auto-clear timeout, in seconds (KeePassXC-style).
 pub fn default_clip_clear_timeout() -> u32 {
@@ -176,10 +191,12 @@ pub struct Config {
     pub ui_font: String,           // fonts::CHOICES key ("system" default = host)
     pub ui_font_size: String,      // "system" (host size) | a point size
     pub window_size: String,       // "default" | "max" | "<w>x<h>"
+    pub modifier_keys: String,     // keyboard::CHOICES key ("system" = host)
     pub exchange: bool,            // host<->volume shared directory on/off
     pub exchange_dir: Option<String>,
     pub clip_clear: bool,          // auto-clear host clipboard after Copy out
     pub clip_clear_timeout: u32,   // seconds before the auto-clear fires
+    pub auto_dismount: u32,        // idle minutes before a dismount (0 = off)
     pub debug: bool,               // verbose timing logs (docs/debugging.md)
     pub shortcuts: BTreeMap<String, String>, // action -> keybind (copy_out/paste_in)
     volumes: BTreeMap<String, toml::Value>, // opaque pass-through
@@ -215,10 +232,12 @@ impl Config {
             ui_font: default_font(),
             ui_font_size: default_font_size(),
             window_size: default_window_size(),
+            modifier_keys: default_modifier_keys(),
             exchange: true,
             exchange_dir: None,
             clip_clear: true,
             clip_clear_timeout: default_clip_clear_timeout(),
+            auto_dismount: 0,
             debug: false,
             shortcuts: default_shortcuts(),
             volumes: BTreeMap::new(),
@@ -278,6 +297,17 @@ pub fn load() -> Config {
             "light".into()
         }
     };
+    // The value is published to the compositor and handed to libxkbcommon, so
+    // only the offered choices are accepted.
+    let modifier_keys = if crate::keyboard::is_valid(&raw.default.modifier_keys) {
+        raw.default.modifier_keys
+    } else {
+        eprintln!(
+            "veracage: invalid modifier_keys {:?}; using 'system'",
+            raw.default.modifier_keys
+        );
+        default_modifier_keys()
+    };
     let ui_font = if crate::fonts::is_valid_font(&raw.default.ui_font) {
         raw.default.ui_font
     } else {
@@ -321,10 +351,13 @@ pub fn load() -> Config {
         ui_font,
         ui_font_size,
         window_size,
+        modifier_keys,
         exchange: raw.default.exchange,
         exchange_dir: raw.default.exchange_dir,
         clip_clear: raw.default.clip_clear,
         clip_clear_timeout,
+        // Bounded so a hand-edited config can't keep a volume open forever.
+        auto_dismount: raw.default.auto_dismount.min(AUTO_DISMOUNT_MAX),
         debug: raw.default.debug,
         shortcuts,
         volumes: raw.volumes,
@@ -372,10 +405,12 @@ pub fn save(cfg: &Config) -> io::Result<PathBuf> {
             ui_font: cfg.ui_font.clone(),
             ui_font_size: cfg.ui_font_size.clone(),
             window_size: cfg.window_size.clone(),
+            modifier_keys: cfg.modifier_keys.clone(),
             exchange: cfg.exchange,
             exchange_dir: cfg.exchange_dir.clone(),
             clip_clear: cfg.clip_clear,
             clip_clear_timeout: cfg.clip_clear_timeout,
+            auto_dismount: cfg.auto_dismount,
             debug: cfg.debug,
         },
         apps,

@@ -109,7 +109,7 @@ a `veracage`-uid process cannot (`pkexec`) and mediates host files.
               session leader (one per session): holds the workspace NS,
               launches apps in bwrap wired to /run/veracage/rt/wl-vc, serves
               the control socket.
-  root        a static systemd system-sleep hook unmounts before suspend.
+  root        a static systemd system-sleep hook dismounts before suspend.
 ```
 
 - **Why the `veracage` uid seals it.** `veracage` is a *standing system user*

@@ -128,6 +128,16 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
         # Terminals (Konsole) launch the login shell and exit immediately with
         # it, so hand them a real shell explicitly.
         "--setenv", "SHELL", "/bin/bash",
+        # Load the KDE platform theme, which is what actually applies the
+        # seeded kdeglobals (font, palette, widget style, icons). Without it Qt
+        # uses its generic theme and ignores the file: measured with the same
+        # kdeglobals, `fusion` / DejaVu 12pt / #efefef window without it, and
+        # `breeze` / Noto Sans 16pt / #2a2e32 with it. Only Frameworks
+        # components that read the colours themselves followed, which is why a
+        # dark session used to come out with light widgets on a dark backdrop.
+        # The plugin is a host Qt plugin like every other one the app loads
+        # from the read-only /usr, and it needs no session bus.
+        "--setenv", "QT_QPA_PLATFORMTHEME", "kde",
         "--chdir", "/vaults",
     ]
     # Preserve locale and the cursor theme (an explicit allowlist, not blanket

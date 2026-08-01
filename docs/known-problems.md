@@ -73,6 +73,19 @@ the strip renders at the top and the buttons work, so it currently lines up,
 but it's unverified in code and fragile. *Fix:* verify/normalize the paint vs.
 hit-test orientation on screen.
 
+## [FIX] The volume picker records the volume path in the host's recent files
+`broker.rs` opens the volume through `rfd` built on the **xdg-desktop-portal**
+FileChooser, and the portal backend adds every pick to the desktop's recent
+documents: measured on KDE, one mount wrote the volume path into both
+`~/.local/share/recently-used.xbel` and
+`~/.local/share/RecentDocuments/<volume>.desktop`
+(`X-KDE-LastOpenedWith=org.freedesktop.impl.portal.desktop.kde`). Recent-files
+is a leak class `SECURITY.md` claims to defend, and the entry outlives the
+session. Only the path leaks, never volume contents, and the file it names is
+still encrypted. The FileChooser portal has no "do not record" option. *Fix:*
+pick the volume in our own egui dialog (the agent already has the dialog
+infrastructure), which also drops the `rfd` dependency.
+
 ## D#8 - [TRACK] Move-grab clamps only the top edge
 `move_grab.rs` clamps `y ≥ TOOLBAR_HEIGHT` but nothing else, so a window can
 be dragged fully off left/right/bottom and become unreachable (no
@@ -94,13 +107,12 @@ edge.
   root-owned, the helper writes a validated path). *Fix:* match the helper's
   `mountpoint_ok` (parent == `/run/veracage`, reject `..`), applied to the
   `.raw`/`.run` siblings too.
-- **bwrap cores dump decrypted content**: `sandbox.py` doesn't suppress cores,
-  so an app crash dumps decrypted content to `/var/lib/systemd/coredump` (a
-  host-readable path). This is an **accidental leak**, in scope. *Fix:*
-  `RLIMIT_CORE=0` preexec. (`--unshare-user --disable-userns` (bwrap >= 0.8)
-  would also narrow the kernel attack surface a compromised app could reach,
-  but confining the app is outside the threat model, so that part is defense in
-  depth only, not a fix this model owes.)
+- **bwrap `--unshare-user --disable-userns`** (bwrap >= 0.8) would narrow the
+  kernel attack surface a compromised app can reach. Confining the app is
+  outside the threat model, so this is defense in depth only, not a fix this
+  model owes. (The core-dump leak that used to be filed here is fixed: the
+  helper clears `coredump_filter` for everything it execs. `RLIMIT_CORE=0`,
+  which this item used to prescribe, does nothing on a systemd host.)
 - **`scan_leaders` TOCTOU** - residual on the existing size/type checks:
   between `symlink_metadata` and `read_to_string` a same-uid process can swap
   the validated regular file for a FIFO (main-thread hang) or grow it past the

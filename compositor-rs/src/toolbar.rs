@@ -32,7 +32,7 @@ pub enum ToolbarAction {
     ClipPull, // sandbox selection -> host
     LaunchApp { sock: std::path::PathBuf, index: usize },
     Command(String),     // broker verbs: open/open-app:<key>/configure/settings/exchange/help/about
-    CloseVolume(String), // unmount ONE volume of the session (by label)
+    CloseVolume(String), // dismount ONE volume of the session (by label)
     Quit,                // stop the compositor loop (in-process)
 }
 
@@ -43,7 +43,7 @@ pub enum ToolbarAction {
 pub struct LeaderApps {
     pub sock: std::path::PathBuf,
     pub label: String,
-    pub volumes: Vec<String>, // open-volume labels (for the Unmount menu)
+    pub volumes: Vec<String>, // open-volume labels (for the Dismount menu)
     pub opener: Option<usize>,
     pub names: Vec<String>,
 }
@@ -71,8 +71,8 @@ pub struct Toolbar {
     pointer: egui::Pos2,
     /// Reserved strip height, in logical points, at the top of the window.
     pub height: f32,
-    /// Dark vs light egui visuals. Default LIGHT; the human side passes
-    /// `VERACAGE_THEME=dark` (from config) when it spawns the compositor.
+    /// Dark vs light egui visuals, from `pub/theme` and refreshed live on the
+    /// discovery scan. Light until the human side publishes anything.
     dark: bool,
     /// Menu icons by config-app key, refreshed on the ~1s scan (never per frame).
     icons: HashMap<String, IconSlot>,
@@ -98,6 +98,31 @@ pub struct Toolbar {
     /// A transient user-facing banner (e.g. a failed launch a leader reported),
     /// with the instant it was set. Cleared after NOTICE_TTL.
     notice: Option<(String, std::time::Instant)>,
+}
+
+/// Veracage's own two-color menu glyphs, baked into textures in the theme's ink.
+/// Done once per theme (at construction and on a theme change), never per frame.
+fn bake_menu_icons(
+    ctx: &egui::Context,
+    dark: bool,
+) -> HashMap<String, egui::TextureHandle> {
+    let ink = if dark {
+        egui::Color32::from_gray(222)
+    } else {
+        egui::Color32::from_gray(35)
+    };
+    let mut icons = HashMap::new();
+    for key in MENU_ICON_KEYS {
+        if let Some(img) = crate::mono_icons::icon(key, ink) {
+            let tex = ctx.load_texture(
+                format!("veracage-menu-{key}"),
+                img,
+                egui::TextureOptions::LINEAR,
+            );
+            icons.insert((*key).to_string(), tex);
+        }
+    }
+    icons
 }
 
 /// The progress spinner (see the status spec above `pick_status`): a full ring of
@@ -206,7 +231,7 @@ pub fn decode_icon_rgba() -> Option<(u32, u32, Vec<u8>)> {
 
 /// Menu-item icon keys (each names a glyph in mono_icons).
 pub(crate) const MENU_ICON_KEYS: &[&str] = &[
-    "mount", "exchange", "unmount", "quit", "copy_out", "paste_in",
+    "mount", "exchange", "dismount", "quit", "copy_out", "paste_in",
     "configure_apps", "settings", "shortcuts", "help", "about",
 ];
 
@@ -241,24 +266,8 @@ impl Toolbar {
             .and_then(|s| s.trim().parse::<f32>().ok())
             .map(|s| s.clamp(6.0, 48.0))
             .unwrap_or(FALLBACK_SIZE);
-        let dark = std::env::var("VERACAGE_THEME").as_deref() == Ok("dark");
-        // Our own two-color menu glyphs, in the theme's icon ink.
-        let ink = if dark {
-            egui::Color32::from_gray(222)
-        } else {
-            egui::Color32::from_gray(35)
-        };
-        let mut menu_icons = HashMap::new();
-        for key in MENU_ICON_KEYS {
-            if let Some(img) = crate::mono_icons::icon(key, ink) {
-                let tex = ctx.load_texture(
-                    format!("veracage-menu-{key}"),
-                    img,
-                    egui::TextureOptions::LINEAR,
-                );
-                menu_icons.insert((*key).to_string(), tex);
-            }
-        }
+        let dark = initial_dark();
+        let menu_icons = bake_menu_icons(&ctx, dark);
         Some(Self {
             ctx,
             painter,
@@ -334,6 +343,18 @@ impl Toolbar {
     pub fn refresh_shortcuts(&mut self, copy_out: String, paste_in: String) {
         self.copy_out_label = copy_out;
         self.paste_in_label = paste_in;
+    }
+
+    /// Apply a live theme change (from `pub/theme`). The visuals themselves are
+    /// set per frame from `self.dark`, so only the menu glyphs, which are baked
+    /// once in the theme's ink, have to be redrawn. True if anything changed.
+    pub fn refresh_theme(&mut self, dark: bool) -> bool {
+        if dark == self.dark {
+            return false;
+        }
+        self.dark = dark;
+        self.menu_icons = bake_menu_icons(&self.ctx, dark);
+        true
     }
 
     /// Apply a live font/size change (from `pub/font`). Re-installs the font only
@@ -477,15 +498,15 @@ impl Toolbar {
                                 action = ToolbarAction::Command("exchange".into());
                                 ui.close_menu();
                             }
-                            // Unmount ▸ one item per mounted volume across the
+                            // Dismount ▸ one item per mounted volume across the
                             // session. Absent when nothing is mounted.
                             let vols: Vec<String> =
                                 leaders.iter().flat_map(|l| l.volumes.clone()).collect();
                             if !vols.is_empty() {
                                 ui.separator();
-                                ui.menu_button("Unmount", |ui| {
+                                ui.menu_button("Dismount", |ui| {
                                     for v in &vols {
-                                        if ui.add(menu_item(mi("unmount"), v)).clicked() {
+                                        if ui.add(menu_item(mi("dismount"), v)).clicked() {
                                             action = ToolbarAction::CloseVolume(v.clone());
                                             ui.close_menu();
                                         }
@@ -550,11 +571,15 @@ impl Toolbar {
                             }
                         });
                         ui.menu_button("Settings", |ui| {
-                            if ui.add(menu_item(mi("settings"), "Settings...")).clicked() {
+                            if ui.add(menu_item(mi("settings"), "System Integration...")).clicked() {
                                 action = ToolbarAction::Command("settings".into());
                                 ui.close_menu();
                             }
-                            if ui.add(menu_item(mi("shortcuts"), "Configure shortcuts...")).clicked() {
+                            if ui.add(menu_item(mi("settings"), "Appearance...")).clicked() {
+                                action = ToolbarAction::Command("appearance".into());
+                                ui.close_menu();
+                            }
+                            if ui.add(menu_item(mi("shortcuts"), "Keyboard and Shortcuts...")).clicked() {
                                 action = ToolbarAction::Command("shortcuts".into());
                                 ui.close_menu();
                             }
@@ -1005,6 +1030,42 @@ pub fn scan_font() -> Option<(String, f32)> {
     Some((file, size))
 }
 
+/// Read the idle-dismount timeout from `PUB_DIR/autodismount` (minutes,
+/// 0 = off). None if absent or unreadable, in which case the current setting
+/// stays. Bounded to a day, like the human side's own validation.
+pub fn scan_autodismount() -> Option<u32> {
+    let path = std::path::Path::new(PUB_DIR).join("autodismount");
+    let md = std::fs::symlink_metadata(&path).ok()?;
+    if !md.file_type().is_file() || md.len() > 16 {
+        return None;
+    }
+    let minutes: u32 = std::fs::read_to_string(&path).ok()?.trim().parse().ok()?;
+    Some(minutes.min(1440))
+}
+
+/// The theme to start with: the published one when the human side has already
+/// written it, else the value the helper forwarded at spawn. Without the env
+/// fallback a dark session would flash light for one scan interval.
+pub fn initial_dark() -> bool {
+    scan_theme().unwrap_or_else(|| std::env::var("VERACAGE_THEME").as_deref() == Ok("dark"))
+}
+
+/// Read the human-published theme from `PUB_DIR/theme` ("light" | "dark").
+/// None if the file is absent or holds anything else, in which case the current
+/// theme stays.
+pub fn scan_theme() -> Option<bool> {
+    let path = std::path::Path::new(PUB_DIR).join("theme");
+    let md = std::fs::symlink_metadata(&path).ok()?;
+    if !md.file_type().is_file() || md.len() > 32 {
+        return None;
+    }
+    match std::fs::read_to_string(&path).ok()?.trim() {
+        "dark" => Some(true),
+        "light" => Some(false),
+        _ => None,
+    }
+}
+
 /// Read the host-clipboard auto-clear policy from `PUB_DIR/clipclear`
 /// (`<0|1 enabled>\n<timeout secs>`). None if absent/unreadable, in which case
 /// the worker keeps its secure default (enabled, 30s). Timeout clamped 1..=3600.
@@ -1019,6 +1080,51 @@ pub fn scan_clipclear() -> Option<(bool, u32)> {
     let enabled = lines.next()?.trim() == "1";
     let secs = lines.next()?.trim().parse::<u32>().ok()?.clamp(1, 3600);
     Some((enabled, secs))
+}
+
+/// The keyboard configuration the human published: the host desktop's own XKB
+/// settings with the configured modifier mapping applied. Empty fields mean
+/// "libxkbcommon's default".
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct KeyboardConfig {
+    pub model: String,
+    pub layout: String,
+    pub variant: String,
+    pub options: String,
+}
+
+/// XKB names are lowercase identifiers joined by a few separators. Anything
+/// else means a corrupt (or hostile) pub dir, and a keymap that fails to
+/// compile would leave the session with no keyboard at all, so the whole file
+/// is rejected and the default layout kept.
+fn xkb_names_ok(s: &str) -> bool {
+    s.len() <= 256
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-:,+()".contains(c))
+}
+
+/// Read the published keyboard configuration from `PUB_DIR/keyboard`
+/// (`<model>\n<layout>\n<variant>\n<options>`). None if absent, unreadable or
+/// not plausible XKB names.
+pub fn scan_keyboard() -> Option<KeyboardConfig> {
+    let path = std::path::Path::new(PUB_DIR).join("keyboard");
+    let md = std::fs::symlink_metadata(&path).ok()?;
+    if !md.file_type().is_file() || md.len() > 1024 {
+        return None;
+    }
+    let body = std::fs::read_to_string(&path).ok()?;
+    let mut lines = body.lines().map(str::trim);
+    let mut next = || lines.next().unwrap_or("").to_string();
+    let cfg = KeyboardConfig {
+        model: next(),
+        layout: next(),
+        variant: next(),
+        options: next(),
+    };
+    let ok = [&cfg.model, &cfg.layout, &cfg.variant, &cfg.options]
+        .iter()
+        .all(|s| xkb_names_ok(s));
+    ok.then_some(cfg)
 }
 
 /// Read the human-published desired window size from `PUB_DIR/window.size`
@@ -1102,7 +1208,7 @@ pub fn scan_leaders() -> Vec<LeaderApps> {
             continue;
         }
         let label = lines.next().unwrap_or("Volume").to_string();
-        // Open-volume labels (tab-separated) for the Unmount menu.
+        // Open-volume labels (tab-separated) for the Dismount menu.
         let volumes: Vec<String> = lines
             .next()
             .unwrap_or("")
@@ -1151,6 +1257,18 @@ pub fn launch_app(sock: &std::path::Path, index: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_xkb_names_are_checked_before_they_reach_libxkbcommon() {
+        assert!(xkb_names_ok(""));
+        assert!(xkb_names_ok("us,rp"));
+        assert!(xkb_names_ok("compose:caps,eurosign:e,altwin:ctrl_win"));
+        assert!(xkb_names_ok("nodeadkeys(legacy)"));
+        // A corrupt or hostile pub dir must not reach the keymap compiler.
+        assert!(!xkb_names_ok("us; rm -rf"));
+        assert!(!xkb_names_ok("us\u{0}rp"));
+        assert!(!xkb_names_ok(&"a".repeat(257)));
+    }
 
     const HOUR_NS: u128 = 3_600_000_000_000;
 

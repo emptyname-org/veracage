@@ -135,12 +135,32 @@ fn apply_window_size(window: &dyn smithay::reexports::winit::window::Window, siz
     }
 }
 
-/// True when the human side asked for the dark theme (same env the toolbar
-/// reads). Read once; it decides the backdrop text's ink.
-fn dark_theme() -> bool {
-    use std::sync::OnceLock;
-    static DARK: OnceLock<bool> = OnceLock::new();
-    *DARK.get_or_init(|| std::env::var("VERACAGE_THEME").as_deref() == Ok("dark"))
+/// Minimum gap between two dismount requests. They travel through a single-verb
+/// file the broker polls every 300ms, so back-to-back requests would overwrite
+/// each other and only the last volume would close. It also paces the retries if
+/// a dismount does not take.
+const DISMOUNT_REQUEST_GAP: Duration = Duration::from_secs(5);
+
+/// Whether an idle dismount is due: a timeout is configured, the human has left
+/// Veracage alone for at least that long, and the last request (if any) has had
+/// time to reach the broker.
+fn dismount_due(
+    minutes: u32,
+    idle: Duration,
+    since_last_request: Option<Duration>,
+) -> bool {
+    minutes > 0
+        && idle >= Duration::from_secs(minutes as u64 * 60)
+        && since_last_request.is_none_or(|d| d >= DISMOUNT_REQUEST_GAP)
+}
+
+/// The backdrop IS the desktop: drawn first, behind every window. Light-gray
+/// under the light theme, near-black under dark. Read per frame, so a theme
+/// change applies to the running session.
+fn backdrop_color(_dark: bool) -> [f32; 4] {
+    // Veracage's own teal, rgb(7, 169, 175), the same in both themes: the
+    // backdrop is the product's surface, not a shade of the theme.
+    [7.0 / 255.0, 169.0 / 255.0, 175.0 / 255.0, 1.0]
 }
 
 /// How often the discovery scan runs: it is what makes a mounted volume show up
@@ -178,8 +198,18 @@ fn run_discovery_scan(
         state.cfg_apps = cfg_apps;
         changed = true;
     }
+    // Live theme: the backdrop, the menu-bar visuals and the backdrop hint all
+    // follow it, so a Settings change no longer waits for a restart.
+    if let Some(dark) = crate::toolbar::scan_theme() {
+        if dark != state.dark {
+            state.dark = dark;
+            changed = true;
+        }
+    }
     let font = crate::toolbar::scan_font();
+    let dark = state.dark;
     if let Some(tb) = state.toolbar.as_mut() {
+        changed |= tb.refresh_theme(dark);
         tb.refresh_icons(&state.cfg_apps);
         if let Some((path, base)) = font.clone() {
             changed |= tb.refresh_font(&path, base);
@@ -207,6 +237,47 @@ fn run_discovery_scan(
                 tb.refresh_shortcuts(label(&binds.copy_out), label(&binds.paste_in));
             }
             state.binds = binds;
+            changed = true;
+        }
+    }
+    // Live keyboard configuration: a layout or modifier mapping changed on the
+    // host (or in Settings) recompiles the keymap, which smithay then sends to
+    // every client. A keymap that won't compile leaves the current one in place.
+    if let Some(kb) = crate::toolbar::scan_keyboard() {
+        if kb != state.keyboard_applied {
+            if let Some(keyboard) = state.seat.get_keyboard() {
+                match keyboard.set_xkb_config(state, crate::state::xkb_config(&kb)) {
+                    Ok(()) => tracing::debug!("keyboard: applied {:?}", kb),
+                    Err(e) => tracing::warn!("keyboard: {:?} rejected ({e}), keeping the current keymap", kb),
+                }
+            }
+            state.keyboard_applied = kb;
+        }
+    }
+    // Idle dismount: close the volumes when Veracage has been left alone for the
+    // configured time. One volume per request (the broker's command file carries
+    // one verb), the rest follow on later scans while the session stays idle.
+    if let Some(minutes) = crate::toolbar::scan_autodismount() {
+        state.auto_dismount = minutes;
+    }
+    if dismount_due(
+        state.auto_dismount,
+        state.last_input.elapsed(),
+        state.last_dismount_request.map(|t| t.elapsed()),
+    ) {
+        if let Some(label) = state.leaders.iter().flat_map(|l| l.volumes.iter()).next() {
+            tracing::debug!(
+                "auto-dismount: {label:?} after {}s idle",
+                state.last_input.elapsed().as_secs()
+            );
+            crate::toolbar::request_command(&format!("close-volume:{label}"));
+            state.last_dismount_request = Some(std::time::Instant::now());
+            if let Some(tb) = state.toolbar.as_mut() {
+                tb.set_notice(format!(
+                    "Dismounting {label} after {} minutes idle",
+                    state.auto_dismount
+                ));
+            }
             changed = true;
         }
     }
@@ -332,13 +403,6 @@ pub fn init_winit(
     // pointer move that leaves it still gets one frame to drop the highlight.
     let mut strip_hot = false;
 
-    // The backdrop IS the desktop: drawn first, behind every window. Themed:
-    // light-gray under the light theme, near-black under dark.
-    let clear_color: [f32; 4] = if std::env::var("VERACAGE_THEME").as_deref() == Ok("dark") {
-        [0.10, 0.10, 0.10, 1.0]
-    } else {
-        [0.85, 0.85, 0.87, 1.0]
-    };
 
     // Rendering stays in the winit source (on Redraw). Share the backend so a
     // paced timer can drive redraws, instead of the render re-requesting one
@@ -625,7 +689,6 @@ pub fn init_winit(
                             line2,
                             &font_path,
                             base,
-                            dark_theme(),
                         ) {
                             let tx = (w_l - tw) / 2;
                             let ty = icon_y + crate::toolbar::HINT_ICON_PX + 16;
@@ -714,7 +777,7 @@ pub fn init_winit(
                         }
                         elements.extend(backdrop.iter().map(OutputElement::Custom));
                         damage_tracker
-                            .render_output(renderer, &mut framebuffer, age, &elements, clear_color)
+                            .render_output(renderer, &mut framebuffer, age, &elements, backdrop_color(state.dark))
                             .map_err(|e| e.to_string())
                     }
                     Err(e) => Err(e.to_string()),
@@ -867,4 +930,32 @@ pub fn init_winit(
         })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DISMOUNT_REQUEST_GAP, dismount_due};
+    use std::time::Duration;
+
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn off_never_dismounts() {
+        assert!(!dismount_due(0, HOUR * 24, None));
+    }
+
+    #[test]
+    fn dismounts_once_the_session_has_been_idle_that_long() {
+        assert!(!dismount_due(60, Duration::from_secs(3599), None));
+        assert!(dismount_due(60, HOUR, None));
+        // Activity resets the idle time, so a used session is never dismounted.
+        assert!(!dismount_due(30, Duration::from_secs(5), None));
+    }
+
+    #[test]
+    fn requests_are_paced_so_the_broker_sees_each_one() {
+        // A second volume waits: the command file carries one verb at a time.
+        assert!(!dismount_due(30, HOUR, Some(Duration::from_millis(200))));
+        assert!(dismount_due(30, HOUR, Some(DISMOUNT_REQUEST_GAP)));
+    }
 }

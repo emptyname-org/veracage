@@ -76,7 +76,7 @@ fn glyph(key: &str) -> Vec<Shape> {
             add(rrect(0.08, 0.30, 0.92, 0.78, 0.05)),
         ],
         // Eject: triangle over a bar.
-        "unmount" => vec![
+        "dismount" => vec![
             add(tri((0.50, 0.16), (0.13, 0.56), (0.87, 0.56))),
             add(rrect(0.13, 0.66, 0.87, 0.80, 0.03)),
         ],

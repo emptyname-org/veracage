@@ -1,6 +1,6 @@
 [package]
 name = "veracage-agent"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Veracage human-side agent - control window + config picker (no vault access)"
 license = "MIT OR Apache-2.0"

@@ -47,6 +47,29 @@ pub fn is_valid_size(s: &str) -> bool {
     s == "system" || s.parse::<u32>().map(|n| (6..=48).contains(&n)).unwrap_or(false)
 }
 
+/// Family + POINT size for apps inside the sandbox (kdeglobals stores points),
+/// from the same settings that size the Veracage UI. "system" on either follows
+/// the host desktop.
+pub fn app_font(font_key: &str, size_key: &str) -> (String, f32) {
+    let (host_family, host_pt) = host_ui_font();
+    let family = if font_key == "system" {
+        host_family.clone()
+    } else {
+        family_for(font_key).map(str::to_string)
+    };
+    let points = if size_key == "system" {
+        host_pt.unwrap_or(FALLBACK_PT)
+    } else {
+        size_key.parse().unwrap_or(FALLBACK_PT)
+    };
+    (
+        family
+            .or(host_family)
+            .unwrap_or_else(|| "Noto Sans".to_string()),
+        points,
+    )
+}
+
 /// The fontconfig family a key maps to, or None for "system"/unknown (host font).
 fn family_for(key: &str) -> Option<&'static str> {
     match key {
@@ -59,7 +82,7 @@ fn family_for(key: &str) -> Option<&'static str> {
 }
 
 /// Run a command and return trimmed stdout, or None on any failure.
-fn run(bin: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn run(bin: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(bin).args(args).output().ok()?;
     if !out.status.success() {
         return None;
@@ -257,6 +280,17 @@ pub fn install(ctx: &egui::Context, font_key: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn app_font_uses_the_configured_family_and_points() {
+        // Points, not pixels: kdeglobals is what Qt apps read, and it stores
+        // typographic points, so no DPI conversion happens here.
+        assert_eq!(super::app_font("noto", "12"), ("Noto Sans".to_string(), 12.0));
+        assert_eq!(
+            super::app_font("dejavu-mono", "18"),
+            ("DejaVu Sans Mono".to_string(), 18.0)
+        );
+    }
+
     use super::*;
 
     #[test]

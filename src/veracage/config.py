@@ -102,6 +102,18 @@ def _valid_font_size(s: str) -> bool:
         return False
 
 
+# Modifier-mapping choices (mirrors agent-rs keyboard.rs CHOICES): "system"
+# follows the host desktop, "none" strips any modifier remapping it has, the
+# rest are XKB options verbatim.
+_MODIFIER_KEYS = ("system", "none", "altwin:ctrl_win", "altwin:alt_win",
+                  "altwin:ctrl_alt_win", "ctrl:swap_lwin_lctl",
+                  "ctrl:swap_lalt_lctl", "ctrl:nocaps")
+
+# The XKB option groups the modifier setting owns. Choosing a mapping replaces
+# the host's entries in these groups and leaves its other options alone.
+_MODIFIER_GROUPS = ("altwin", "ctrl")
+
+
 def _run(bin_: str, args: list[str]) -> str | None:
     """Run a command, return trimmed stdout, or None on any failure."""
     import subprocess
@@ -149,6 +161,51 @@ def host_ui_font() -> tuple[str | None, float | None]:
     if v:
         return v.split(",")[0].strip() or None, None
     return None, None
+
+
+def host_keyboard() -> tuple[str, str, str, str]:
+    """The host desktop's XKB configuration (model, layout, variant, options),
+    if detectable. KDE keeps it in kxkbrc, and `Use=false` means it leaves the
+    layout to the system, so we do too. Empty fields mean libxkbcommon's own
+    default, which is what an undetectable desktop gets."""
+    def read(key: str) -> str | None:
+        for tool in ("kreadconfig6", "kreadconfig5"):
+            v = _run(tool, ["--file", "kxkbrc", "--group", "Layout", "--key", key])
+            if v is not None:
+                return v
+        return None
+
+    if read("Use") != "true":
+        return ("", "", "", "")
+    return (read("Model") or "", read("LayoutList") or "",
+            read("VariantList") or "", read("Options") or "")
+
+
+def modifier_options(host_options: str, choice: str) -> str:
+    """The XKB option list to publish: the host's options with the configured
+    modifier mapping applied (mirrors agent-rs keyboard.rs `options_for`)."""
+    if choice == "system":
+        return host_options
+    kept = [o.strip() for o in host_options.split(",")
+            if o.strip() and o.split(":")[0] not in _MODIFIER_GROUPS]
+    if choice != "none":
+        kept.append(choice)
+    return ",".join(kept)
+
+
+def app_font(cfg: "Config") -> tuple[str, float]:
+    """The font for apps INSIDE the sandbox: family and POINT size. Same setting
+    that sizes the Veracage UI, but in Qt's own unit (kdeglobals stores points),
+    so no pixel conversion. "system" on either follows the host desktop."""
+    host_family, host_pt = host_ui_font()
+    family = host_family if cfg.ui_font == "system" else _FONT_FAMILIES.get(cfg.ui_font)
+    if not family:
+        family = host_family or _FONT_FAMILIES["noto"]
+    if cfg.ui_font_size == "system":
+        points = host_pt or FALLBACK_FONT_PT
+    else:
+        points = float(cfg.ui_font_size)   # validated on load
+    return family, points
 
 
 def font_file(ui_font: str) -> str:
@@ -268,6 +325,20 @@ def _coerce_clip_timeout(val: object) -> int:
     return max(_CLIP_CLEAR_TIMEOUT_MIN, min(val, _CLIP_CLEAR_TIMEOUT_MAX))
 
 
+# Idle minutes before the session dismounts itself (0 = off). Bounded so a
+# crafted config can neither wedge the timer nor keep a volume open forever.
+_AUTO_DISMOUNT_MAX = 1440
+
+
+def _coerce_auto_dismount(val: object) -> int:
+    """Clamp the auto-dismount idle timeout (minutes) into range. A non-int
+    (bool counts as non-int) falls back to off."""
+    if isinstance(val, bool) or not isinstance(val, int):
+        print(f"veracage: invalid auto_dismount {val!r}, using 0 (off)", file=sys.stderr)
+        return 0
+    return max(0, min(val, _AUTO_DISMOUNT_MAX))
+
+
 @dataclass
 class Config:
     apps: dict[str, App]
@@ -277,10 +348,12 @@ class Config:
     ui_font: str = "system"               # UI font key (see _VALID_FONTS); system = host
     ui_font_size: str = "system"          # "system" (host size) | a point size
     window_size: str = "default"          # compositor default window size
+    modifier_keys: str = "system"         # modifier mapping (see _MODIFIER_KEYS)
     exchange: bool = True                 # host<->volume shared directory
     exchange_dir: str | None = None       # default ~/Veracage/Exchange when unset
     clip_clear: bool = True               # auto-clear host clipboard after Copy out
     clip_clear_timeout: int = DEFAULT_CLIP_CLEAR_TIMEOUT   # seconds before it fires
+    auto_dismount: int = 0                # idle minutes before a dismount (0 = off)
     debug: bool = False                   # verbose timing logs (see docs/debugging.md)
     shortcuts: dict[str, str] = field(default_factory=_default_shortcuts)
     volumes: dict[str, VolumeConfig] = field(default_factory=dict)
@@ -363,6 +436,7 @@ def load() -> Config:
     debug = _coerce_bool(default.get("debug", False), "default.debug")
     clip_clear_timeout = _coerce_clip_timeout(
         default.get("clip_clear_timeout", DEFAULT_CLIP_CLEAR_TIMEOUT))
+    auto_dismount = _coerce_auto_dismount(default.get("auto_dismount", 0))
     theme = default.get("theme", "light")
     if theme not in ("light", "dark", "system"):
         print(f"veracage: invalid theme {theme!r}, using 'light'", file=sys.stderr)
@@ -381,6 +455,11 @@ def load() -> Config:
         print(f"veracage: invalid window_size {window_size!r}, using 'default'",
               file=sys.stderr)
         window_size = "default"
+    modifier_keys = default.get("modifier_keys", "system")
+    if modifier_keys not in _MODIFIER_KEYS:
+        print(f"veracage: invalid modifier_keys {modifier_keys!r}, using 'system'",
+              file=sys.stderr)
+        modifier_keys = "system"
     suspend_action = default.get("suspend_action", "dismount")
     if suspend_action not in ("dismount", "ignore"):
         print(f"veracage: invalid suspend_action {suspend_action!r} "
@@ -421,8 +500,10 @@ def load() -> Config:
     return Config(apps=apps, last_used_app=last,
                   suspend_action=suspend_action, theme=theme, ui_font=ui_font,
                   ui_font_size=ui_font_size, window_size=window_size,
+                  modifier_keys=modifier_keys,
                   exchange=exchange, exchange_dir=exchange_dir,
                   clip_clear=clip_clear, clip_clear_timeout=clip_clear_timeout,
+                  auto_dismount=auto_dismount,
                   debug=debug, shortcuts=shortcuts, volumes=volumes)
 
 
@@ -437,10 +518,12 @@ def save(cfg: Config) -> Path:
               f'ui_font        = "{_esc(cfg.ui_font)}"',
               f'ui_font_size   = "{_esc(cfg.ui_font_size)}"',
               f'window_size    = "{_esc(cfg.window_size)}"',
+              f'modifier_keys  = "{_esc(cfg.modifier_keys)}"',
               f"exchange       = {_toml_bool(cfg.exchange)}",
               f'suspend_action = "{_esc(cfg.suspend_action)}"',
               f"clip_clear     = {_toml_bool(cfg.clip_clear)}",
               f"clip_clear_timeout = {int(cfg.clip_clear_timeout)}",
+              f"auto_dismount  = {int(cfg.auto_dismount)}",
               f"debug          = {_toml_bool(cfg.debug)}"]
     if cfg.exchange_dir:
         lines += [f'exchange_dir   = "{_esc(cfg.exchange_dir)}"']
@@ -639,10 +722,20 @@ def publish_apps(cfg: Config) -> None:
     # keyboard shortcuts. All published atomically (temp + replace).
     _publish_atomic(pub, "config.apps", apps)
     _publish_atomic(pub, "window.size", cfg.window_size + "\n")
+    _publish_atomic(pub, "theme", cfg.theme + "\n")
+    # The app-side font (family + points): the leader builds the sandbox's
+    # kdeglobals from this and pub/theme.
+    family, points = app_font(cfg)
+    _publish_atomic(pub, "appfont", f"{family}\n{points:g}\n")
     _publish_atomic(pub, "font",
                     f"{font_file(cfg.ui_font)}\n{base_font_size(cfg.ui_font_size, cfg.ui_font)}\n")
     _publish_atomic(pub, "shortcuts",
                     "".join(f"{a}\t{sc.get(a, _DEFAULT_SHORTCUTS[a])}\n" for a in _SHORTCUT_ACTIONS))
+    model, layout, variant, options = host_keyboard()
+    _publish_atomic(pub, "keyboard",
+                    f"{model}\n{layout}\n{variant}\n"
+                    f"{modifier_options(options, cfg.modifier_keys)}\n")
+    _publish_atomic(pub, "autodismount", f"{int(cfg.auto_dismount)}\n")
     _publish_atomic(pub, "clipclear",
                     f"{1 if cfg.clip_clear else 0}\n{cfg.clip_clear_timeout}\n")
     # The default-app associations the leader seeds into each sandbox.

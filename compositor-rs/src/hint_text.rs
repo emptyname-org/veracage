@@ -22,7 +22,7 @@ pub struct HintText {
     buffer: Option<MemoryRenderBuffer>,
     size: (i32, i32),
     /// What the current buffer was built from.
-    built: Option<(String, String, String, u32, bool)>,
+    built: Option<(String, String, String, u32)>,
 }
 
 impl HintText {
@@ -35,7 +35,6 @@ impl HintText {
         line2: &str,
         font_path: &str,
         base: f32,
-        dark: bool,
     ) -> Option<(&MemoryRenderBuffer, (i32, i32))> {
         if line1.is_empty() && line2.is_empty() {
             return None;
@@ -45,10 +44,9 @@ impl HintText {
             line2.to_string(),
             font_path.to_string(),
             base.to_bits(),
-            dark,
         );
         if self.built.as_ref() != Some(&key) {
-            let (w, h, rgba) = rasterise(line1, line2, font_path, base, dark)?;
+            let (w, h, rgba) = rasterise(line1, line2, font_path, base)?;
             self.buffer = Some(MemoryRenderBuffer::from_slice(
                 &rgba,
                 Fourcc::Abgr8888,
@@ -70,7 +68,6 @@ fn rasterise(
     line2: &str,
     font_path: &str,
     base: f32,
-    dark: bool,
 ) -> Option<(i32, i32, Vec<u8>)> {
     use egui::epaint::text::{FontDefinitions, Fonts};
     use egui::{Color32, FontData, FontFamily, FontId};
@@ -88,13 +85,11 @@ fn rasterise(
     let fonts = Fonts::new(1.0, MAX_TEXTURE_SIDE, defs);
     fonts.begin_pass(1.0, MAX_TEXTURE_SIDE);
 
-    // The same weights the egui version used: a large first line, a smaller and
-    // fainter second one.
-    let (strong, weak) = if dark {
-        (Color32::from_gray(190), Color32::from_gray(130))
-    } else {
-        (Color32::from_gray(95), Color32::from_gray(130))
-    };
+    // White on the teal backdrop, which is the same under both themes: a large
+    // solid first line and a fainter second one. (Premultiplied, so the faint
+    // line is white AT its alpha - the buffer is composited over the backdrop.)
+    let strong = Color32::WHITE;
+    let weak = Color32::from_white_alpha(170);
     let big = fonts.layout_no_wrap(line1.to_owned(), FontId::proportional(base * 1.7), strong);
     let small = fonts.layout_no_wrap(line2.to_owned(), FontId::proportional(base), weak);
 
@@ -172,7 +167,7 @@ mod tests {
     fn rasterises_visible_glyphs_with_premultiplied_alpha() {
         // The blit is the part that is ours (epaint does layout and glyphs), so
         // check it actually produces ink: a sized buffer with non-zero coverage.
-        let (w, h, rgba) = rasterise("No volume mounted", "File > Mount volume", "", 16.0, false)
+        let (w, h, rgba) = rasterise("No volume mounted", "File > Mount volume", "", 16.0)
             .expect("the embedded epaint font must rasterise");
         assert!(w > 100 && h > 20, "unexpected block size {w}x{h}");
         assert_eq!(rgba.len(), (w * h * 4) as usize);
@@ -184,9 +179,9 @@ mod tests {
 
     #[test]
     fn second_line_is_optional_and_nothing_means_no_buffer() {
-        let (_, tall, _) = rasterise("1 volume mounted (work)", "hint", "", 16.0, false).unwrap();
-        let (_, short, _) = rasterise("1 volume mounted (work)", "", "", 16.0, false).unwrap();
+        let (_, tall, _) = rasterise("1 volume mounted (work)", "hint", "", 16.0).unwrap();
+        let (_, short, _) = rasterise("1 volume mounted (work)", "", "", 16.0).unwrap();
         assert!(short < tall, "an empty second line should not reserve its height");
-        assert!(HintText::default().buffer("", "", "", 16.0, false).is_none());
+        assert!(HintText::default().buffer("", "", "", 16.0).is_none());
     }
 }

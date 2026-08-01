@@ -29,10 +29,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Never dump core: the compositor holds decrypted on-screen content and
     // clipboard secrets, so a core would write that plaintext to a host-readable
     // file (/var/lib/systemd/coredump). Suppress it before anything sensitive.
+    // The helper already clears `coredump_filter` for everything it execs (see
+    // its `suppress_core_dumps`); repeated here because the compositor also runs
+    // directly, from the tests and the headless smoke. The limit alone is not
+    // enough: the kernel ignores it when `core_pattern` is a pipe, which is the
+    // systemd default, so the filter is what actually empties the dump.
     unsafe {
         let rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         libc::setrlimit(libc::RLIMIT_CORE, &rl);
     }
+    let _ = std::fs::write("/proc/self/coredump_filter", "0\n");
 
     // --socket <name>  the wayland socket name apps connect to (the leader picks
     //                  it, like `weston --socket=`, so it knows it). The clipboard

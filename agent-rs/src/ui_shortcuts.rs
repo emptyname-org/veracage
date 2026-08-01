@@ -1,6 +1,8 @@
-//! Shortcut configurator: `veracage-agent _shortcuts` (Settings > Shortcuts).
-//! Rebind the Veracage clipboard transfers - click a binding, press the new
-//! combo, Save. (The apps' own Cut/Copy/Paste are not Veracage bindings.)
+//! Keyboard and shortcuts: `veracage-agent _shortcuts`
+//! (Settings > Keyboard and Shortcuts). Two things, both about keys: which
+//! modifier mapping the sandbox uses, and the Veracage clipboard bindings -
+//! click a binding, press the new combo, Save. (The apps' own Cut/Copy/Paste
+//! are not Veracage bindings.)
 
 use eframe::egui;
 
@@ -13,26 +15,17 @@ const ROWS: &[(&str, &str, &str)] = &[
 ];
 
 pub fn run() -> Result<(), eframe::Error> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Veracage Shortcuts")
-            .with_app_id("veracage")
-            .with_inner_size([520.0, 480.0])
-            .with_min_inner_size([440.0, 400.0]),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "veracage-shortcuts",
-        options,
-        Box::new(|cc| {
-            crate::theme::apply_config(&cc.egui_ctx, &config::load());
-            Ok(Box::new(Shortcuts::new()) as Box<dyn eframe::App>)
-        }),
-    )
+    crate::theme::dialog("veracage-shortcuts", "Veracage Keyboard and Shortcuts", [660.0, 520.0], [560.0, 420.0], |cc| {
+        crate::theme::apply_config(&cc.egui_ctx, &config::load());
+        Box::new(Shortcuts::new())
+    })
 }
 
 struct Shortcuts {
     cfg: config::Config,
+    /// The host desktop's own XKB options, resolved once, so "Host setting"
+    /// shows what it actually follows.
+    host_modifiers: String,
     /// The action currently capturing a new combo, if any.
     capturing: Option<String>,
     /// True while OUR sentinel is on the host clipboard, so it is removed again
@@ -45,6 +38,7 @@ impl Shortcuts {
     fn new() -> Self {
         Self {
             cfg: config::load(),
+            host_modifiers: crate::keyboard::host_keyboard().options,
             capturing: None,
             seeded_clipboard: false,
             status: String::new(),
@@ -179,11 +173,41 @@ impl eframe::App for Shortcuts {
             }
         });
 
+        let host_modifiers = match self.host_modifiers.as_str() {
+            "" => "Host setting".to_string(),
+            opts => format!("Host setting ({opts})"),
+        };
         crate::theme::content_panel(ctx, |ui| {
-                ui.label(egui::RichText::new("Click a shortcut to modify").weak());
-                ui.add_space(14.0);
+                // Which modifier mapping the sandbox uses. The default follows
+                // the host desktop, so Ctrl/Alt/Win behave the same in and out.
+                let col = crate::theme::text_width(ui, &["Modifier keys:"]) + 24.0;
+                let ctrl = crate::theme::text_width(ui, &["Host setting"]) + 160.0;
+                crate::theme::row(ui, col, "Modifier keys:", |ui| {
+                    egui::ComboBox::from_id_salt("modifier_keys")
+                        .width(ctrl)
+                        .truncate()
+                        .selected_text(crate::keyboard::label(&self.cfg.modifier_keys))
+                        .show_ui(ui, |ui| {
+                            for (key, label) in crate::keyboard::CHOICES {
+                                let label = if *key == "system" {
+                                    host_modifiers.clone()
+                                } else {
+                                    (*label).to_string()
+                                };
+                                ui.selectable_value(
+                                    &mut self.cfg.modifier_keys,
+                                    (*key).to_string(),
+                                    label,
+                                );
+                            }
+                        });
+                });
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(16.0);
 
-                // Each shortcut button sits UNDER its explanation, not beside it.
+                // Each shortcut button sits UNDER its explanation, with the
+                // "how" beside the button it applies to rather than in a header.
                 for (action, label, desc) in ROWS {
                     ui.label(*label);
                     ui.label(egui::RichText::new(*desc).weak());
@@ -195,7 +219,14 @@ impl eframe::App for Shortcuts {
                         self.bind(action)
                     };
                     let btn = egui::Button::new(text).min_size(egui::vec2(150.0, 0.0));
-                    if ui.add(btn).clicked() {
+                    let mut hit = false;
+                    ui.horizontal(|ui| {
+                        hit = ui.add(btn).clicked();
+                        if !capturing {
+                            ui.label(egui::RichText::new("Click to modify").weak());
+                        }
+                    });
+                    if hit {
                         self.capturing = Some((*action).to_string());
                         // egui only emits a Paste event when the clipboard has
                         // content, so with an EMPTY clipboard Ctrl+V yields no
@@ -227,6 +258,7 @@ impl eframe::App for Shortcuts {
             match config::save(&self.cfg) {
                 Ok(_) => {
                     crate::broker::publish_shortcuts(&self.cfg);
+                    crate::broker::publish_keyboard(&self.cfg);
                     self.unseed_clipboard();
                     std::process::exit(0);
                 }

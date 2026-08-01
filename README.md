@@ -46,9 +46,19 @@ ownership, and the mount never appears in `/proc/mounts`. Apps run as
 - **Clipboard** - user-triggered only: Clipboard > Paste in (host to sandbox)
   and Clipboard > Copy out (sandbox to host), with configurable shortcuts
   (defaults Ctrl+Alt+V / Ctrl+Alt+C). Text-only, owned by the compositor. After
-  a Copy out, the host clipboard is cleared automatically after a timeout
+  a Copy out, the host clipboard is cleared automatically after a delay
   (default 30 seconds) and again when Veracage quits, so a copied secret does
-  not linger on the host. Both are configurable in Settings.
+  not linger on the host. Settings sets the delay, or turns it off.
+- **Keyboard** - the compositor builds its keymap from the host desktop's own
+  XKB configuration (layout, model, variant, options), so a Compose key or a
+  Ctrl/Win mapping set on the host applies inside Veracage too. Settings >
+  Keyboard and Shortcuts overrides the Ctrl / Alt / Win part of it, and a
+  change applies to the running session.
+- **Theme and font** - Settings > Appearance applies to the Veracage window
+  live, and to the apps launched next: the session seeds the sandbox's
+  `kdeglobals` with the chosen font (in points) and the desktop's own Breeze
+  colour scheme, so a dark Veracage runs dark apps. A running app keeps the look
+  it started with.
 - **Shared directory** - `~/Veracage/Exchange` on the host is idmap-mounted
   into the sandbox at `/exchange`. Files dropped on either side appear on the
   other, owned by the user. No dialogs, no copies. File > Shared
@@ -57,14 +67,19 @@ ownership, and the mount never appears in `/proc/mounts`. Apps run as
   mount namespace, side by side at `/vaults/<label>`. One app set sees them
   all, so a single file manager can drag-and-drop between volumes. The title
   bar counts the mounts ("2 volumes mounted (work, private)"). **File >
-  Unmount** unmounts one volume, the rest keep running. Apps see the volumes
+  Dismount** dismounts one volume, the rest keep running. Apps see the volumes
   mounted at their launch time. Design: `docs/shared-workspace.md`.
 - **Any installed app** - `veracage configure` (GUI picker) or
   `--add <binary>` / `--remove <key>` / `--list`. No fixed catalog.
+- **Idle dismount** - Settings > Auto-dismount after (off, 30 minutes, 1, 2 or
+  12 hours). The compositor is the only component that sees whether you are
+  using Veracage, so it runs the timer: after that long with no input to the
+  Veracage window, the mounted volumes dismount themselves and the session stays
+  up as an empty scratchpad.
 - **Crash-safe teardown** - the session is a `systemd --user` transient
   service whose `ExecStopPost` closes the dm device on any exit
   (SIGKILL, OOM, panic, logout).
-- **Suspend** - a root `system-sleep` hook unmounts every session before
+- **Suspend** - a root `system-sleep` hook dismounts every session before
   sleep.
 - **Hardened privilege helper** (Rust, `helper-rs/`) - caller uid from
   `PKEXEC_UID` (never argv), continuation pinned at build time, forwarded env
@@ -103,8 +118,9 @@ sudo make install    # system install to /usr/local (override with PREFIX=)
 `make install` lays down the package under `PREFIX/lib/veracage`, with
 `veracage`, `veracage-agent`, and `veracage-compositor` in `PREFIX/bin` and
 the privileged helpers in `PREFIX/libexec/veracage`. It also installs a
-polkit policy, a `.desktop` + icon, a udev rule (hides the dm device from
-UDisks), and the `system-sleep` hook, and creates the `veracage` system user.
+polkit policy, a `.desktop` + icon, a udev rule (keeps the dm device out of
+UDisks and out of `/dev/disk`), and the `system-sleep` hook, and creates the
+`veracage` system user.
 
 ## Usage
 
@@ -115,7 +131,7 @@ veracage open /path/to/volume.vc      # mount into the shared workspace
 veracage open /path/to/volume.vc kate # auto-launch an app too
 veracage open /path/to/other.vc       # a 2nd volume joins the same workspace
 veracage list /path/to/volume.vc
-veracage close-volume <label>         # unmount one volume (File > Unmount)
+veracage close-volume <label>         # dismount one volume (File > Dismount)
 veracage close /path/to/volume.vc     # tear the whole session down
 ```
 
@@ -135,9 +151,12 @@ theme          = "light"        # light | dark
 ui_font        = "system"       # system (host font) | noto | liberation | dejavu | dejavu-mono
 ui_font_size   = "system"       # system (host size) | a point size, e.g. 12
 window_size    = "default"      # default | max | 1280x800 (WxH)
-suspend_action = "dismount"     # unmount on suspend, or "ignore" to keep mounted
+modifier_keys  = "system"       # system (host mapping) | none | an XKB option,
+                                # e.g. altwin:ctrl_win | ctrl:nocaps
+suspend_action = "dismount"     # dismount on suspend, or "ignore" to keep mounted
 clip_clear     = true           # auto-clear the host clipboard after Copy out
 clip_clear_timeout = 30         # seconds before the auto-clear fires
+auto_dismount  = 0              # idle minutes before the volumes dismount (0 = off)
 debug          = false          # verbose timing logs (docs/debugging.md)
 
 [apps.kate]                     # the enabled-app allowlist (any installed binary)

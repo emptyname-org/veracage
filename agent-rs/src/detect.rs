@@ -213,7 +213,7 @@ pub fn icon_rgba_for_exec(exec: &str) -> Option<(u32, u32, Vec<u8>)> {
 /// bounded walk of the icon themes that accepts either extension (KDE/breeze is
 /// SVG-only, e.g. VeraCrypt, while gnome/oxygen ship PNGs). `None` if the icon
 /// isn't in the theme in either form.
-fn icon_rgba_for_name(name: &str) -> Option<(u32, u32, Vec<u8>)> {
+pub fn icon_rgba_for_name(name: &str) -> Option<(u32, u32, Vec<u8>)> {
     if name.starts_with('/') {
         return load_icon_file(std::path::Path::new(name));
     }

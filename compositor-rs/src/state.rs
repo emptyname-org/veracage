@@ -47,6 +47,19 @@ use smithay::{
 };
 use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration_manager::Mode as KdeManagerMode;
 
+/// The published keyboard configuration as smithay's XKB config. Empty fields
+/// are what libxkbcommon reads as "use your default", so an undetectable host
+/// desktop simply gets the default layout.
+pub fn xkb_config(kb: &crate::toolbar::KeyboardConfig) -> smithay::input::keyboard::XkbConfig<'_> {
+    smithay::input::keyboard::XkbConfig {
+        rules: "",
+        model: &kb.model,
+        layout: &kb.layout,
+        variant: &kb.variant,
+        options: (!kb.options.is_empty()).then(|| kb.options.clone()),
+    }
+}
+
 pub struct State {
     pub start_time: std::time::Instant,
     pub socket_name: OsString,
@@ -141,6 +154,25 @@ pub struct State {
     /// to the clipboard worker, so the scan only sends it on a change.
     /// Initialized to the worker's own secure default (enabled, 30s).
     pub clip_clear_applied: (bool, u32),
+
+    /// The keyboard configuration currently compiled into the seat's keymap, so
+    /// the scan recompiles only when the human changes it.
+    pub keyboard_applied: crate::toolbar::KeyboardConfig,
+
+    /// Dark theme, from `pub/theme` and refreshed live on the discovery scan.
+    /// Drives the backdrop, the backdrop hint's ink and the toolbar's visuals.
+    pub dark: bool,
+
+    /// Idle minutes before the mounted volumes dismount themselves (0 = off),
+    /// from `pub/autodismount`, and when input last reached the sandbox. The
+    /// compositor owns this timer because it is the only component that sees
+    /// whether the human is actually using Veracage.
+    pub auto_dismount: u32,
+    pub last_input: std::time::Instant,
+    /// When the last dismount was requested, so the requests are paced: they go
+    /// through a single-verb file the broker polls, and one per volume sent back
+    /// to back would overwrite each other.
+    pub last_dismount_request: Option<std::time::Instant>,
 
     /// The current drag-and-drop icon surface (the "ghost" that follows the
     /// cursor during a DnD), set when a client starts a drag and cleared on drop.
@@ -241,18 +273,30 @@ impl State {
         let mut seat_state = SeatState::new();
         let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "winit");
 
-        // Notify clients that we have a keyboard, for the sake of the example we assume that keyboard is always present.
-        // You may want to track keyboard hot-plug in real compositor.
-        // A real compositor must not die on a bad/custom keymap: try the
-        // environment's layout, and if it won't compile, fall back to plain US.
-        if seat.add_keyboard(Default::default(), 200, 25).is_err() {
-            eprintln!("veracage-compositor: environment keymap failed to compile; falling back to 'us'");
-            seat.add_keyboard(
-                smithay::input::keyboard::XkbConfig { layout: "us", ..Default::default() },
-                200,
-                25,
-            )
-            .expect("us keymap must compile");
+        // Keyboard: the host desktop's own XKB configuration, published by the
+        // human side (`pub/keyboard`), so a layout or a Ctrl/Win mapping set on
+        // the host applies inside Veracage too. Absent or unreadable falls
+        // through to libxkbcommon's default, and the scan re-applies a later
+        // change live.
+        let keyboard = crate::toolbar::scan_keyboard().unwrap_or_default();
+        // A real compositor must not die on a bad/custom keymap, and it must not
+        // throw away a working layout over one bad option either: drop the
+        // options first, and only then fall back to plain US.
+        let without_options = crate::toolbar::KeyboardConfig {
+            options: String::new(),
+            ..keyboard.clone()
+        };
+        if seat.add_keyboard(xkb_config(&keyboard), 200, 25).is_err() {
+            eprintln!("veracage-compositor: keymap {keyboard:?} failed to compile; dropping its options");
+            if seat.add_keyboard(xkb_config(&without_options), 200, 25).is_err() {
+                eprintln!("veracage-compositor: layout still would not compile; falling back to 'us'");
+                seat.add_keyboard(
+                    smithay::input::keyboard::XkbConfig { layout: "us", ..Default::default() },
+                    200,
+                    25,
+                )
+                .expect("us keymap must compile");
+            }
         }
 
         // Notify clients that we have a pointer (mouse)
@@ -321,6 +365,11 @@ impl State {
                 .unwrap_or_else(|_| "default".into()),
             binds: crate::shortcuts::Binds::default(),
             clip_clear_applied: crate::hostclip::DEFAULT_CLEAR_POLICY,
+            keyboard_applied: keyboard,
+            dark: crate::toolbar::initial_dark(),
+            auto_dismount: crate::toolbar::scan_autodismount().unwrap_or(0),
+            last_input: std::time::Instant::now(),
+            last_dismount_request: None,
         }
     }
 

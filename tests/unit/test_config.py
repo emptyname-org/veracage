@@ -306,6 +306,52 @@ def test_clip_clear_published(tmp_xdg_config, tmp_path, monkeypatch):
     assert (pub / "clipclear").read_text() == "1\n20\n"
 
 
+def test_auto_dismount_roundtrip_and_bounds(tmp_xdg_config, tmp_path, monkeypatch):
+    config.save(config.Config(apps={}, auto_dismount=120))
+    assert config.load().auto_dismount == 120
+    # Off by default, bounded above, and a non-int falls back to off rather than
+    # leaving a volume open forever.
+    assert config.Config(apps={}).auto_dismount == 0
+    assert config._coerce_auto_dismount(10_000) == config._AUTO_DISMOUNT_MAX
+    assert config._coerce_auto_dismount("30") == 0
+    assert config._coerce_auto_dismount(True) == 0
+    pub = tmp_path / "pub"
+    pub.mkdir()
+    monkeypatch.setenv("VERACAGE_PUB_DIR", str(pub))
+    config.publish_apps(config.Config(apps={}, auto_dismount=30))
+    assert (pub / "autodismount").read_text() == "30\n"
+
+
+def test_modifier_keys_roundtrip_and_validation(tmp_xdg_config):
+    config.save(config.Config(apps={}, modifier_keys="altwin:ctrl_win"))
+    assert config.load().modifier_keys == "altwin:ctrl_win"
+    # An unknown value is refused: it reaches libxkbcommon through the
+    # published keyboard file.
+    p = config.config_path()
+    p.write_text('[default]\nmodifier_keys = "ctrl:whatever"\n')
+    assert config.load().modifier_keys == "system"
+
+
+def test_modifier_options_replaces_only_the_modifier_groups():
+    host = "compose:caps,eurosign:e,altwin:ctrl_win"
+    assert config.modifier_options(host, "system") == host
+    # The Compose key and the currency sign survive a modifier choice.
+    assert config.modifier_options(host, "ctrl:nocaps") == "compose:caps,eurosign:e,ctrl:nocaps"
+    assert config.modifier_options(host, "none") == "compose:caps,eurosign:e"
+    assert config.modifier_options("", "altwin:alt_win") == "altwin:alt_win"
+
+
+def test_keyboard_published(tmp_xdg_config, tmp_path, monkeypatch):
+    # publish_apps writes pub/keyboard as "<model>\n<layout>\n<variant>\n<options>".
+    pub = tmp_path / "pub"
+    pub.mkdir()
+    monkeypatch.setenv("VERACAGE_PUB_DIR", str(pub))
+    monkeypatch.setattr(config, "host_keyboard",
+                        lambda: ("apple", "us,rp", ",", "compose:caps,altwin:ctrl_win"))
+    config.publish_apps(config.Config(apps={}, modifier_keys="ctrl:nocaps"))
+    assert (pub / "keyboard").read_text() == "apple\nus,rp\n,\ncompose:caps,ctrl:nocaps\n"
+
+
 @pytest.fixture
 def tmp_xdg_data(monkeypatch, tmp_path):
     """An isolated XDG data dir with an applications/ directory, so mimeapps

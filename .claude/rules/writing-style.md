@@ -23,7 +23,7 @@ Apply these rules to all prose, documentation, comments, UI text, and generated 
 - Use "Veracage", not "vault", "composer", or "sandbox".
 - The host os should be called Host, not desktop
 - Use "Volume", not "disk".
-- Volumes are mounted and unmounted, not closed or opened.
+- Volumes are mounted and dismounted, not closed or opened.
 - Use "Shared directory" for the directory both the Host and Veracage see, not "exchange folder" or "exchange directory". Internal names (the exchange config key, /exchange, ~/Veracage/Exchange) stay.
 - Clipboard actions move the clipboard (what was copied), not the "selection".
 - Use "directory", not "folder"

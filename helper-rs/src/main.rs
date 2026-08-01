@@ -11,7 +11,7 @@
 //!   2. cryptsetup open SOURCE (LUKS|VeraCrypt) -> /dev/mapper/veracage-XXXX
 //!   3. plain-mount it at <mountpoint>.raw, read its on-disk owner
 //!   4. idmap-mount it at MOUNTPOINT, presenting that owner as the vault uid
-//!   5. unmount the staging mount
+//!   5. dismount the staging mount
 //!   6. drop privileges to the vault uid/gid; exec the (pinned) continuation
 //! Parent: waitpid, cryptsetup close, tidy mountpoint + lock.
 //!
@@ -62,7 +62,7 @@ const PUB_DIR: &str = "/run/veracage/pub";
 const EXIT_CRYPT_FAILED: i32 = 4;
 
 /// Exit code for "the decrypted filesystem needs a repair we will not do": the
-/// volume was opened, checked, and left unmounted. Distinct so the GUI can say
+/// volume was opened, checked, and left dismounted. Distinct so the GUI can say
 /// what happened instead of showing a bare exit code.
 const EXIT_FSCK_FAILED: i32 = 5;
 
@@ -150,7 +150,7 @@ struct Args {
     /// `session-<id>.lock`/`.pid`.
     session: Option<String>,
     /// `--close-volume <label>`: setns into the session and close JUST this volume
-    /// (unmount + `cryptsetup close --deferred` + drop it from the lock), leaving
+    /// (dismount + `cryptsetup close --deferred` + drop it from the lock), leaving
     /// the rest of the session running. Needs --session.
     close_volume: Option<String>,
     /// `--exchange <dir>`: a human-owned host directory to idmap-mount into the
@@ -249,6 +249,28 @@ fn resolve_caller() -> Result<(u32, u32), String> {
         (*pw).pw_gid
     };
     Ok((uid, gid))
+}
+
+/// Keep decrypted content out of core dumps, for this process and everything it
+/// execs: the compositor, the session leader, bwrap and every app. A core is
+/// written to a host-readable file under /var/lib/systemd/coredump and would
+/// carry volume plaintext (and the passphrase this helper reads for cryptsetup),
+/// which is exactly the accidental leak Veracage exists to prevent.
+///
+/// `RLIMIT_CORE` alone does NOT stop it. When `kernel.core_pattern` is a pipe
+/// (systemd-coredump) the kernel skips the limit check, and systemd's pattern
+/// passes a hardcoded infinity in the slot where `%c` would carry the real
+/// limit, so the dump is written whatever the limit says. `coredump_filter`
+/// selects which memory a dump may contain: cleared, the dump holds no memory at
+/// all. It survives `execve` and is inherited by children, so setting it once
+/// here covers the whole session. The limit is still set for hosts whose
+/// `core_pattern` is a plain file, where it does take effect.
+fn suppress_core_dumps() {
+    unsafe {
+        let rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        libc::setrlimit(libc::RLIMIT_CORE, &rl);
+    }
+    let _ = std::fs::write("/proc/self/coredump_filter", "0\n");
 }
 
 /// Drop privileges to the vault user: supplementary groups from the vault
@@ -679,7 +701,7 @@ fn session_lock_remove(sid: &str, dm_name: &str) {
 }
 
 /// Close JUST one volume of a running session: join the leader's NS,
-/// unmount `<WORKSPACE>/<label>` (lazy: a running app keeps its own copy), then
+/// dismount `<WORKSPACE>/<label>` (lazy: a running app keeps its own copy), then
 /// `cryptsetup close --deferred` the dm (so a volume still held by an app closes
 /// when released) and drop it from the session lock. The rest of the session runs
 /// on. No --source, no leader, no compositor.
@@ -956,7 +978,7 @@ fn fsck_checker(fstype: Option<&str>) -> Option<String> {
 }
 
 /// Check and repair the decrypted filesystem BEFORE mounting it. A volume that was
-/// not unmounted cleanly (a crash, a lost device, a pulled disk) carries a dirty
+/// not dismounted cleanly (a crash, a lost device, a pulled disk) carries a dirty
 /// filesystem, and mounting one dirty compounds the damage. Preen mode fixes what
 /// it safely can; anything left is reported so the caller refuses the mount, which
 /// leaves the user free to run a full check themselves instead of Veracage guessing
@@ -1460,6 +1482,7 @@ fn write_launch_request(sid: &str, spec: &str, vault_uid: u32, vault_gid: u32) {
 }
 
 fn main() {
+    suppress_core_dumps();
     let args = parse_args();
 
     if unsafe { libc::geteuid() } != 0 {
@@ -1495,7 +1518,7 @@ fn main() {
     }
 
     // `--close-volume <label>`: close ONE volume of a running session.
-    // No --source; joins the leader's NS and unmounts/closes just that volume.
+    // No --source; joins the leader's NS and dismounts/closes just that volume.
     if args.close_volume.is_some() {
         run_close_volume(&args, human_uid, vault_uid);
     }
@@ -1764,6 +1787,16 @@ mod tests {
         // treat the lock as not-ours and leave it to the ExecStopPost cleanup
         assert_eq!(lock_generation("user_uid=1000\nvolume=x\ty\tz\n"), None);
         assert_eq!(lock_generation(""), None);
+    }
+
+    #[test]
+    fn suppress_core_dumps_clears_the_coredump_filter() {
+        // The dump itself may still be created (the kernel ignores RLIMIT_CORE
+        // when core_pattern is a pipe): what this guarantees is that it carries
+        // no memory, here and in every process the helper execs.
+        suppress_core_dumps();
+        let filter = std::fs::read_to_string("/proc/self/coredump_filter").unwrap();
+        assert_eq!(u32::from_str_radix(filter.trim(), 16).unwrap(), 0);
     }
 
     #[test]

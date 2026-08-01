@@ -1,6 +1,6 @@
 [package]
 name = "veracage-compositor"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Veracage nested compositor - fixed-function, renders the sandbox apps, private clipboard channel to the leader."
 license = "MIT OR Apache-2.0"

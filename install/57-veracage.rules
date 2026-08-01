@@ -1,0 +1,22 @@
+# Veracage: keep the decrypted volume out of the host's disk index.
+#
+# `cryptsetup open` creates a GLOBAL /dev/mapper/veracage-<hex> device (dm devices
+# are not mount-namespaced), so udev sees it like any other disk and publishes it
+# twice over:
+#
+#   * KDE/GNOME (via UDisks/Solid) enumerate it and offer it in the drive menu;
+#     a click mounts the RAW device on the host with its on-disk ownership,
+#     bypassing the sandbox entirely.
+#   * 60-persistent-storage-dm.rules probes the decrypted filesystem and links it
+#     under /dev/disk/by-label/<label> and /dev/disk/by-uuid/<uuid>, readable by
+#     every local user. The dm name is a hash precisely so a mounted volume stays
+#     anonymous outside the sandbox, and those symlinks undo that.
+#
+# A volume must be reached only through the sandbox, so mark the device ignored
+# and set the disk-rules flag, which 60-persistent-storage-dm.rules honors by
+# skipping itself. /dev/mapper/veracage-<hex> comes from 55-dm.rules and is
+# unaffected: it is the only name the helper uses.
+#
+# Numbered to run after 55-dm.rules (which sets DM_NAME) and before
+# 60-persistent-storage-dm.rules.
+ACTION=="add|change", ENV{DM_NAME}=="veracage-*", ENV{UDISKS_IGNORE}="1", ENV{DM_UDEV_DISABLE_DISK_RULES_FLAG}="1"

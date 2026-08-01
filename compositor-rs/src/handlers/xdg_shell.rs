@@ -29,6 +29,20 @@ use crate::{
     grabs::{MoveSurfaceGrab, ResizeSurfaceGrab},
 };
 
+/// Pixels a new window is stepped by per window already on screen.
+const CASCADE_STEP: i32 = 28;
+
+/// Where one axis of a new window goes: its resting position `base`, stepped by
+/// `CASCADE_STEP` for each window already mapped, wrapped to stay inside `slack`
+/// (the room that axis leaves). Deterministic (no `rand`), and it repeats rather
+/// than marching off the edge, so the n-th window is always fully visible.
+fn cascade(base: i32, windows: i32, slack: i32) -> i32 {
+    if slack <= 0 {
+        return 0;
+    }
+    (base + CASCADE_STEP * windows) % (slack + 1)
+}
+
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
@@ -57,14 +71,15 @@ impl XdgShellHandler for State {
         let is_dialog = surface.parent().is_some();
         let loc = if let Some(geo) = output_geo {
             let work_h = (geo.size.h - top).max(1);
+            let mapped = self.space.elements().count() as i32;
             if is_dialog {
                 surface.with_pending_state(|state| {
                     state.bounds = Some((geo.size.w, work_h).into());
                 });
-                let n = self.space.elements().count() as i32;
-                let step = 32 * (n % 8);
-                let x = step.min((geo.size.w - 200).max(0));
-                let y = top + step.min((work_h - 200).max(0));
+                // A dialog keeps its own size, so cascade from the top-left and
+                // assume it is at least 200px each way.
+                let x = cascade(0, mapped, (geo.size.w - 200).max(0));
+                let y = top + cascade(0, mapped, (work_h - 200).max(0));
                 (x, y)
             } else {
                 let w = ((geo.size.w as f32 * 0.85) as i32).max(640);
@@ -74,8 +89,12 @@ impl XdgShellHandler for State {
                     state.size = Some((w, h).into());
                 });
                 surface.send_configure();
-                let x = (geo.size.w - w).max(0) / 2;
-                let y = top + (work_h - h).max(0) / 2;
+                // Centered when it is the only window, then cascading, so a
+                // second window of the same app does not cover the first.
+                let slack_x = (geo.size.w - w).max(0);
+                let slack_y = (work_h - h).max(0);
+                let x = cascade(slack_x / 2, mapped, slack_x);
+                let y = top + cascade(slack_y / 2, mapped, slack_y);
                 (x, y)
             }
         } else {
@@ -370,5 +389,35 @@ impl State {
         popup.with_pending_state(|state| {
             state.geometry = state.positioner.get_unconstrained_geometry(target);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CASCADE_STEP, cascade};
+
+    #[test]
+    fn first_window_sits_at_its_resting_position() {
+        // One window on screen and nothing to step away from: exactly centered.
+        assert_eq!(cascade(77, 0, 154), 77);
+        assert_eq!(cascade(0, 0, 300), 0);
+    }
+
+    #[test]
+    fn each_further_window_steps_and_stays_on_screen() {
+        let slack = 154;
+        let seen: Vec<i32> = (0..6).map(|n| cascade(77, n, slack)).collect();
+        assert_eq!(seen[1] - seen[0], CASCADE_STEP);
+        // Every position keeps the whole window inside the work area, and the
+        // cascade wraps back instead of walking off the edge.
+        assert!(seen.iter().all(|&x| (0..=slack).contains(&x)), "{seen:?}");
+        assert!(seen[3] < seen[2], "the cascade must wrap: {seen:?}");
+    }
+
+    #[test]
+    fn a_window_that_fills_its_axis_is_not_moved() {
+        // No slack (a maximized-size window): stepping it would push it off.
+        assert_eq!(cascade(0, 5, 0), 0);
+        assert_eq!(cascade(40, 5, -10), 0);
     }
 }

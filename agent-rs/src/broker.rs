@@ -49,7 +49,7 @@ const COMPOSITOR_FIRST_WAIT: Duration = Duration::from_secs(180);
 /// almost always a wrong passphrase: re-prompt instead of failing silently.
 const EXIT_CRYPT_FAILED: i32 = 4;
 /// The helper's "the filesystem needs repair" exit code (EXIT_FSCK_FAILED): the
-/// volume decrypted fine but was left unmounted, so say what to do about it.
+/// volume decrypted fine but was left dismounted, so say what to do about it.
 const EXIT_FSCK_FAILED: i32 = 5;
 
 pub fn run_broker() -> ! {
@@ -136,7 +136,7 @@ pub fn run_broker() -> ! {
         } else if b.comp_seen {
             // The user quit Veracage: transient dialogs (Settings, Configure
             // apps, Help...) must not outlive the Veracage window. CLI jobs
-            // (unmounts, opens) still finish on their own below.
+            // (dismounts, opens) still finish on their own below.
             for d in &mut b.dialogs {
                 let _ = d.kill();
             }
@@ -234,7 +234,7 @@ impl Broker {
     }
 
     fn dispatch(&mut self, verb: &str) {
-        // Unmount one volume carries a label: `close-volume:<label>`.
+        // Dismount one volume carries a label: `close-volume:<label>`.
         if let Some(label) = verb.strip_prefix("close-volume:") {
             self.close_volume(label);
             return;
@@ -243,6 +243,7 @@ impl Broker {
             "open" => self.open_flow(None),
             "configure" => self.spawn_dialog("configure"),
             "settings" => self.spawn_dialog("_settings"),
+            "appearance" => self.spawn_dialog("_appearance"),
             "shortcuts" => self.spawn_dialog("_shortcuts"),
             "about" => self.spawn_dialog("_about"),
             "help" => self.spawn_dialog("_help"),
@@ -305,12 +306,12 @@ impl Broker {
         }
     }
 
-    /// Unmount ONE volume of the running session (compositor's Unmount menu).
+    /// Dismount ONE volume of the running session (compositor's Dismount menu).
     fn close_volume(&mut self, label: &str) {
         let Some(bin) = veracage_bin() else { return };
         match Command::new(bin).arg("close-volume").arg(label).spawn() {
             Ok(child) => self.jobs.push(child),
-            Err(e) => eprintln!("veracage: could not unmount volume {label}: {e}"),
+            Err(e) => eprintln!("veracage: could not dismount volume {label}: {e}"),
         }
     }
 
@@ -463,6 +464,76 @@ pub fn publish_clipclear(cfg: &crate::config::Config) {
     }
 }
 
+/// Write the app-side font to `PUB_DIR/appfont` (`<family>\n<points>`): the
+/// session leader builds the sandbox's kdeglobals from this and `PUB_DIR/theme`,
+/// so apps use the configured font and theme instead of their own defaults.
+pub fn publish_appfont(cfg: &crate::config::Config) {
+    let dir = pub_dir();
+    if !dir.is_dir() {
+        return;
+    }
+    let (family, points) = crate::fonts::app_font(&cfg.ui_font, &cfg.ui_font_size);
+    let tmp = dir.join(format!("appfont.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, format!("{family}\n{points}\n")).is_ok() {
+        let _ = std::fs::rename(&tmp, dir.join("appfont"));
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Write the idle-dismount timeout to `PUB_DIR/autodismount` (minutes, 0 = off).
+/// The compositor is the only component that sees whether the human is using
+/// Veracage, so it runs the timer and asks for the dismount. Best-effort.
+pub fn publish_autodismount(cfg: &crate::config::Config) {
+    let dir = pub_dir();
+    if !dir.is_dir() {
+        return;
+    }
+    let tmp = dir.join(format!("autodismount.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, format!("{}\n", cfg.auto_dismount)).is_ok() {
+        let _ = std::fs::rename(&tmp, dir.join("autodismount"));
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Write the configured theme to `PUB_DIR/theme` ("light" | "dark") so the
+/// running compositor repaints its backdrop, menu bar and backdrop hint on its
+/// next scan instead of waiting for a restart. Best-effort.
+pub fn publish_theme(cfg: &crate::config::Config) {
+    let dir = pub_dir();
+    if !dir.is_dir() {
+        return;
+    }
+    let tmp = dir.join(format!("theme.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, format!("{}\n", cfg.theme)).is_ok() {
+        let _ = std::fs::rename(&tmp, dir.join("theme"));
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Write the keyboard configuration the compositor hands to libxkbcommon to
+/// `PUB_DIR/keyboard` (`<model>\n<layout>\n<variant>\n<options>`): the host
+/// desktop's own XKB settings, with the configured modifier mapping applied.
+/// Best-effort, and an absent file leaves the compositor on libxkbcommon's
+/// default layout.
+pub fn publish_keyboard(cfg: &crate::config::Config) {
+    let dir = pub_dir();
+    if !dir.is_dir() {
+        return;
+    }
+    let host = crate::keyboard::host_keyboard();
+    let options = crate::keyboard::options_for(&host.options, &cfg.modifier_keys);
+    let body = format!("{}\n{}\n{}\n{options}\n", host.model, host.layout, host.variant);
+    let tmp = dir.join(format!("keyboard.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, dir.join("keyboard"));
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 /// Write the resolved UI font file + base size to `PUB_DIR/font` (`<path>\n<size>`)
 /// so the running compositor re-loads its menu-bar font live on its next scan.
 /// Empty path line means "keep egui's default face". Best-effort.
@@ -498,6 +569,10 @@ pub fn publish_apps() {
     publish_font(&cfg);
     publish_shortcuts(&cfg);
     publish_clipclear(&cfg);
+    publish_keyboard(&cfg);
+    publish_theme(&cfg);
+    publish_appfont(&cfg);
+    publish_autodismount(&cfg);
     // The key becomes a file name and a cmd.req verb suffix, keep it plain.
     let sane = |k: &str| !k.is_empty() && k.len() <= 64 && !k.contains('/') && k != "..";
     // The name is written into the `<key>\t<name>` TSV: strip tab/newline/control

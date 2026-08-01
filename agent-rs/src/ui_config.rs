@@ -20,21 +20,15 @@ pub struct Outcome {
 pub fn run_configure() -> Result<Outcome, eframe::Error> {
     let outcome = Arc::new(Mutex::new(Outcome::default()));
     let app = ConfigApp::new(outcome.clone());
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Veracage Apps")
-            .with_app_id("veracage")
-            .with_inner_size([620.0, 640.0])
-            .with_min_inner_size([500.0, 420.0]),
-        ..Default::default()
-    };
-    eframe::run_native(
+    crate::theme::dialog(
         "veracage-configure",
-        options,
-        Box::new(move |cc| {
+        "Veracage Apps",
+        [620.0, 640.0],
+        [500.0, 420.0],
+        move |cc| {
             crate::theme::apply_config(&cc.egui_ctx, &config::load());
-            Ok(Box::new(app) as Box<dyn eframe::App>)
-        }),
+            Box::new(app)
+        },
     )?;
     let out = std::mem::take(&mut *outcome.lock().unwrap());
     Ok(out)

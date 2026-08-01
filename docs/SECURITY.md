@@ -28,8 +28,9 @@ from leaking out, not to confine the app.
 | Property | Mechanism |
 |---|---|
 | Volume denied to the human (and every non-root uid) | An idmapped mount presents the on-disk owner as a dedicated `veracage` system uid. Apps run as that uid. The human (even as the on-disk owner) is denied by ownership through the mount, and cannot *become* the veracage uid (needs privilege). **This is the core.** |
-| Mount invisible to the host | The privileged helper mounts inside a private mount namespace (`/` made rslave). It never appears in the host's `/proc/mounts`. |
-| Block device sealed | `/dev/mapper/veracage-*` is `root:disk 0660` + `UDISKS_IGNORE=1`: no unprivileged `open`, and no desktop "mount this drive" path. |
+| Mount hidden from the host | The privileged helper mounts inside a private mount namespace (`/` made rslave), so the mount is absent from the host's `/proc/mounts` and cannot be entered from it (`/proc/<leader>/root` needs ptrace access over the veracage uid, which the human does not have). It is not *invisible*: `/proc/<pid>/mountinfo` carries no ptrace check, so a same-uid process reading the leader's copy learns that a volume is mounted, with its label, mountpoint and dm device. That is metadata, never contents (see Limitations). |
+| Crashes carry no plaintext | The helper clears `coredump_filter` before it execs anything, so a core dump from the compositor, the session leader, `bwrap` or an app holds no memory at all. The setting survives `execve` and is inherited by children, so one call covers the whole session. The agent does the same for the passphrase it holds. `RLIMIT_CORE` is not the knob: the kernel ignores it when `kernel.core_pattern` is a pipe, which is the systemd default. |
+| Block device sealed | `/dev/mapper/veracage-*` is `root:disk 0660` + `UDISKS_IGNORE=1`: no unprivileged `open`, and no desktop "mount this drive" path. `57-veracage.rules` also sets `DM_UDEV_DISABLE_DISK_RULES_FLAG`, so udev never probes the decrypted filesystem into `/dev/disk/by-label/<label>` and `/dev/disk/by-uuid/<uuid>`, which would publish the volume's identity to every local user. |
 | Decrypted data has no path out to network / host FS | `bwrap` unshares pid/uts/ipc/cgroup/**net**, `--die-with-parent`, `--clearenv` + env allowlist, `HOME=/vaults`, host `$XDG_RUNTIME_DIR` hidden, with only the compositor's Wayland socket bound in. This keeps the volume data from leaking out. It protects the data, it is not a cage on the app (a malicious app is outside the threat model). |
 | Minimal host surface | `/usr` read-only, **curated** `/etc` (linker, fontconfig, tz, NSS, machine-id, TLS) instead of all of `/etc`, no host home, no D-Bus, no portals. The GPU exception: `/dev/dri` plus `/sys/dev/char` and `/sys/devices` read-only, which Mesa needs to pick the hardware driver. That exposes host *device metadata* (NIC addresses, DMI ids, the device tree) to the app, which the one-directional model accepts: it is not volume data, and a malicious app is outside the threat model. |
 | Clipboard isolation | The sandbox runs against the project's own nested `veracage-compositor`, which owns the selection. **No `data-control` global** is exposed to apps, so a clipboard manager inside the sandbox can't scrape it. Host<->sandbox transfer is one-shot, user-triggered (Ctrl+Alt+V/C or the toolbar), text-only. After a Copy out, the host clipboard is auto-cleared after a timeout (default 30 seconds) and again on exit, so a copied secret does not linger on the host. |
@@ -40,7 +41,7 @@ from leaking out, not to confine the app.
 
 ## Privilege model
 
-No setuid, no long-lived root daemon. The only root steps (mount/unmount and
+No setuid, no long-lived root daemon. The only root steps (mount/dismount and
 the compositor spawn) run in a small polkit-authorised Rust helper
 (`helper-rs/`) that exits in seconds.
 
@@ -73,6 +74,30 @@ contract.
   out; so may the decrypted volume's page cache. Veracage removes the *file*
   channels (`~/.cache`, recent-files, thumbnails) but cannot stop the kernel
   swapping. Use encrypted swap or zram if that matters to you.
+- **Which volume is open is not a secret, only what is in it.** A same-uid
+  process can learn that from several host surfaces Veracage does not own:
+  `/proc/<leader-pid>/mountinfo` (label, mountpoint, dm device),
+  `/sys/block/loopN/loop/backing_file` and the helper's `/proc/<pid>/cmdline`
+  (the volume's path), polkit's own journal line for the mount, and the recent
+  files the volume picker leaves behind (`known-problems.md`). Veracage avoids
+  adding to that where it can: the dm device is named by hash, the transient
+  unit and its description carry the same hash instead of the filename, and
+  `57-veracage.rules` keeps the decrypted filesystem's label and UUID out of
+  `/dev/disk`. The kernel and polkit surfaces are not ours to close.
+- **A file opened from the sandboxed file manager has its path in `/proc` while
+  the app runs.** Double-clicking a file makes the file manager spawn the
+  handler app inside the sandbox with the path in its argv, and
+  `/proc/<pid>/cmdline` is world-readable no matter which uid owns the process,
+  which `bwrap --unshare-pid` does not change (the host still sees the process
+  in its own `/proc`). So the name of the file being edited is readable for as
+  long as the app is open. It leaves no record: it dies with the process, and
+  nothing on the host stores it. Apps started from the Apps menu carry no file
+  path at all. Inherent to handing a path to a program that takes a path.
+- **`debug = true` sends app output to the journal.** The session leader passes
+  each app's stdio through, and toolkits print file paths in their warnings, so
+  the debug setting turns app-side paths into a persistent host record. It is
+  off by default and is a deliberate trade for diagnosing launches
+  (`docs/debugging.md`).
 - **No network** from the sandbox, even opt-in (v1 non-goal).
 - **Clipboard is text-only** in v1.
 - **Apps and the compositor render on the host GPU** (`/dev/dri` is passed

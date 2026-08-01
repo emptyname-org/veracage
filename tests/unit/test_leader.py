@@ -461,3 +461,46 @@ def test_accept_app_launch_ignores_out_of_range(tmp_path, monkeypatch):
     finally:
         srv.close()
         leader._unpublish_apps(st)
+
+
+def test_kdeglobals_carries_the_font_and_the_desktop_scheme(tmp_path, monkeypatch):
+    """The seeded kdeglobals must set the Veracage font in Qt's own unit and
+    carry the colours from the desktop's scheme file, with the scheme's own
+    [General] (its translated names) dropped so it can't shadow the fonts."""
+    scheme = tmp_path / "BreezeDark.colors"
+    scheme.write_text(
+        "[Colors:Window]\nBackgroundNormal=42,46,50\n\n"
+        "[General]\nColorScheme=BreezeDark\nName=Breeze Dark\n\n"
+        "[KDE]\ncontrast=4\n"
+    )
+    monkeypatch.setitem(leader.COLOR_SCHEMES, "dark", scheme)
+    body = leader._kdeglobals_body("dark", "Noto Sans", 12.0)
+
+    assert "font=Noto Sans,12,-1,5,50,0,0,0,0,0" in body
+    assert "smallestReadableFont=Noto Sans,10," in body   # 0.85 of the base
+    assert "BackgroundNormal=42,46,50" in body
+    assert "Theme=breeze-dark" in body
+    assert "widgetStyle=Breeze" in body
+    # The scheme's [General] must not come through: one [General], ours.
+    assert body.count("[General]") == 1
+    assert "Name=Breeze Dark" not in body
+
+
+def test_kdeglobals_without_a_scheme_still_sets_the_font(tmp_path, monkeypatch):
+    # A host with no KDE colour schemes installed: fonts apply, colours do not.
+    monkeypatch.setitem(leader.COLOR_SCHEMES, "light", tmp_path / "absent.colors")
+    body = leader._kdeglobals_body("light", "DejaVu Sans", 11.0)
+    assert "font=DejaVu Sans,11," in body
+    assert "[Colors:" not in body
+
+
+def test_kdeglobals_seed_needs_both_published_inputs(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(leader, "THEME_PUB", tmp_path / "theme")
+    monkeypatch.setattr(leader, "APPFONT_PUB", tmp_path / "appfont")
+    assert leader._write_kdeglobals_file() is None      # nothing published yet
+    (tmp_path / "theme").write_text("dark\n")
+    (tmp_path / "appfont").write_text("Noto Sans\n12\n")
+    p = leader._write_kdeglobals_file()
+    assert p == tmp_path / "kdeglobals"
+    assert "font=Noto Sans,12," in p.read_text()
