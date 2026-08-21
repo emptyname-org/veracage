@@ -13,6 +13,7 @@
 //!   4. idmap-mount it at MOUNTPOINT, presenting that owner as the vault uid
 //!   5. dismount the staging mount
 //!   6. drop privileges to the vault uid/gid; exec the (pinned) continuation
+//!
 //! Parent: waitpid, cryptsetup close, tidy mountpoint + lock.
 //!
 //! SECURITY: reachable by any active local user via pkexec. It does NOT trust
@@ -1279,7 +1280,6 @@ fn validated_exchange(path: &str, human_uid: u32) -> Option<std::fs::File> {
 /// bootstrap child mounts it after unshare; the add child inherits it via setns).
 /// The label is read from the decrypted device, so the mountpoint is only known
 /// here. Returns (mountpoint, label). Fails (closing the dm) on any mount error.
-#[allow(clippy::too_many_arguments)]
 /// Filesystems checked before mounting, and their checker is `fsck.<type>`. All of
 /// them take `-p`: fix what is unambiguous, never ask a question, since there is no
 /// terminal here. NTFS is deliberately absent, `fsck.ntfs` is not a repair tool.
@@ -1346,6 +1346,7 @@ fn fsck_volume(dm_path: &str, fstype: Option<&str>) -> Result<(), String> {
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mount_volume_at_workspace(
     source: &Path,
     backend: Option<Backend>,
@@ -1704,6 +1705,7 @@ fn run_session_bootstrap(
 /// keeps holding the mount, and teardown closes this dm from the session lock. No
 /// leader, no compositor bring-up, no ExecStopPost teardown (the CLI's
 /// `cleanup --session` no-ops while the leader is alive).
+#[allow(clippy::too_many_arguments)]
 fn run_session_add(
     args: &Args,
     human_uid: u32,
