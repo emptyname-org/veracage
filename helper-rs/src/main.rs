@@ -492,8 +492,13 @@ fn sanitize_label(label: &str, source: &Path) -> String {
 /// with a `-2`, `-3`… suffix if that directory already exists (a second volume
 /// with the same label). Called inside the session NS, after the tmpfs is up.
 fn workspace_path(label: &str, source: &Path) -> PathBuf {
+    workspace_path_in(Path::new(WORKSPACE), label, source)
+}
+
+/// The same, under an explicit root, so the suffix logic can be tested without
+/// the session's tmpfs.
+fn workspace_path_in(root: &Path, label: &str, source: &Path) -> PathBuf {
     let base = sanitize_label(label, source);
-    let root = Path::new(WORKSPACE);
     let first = root.join(&base);
     if !first.exists() {
         return first;
@@ -914,25 +919,32 @@ const HOLDERS_POLL_SLICE_MS: i32 = 1000;
 /// systemd kills at its stop timeout, and the root suspend hook, which the
 /// sleep transition waits on.
 fn wait_for_go(leader_pid: i32) -> bool {
-    let deadline = std::time::Instant::now() + HOLDERS_WAIT;
+    wait_for_go_on(libc::STDIN_FILENO, leader_pid, HOLDERS_WAIT)
+}
+
+/// The wait itself, against an explicit descriptor and timeout so the protocol
+/// can be exercised over a pipe in a test. `leader_pid` <= 0 skips the liveness
+/// check (there is no session to watch in a test).
+fn wait_for_go_on(fd: libc::c_int, leader_pid: i32, budget: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
     let mut line = Vec::new();
     loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
             return false;
         }
-        if !Path::new(&format!("/proc/{leader_pid}")).exists() {
+        if leader_pid > 0 && !Path::new(&format!("/proc/{leader_pid}")).exists() {
             return false; // the session went away under us
         }
         let slice = (left.as_millis() as i32).min(HOLDERS_POLL_SLICE_MS);
-        let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
         match unsafe { libc::poll(&mut pfd, 1, slice) } {
             0 => continue,      // slice elapsed: re-check the leader, then wait on
             n if n < 0 => return false, // poll failed: treat as gone
             _ => {}
         }
         let mut buf = [0u8; 32];
-        let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n <= 0 {
             return false; // EOF: cancelled
         }
@@ -2145,6 +2157,85 @@ mod tests {
         assert_eq!(lock_dms_for_vhash(body, "deadbeefdeadbeef"),
                    vec!["veracage-bbbbbbbbbbbb".to_string()]);
         assert!(lock_dms_for_vhash(body, "0000000000000000").is_empty());
+    }
+
+    /// A pipe with `bytes` already in it, plus its write end (dropped by the
+    /// caller to signal EOF).
+    fn pipe_with(bytes: &[u8]) -> (libc::c_int, libc::c_int) {
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        if !bytes.is_empty() {
+            let n = unsafe {
+                libc::write(fds[1], bytes.as_ptr() as *const libc::c_void, bytes.len())
+            };
+            assert_eq!(n as usize, bytes.len());
+        }
+        (fds[0], fds[1])
+    }
+
+    #[test]
+    fn the_go_protocol_accepts_only_go_and_treats_everything_else_as_a_refusal() {
+        let short = std::time::Duration::from_millis(200);
+
+        // The one answer that continues a close.
+        let (r, w) = pipe_with(b"go\n");
+        assert!(wait_for_go_on(r, 0, short));
+        unsafe { libc::close(r); libc::close(w) };
+
+        // A cancel is EOF: the caller drops our stdin.
+        let (r, w) = pipe_with(b"");
+        unsafe { libc::close(w) };
+        assert!(!wait_for_go_on(r, 0, short), "EOF must not continue the close");
+        unsafe { libc::close(r) };
+
+        // Anything else on the line is not our protocol.
+        for junk in [&b"no\n"[..], b"GO\n", b" go\n", b"gogo\n"] {
+            let (r, w) = pipe_with(junk);
+            assert!(!wait_for_go_on(r, 0, short), "{:?} must not continue", junk);
+            unsafe { libc::close(r); libc::close(w) };
+        }
+
+        // A flood with no newline is refused rather than buffered without bound:
+        // this parks a ROOT process inside the session namespace, so it must not
+        // be steerable by a caller that just keeps writing.
+        let (r, w) = pipe_with(&[b'x'; 64]);
+        assert!(!wait_for_go_on(r, 0, short));
+        unsafe { libc::close(r); libc::close(w) };
+
+        // Nothing at all: the budget expires and the volume is left alone.
+        let (r, w) = pipe_with(b"");
+        let t0 = std::time::Instant::now();
+        assert!(!wait_for_go_on(r, 0, short));
+        assert!(t0.elapsed() >= short, "it must wait out the budget, not spin");
+        unsafe { libc::close(r); libc::close(w) };
+    }
+
+    #[test]
+    fn a_second_volume_with_the_same_label_gets_its_own_directory() {
+        // Two volumes can carry the same filesystem label. They must not land on
+        // the same mountpoint: the second would mount over the first, and the
+        // close menu would show one entry for two open volumes.
+        let root = std::env::temp_dir().join(format!("vc-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let src = Path::new("/tmp/work.vc");
+
+        let first = workspace_path_in(&root, "work", src);
+        assert_eq!(first, root.join("work"));
+        std::fs::create_dir(&first).unwrap();
+
+        let second = workspace_path_in(&root, "work", src);
+        assert_eq!(second, root.join("work-2"));
+        std::fs::create_dir(&second).unwrap();
+
+        assert_eq!(workspace_path_in(&root, "work", src), root.join("work-3"));
+
+        // The label is sanitized first, so a hostile one cannot escape the root.
+        let evil = workspace_path_in(&root, "../../etc", src);
+        assert_eq!(evil.parent(), Some(root.as_path()));
+        assert!(!evil.to_string_lossy().contains(".."));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
