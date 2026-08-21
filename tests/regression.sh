@@ -6,8 +6,8 @@
 #
 # Each component reports PASS / FAIL / SKIP. SKIP = tooling absent on this host
 # (not a failure). The script exits non-zero iff any component FAILs, so it is
-# safe to gate commits/CI on it. Designed to run both locally and on the dev VPS
-# (Debian 13, headless) - it auto-detects what it can run.
+# safe to gate commits/CI on it. Designed to run both locally and on a headless
+# box - it auto-detects what it can run.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -45,11 +45,16 @@ c_helper() { # privilege helper: pinned to DISTRO rustc (1.63 on Debian 12).
 }
 c_compositor_build() {
   have make || { echo "no make"; return 2; }
-  make build-compositor && make test-compositor
+  # `|| return 1`: GNU make exits 2 on a build/test FAILURE, and 2 is this
+  # script's code for "tooling absent", so a real failure used to be reported as
+  # a SKIP.
+  make build-compositor || return 1
+  make test-compositor || return 1
 }
 c_agent_build() {
   have make || { echo "no make"; return 2; }
-  make build-agent && make test-agent
+  make build-agent || return 1
+  make test-agent || return 1
 }
 
 # -------------------------------------------------------------- python ------
@@ -64,6 +69,19 @@ c_py_tests() {
   # vault/Wayland are marked in tests/integration/MANUAL.md and skipped here.
   # PYTHONPATH=src so `from veracage import ...` resolves without an editable install.
   PYTHONPATH="$ROOT/src" "$py" -m pytest -q tests/unit
+}
+
+c_helper_contract() { # the privilege-boundary tests, against the BUILT helper
+  local py="$PY"
+  [ -x "$ROOT/.venv/bin/python" ] && py="$ROOT/.venv/bin/python"
+  have "$py" || { echo "no python"; return 2; }
+  "$py" -c 'import pytest' 2>/dev/null || { echo "pytest not importable"; return 2; }
+  [ -f "$ROOT/helper-rs/target/release/veracage-helper" ] || {
+    echo "helper not built (release)"; return 2; }
+  # SECURITY.md names these as the guard on the helper's argument contract, and
+  # nothing ran them: pytest.ini's testpaths stops at tests/unit. They need no
+  # root, no vault and no Wayland (every case fails before the helper forks).
+  PYTHONPATH="$ROOT/src" "$py" -m pytest -q tests/integration/test_helper_security.py
 }
 c_py_lint() {
   # Prefer the project venv; else system ruff/mypy on PATH.
@@ -86,6 +104,7 @@ c_headless_smoke() {
   local COMP="$ROOT/compositor-rs/target/release/veracage-compositor"
   [ -x "$COMP" ] || { echo "compositor not built (run c_compositor_build first)"; return 2; }
   have weston-simple-shm || { echo "no weston demo clients"; return 2; }
+  have weston-terminal || { echo "no weston-terminal (the map check needs it)"; return 2; }
 
   # Run the whole nested exercise in a SUBSHELL so its teardown trap and temp
   # state are fully contained and can never leak to the outer runner.
@@ -159,13 +178,14 @@ component "rust: helper build+test"  c_helper
 component "rust: compositor build"   c_compositor_build
 component "rust: agent build"        c_agent_build
 component "python: unit tests"       c_py_tests
+component "helper argument contract" c_helper_contract
 component "python: lint (ruff+mypy)" c_py_lint
 component "headless compositor smoke" c_headless_smoke
 
 # ------------------------------------------------------------- summary ------
 # A SKIP of a CORE component (a build or the unit tests) means the environment
 # can't actually run the gate - treat it as a failure, not a silent pass.
-CORE_RE='helper build|compositor build|agent build|unit tests'
+CORE_RE='helper build|compositor build|agent build|unit tests|lint|argument contract'
 printf '\n'; bold "================ SUMMARY ================"
 fails=0
 for name in "${ORDER[@]}"; do

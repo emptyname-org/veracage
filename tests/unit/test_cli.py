@@ -134,9 +134,14 @@ def test_open_passes_vault_but_not_identity(monkeypatch, configured, fake_vault)
     pairs = list(zip(argv, argv[1:]))
     assert ("--source", str(fake_vault)) in pairs
     assert ("--session", str(os.getuid())) in pairs   # the workspace session id
-    assert ("--user", str(os.getuid())) not in pairs
-    assert ("--group", str(os.getgid())) not in pairs
-    assert "--continuation" not in argv
+    # Check the HELPER's own argv (everything from `pkexec` on), and check the
+    # FLAG rather than one value of it: asserting only that it is not
+    # `--user <our own uid>` left `--user 0`, the escalation this test is named
+    # for, passing. (`systemd-run --user` earlier in the line is unrelated.)
+    helper_argv = argv[argv.index("pkexec"):]
+    assert "--user" not in helper_argv
+    assert "--group" not in helper_argv
+    assert "--continuation" not in helper_argv
 
 
 def test_open_forwards_wayland_display(monkeypatch, configured, fake_vault):
@@ -253,7 +258,7 @@ def test_open_refuses_when_bootstrap_volume_still_mounted(
     rc, argv = _run_open(monkeypatch, fake_vault, "kate")
     assert rc == 2
     assert argv is None                      # helper never invoked
-    assert "already mounted" in capsys.readouterr().err
+    assert "already open" in capsys.readouterr().err
 
 
 def test_open_proceeds_after_per_volume_close_of_bootstrap(
@@ -360,3 +365,59 @@ def test_cmd_compositor_execs_binary(monkeypatch, tmp_path):
     cli.cmd_compositor(argparse.Namespace(socket="wl-vc"))
     assert captured["path"] == str(exe)
     assert captured["argv"] == [str(exe), "--socket", "wl-vc"]
+
+
+def test_the_stop_post_helper_path_is_quoted(monkeypatch, configured, fake_vault):
+    """systemd re-tokenizes an ExecStopPost value on whitespace. An unquoted
+    helper path under a directory with a space would silently register a
+    different command, and the crash teardown that closes the dm devices would
+    never run."""
+    _, argv = _run_open(monkeypatch, fake_vault, "kate")
+    stop_post = next(a for a in argv if a.startswith("ExecStopPost="))
+    assert '"' in stop_post, stop_post
+    quoted = stop_post.split("pkexec ", 1)[1]
+    assert quoted.startswith('"') and '" --session ' in quoted
+
+
+def test_the_volume_path_is_canonicalized_before_the_helper_sees_it(
+        monkeypatch, configured, tmp_path):
+    """The helper is handed a path it opens as root. Resolving it here keeps a
+    relative path or a symlinked directory from being what reaches it."""
+    real = tmp_path / "real.vc"
+    real.write_bytes(b"x")
+    link = tmp_path / "link.vc"
+    link.symlink_to(real)
+    _, argv = _run_open(monkeypatch, link, None)
+    pairs = list(zip(argv, argv[1:]))
+    assert ("--source", str(real)) in pairs
+    assert ("--source", str(link)) not in pairs
+
+
+def test_a_probe_that_cannot_answer_refuses_rather_than_risking_a_double_mount(
+        monkeypatch, configured, fake_vault, capsys):
+    """A session MAY be alive but too busy to answer. Unlinking its socket and
+    opening anyway would cryptsetup-open the same container twice and rw-mount
+    one filesystem twice: corruption."""
+    def busy(*a, **k):
+        raise TimeoutError("no reply")
+    monkeypatch.setattr(cli.leader, "send_request", busy)
+    with mock.patch("veracage.cli.subprocess.run") as run:
+        run.return_value.returncode = 0
+        rc = cli.cmd_open(argparse.Namespace(volume=str(fake_vault), app=None,
+                                             passphrase_stdin=False))
+    assert rc == 2
+    run.assert_not_called()   # the helper must not be invoked
+    assert "double mount" in capsys.readouterr().err
+
+
+def test_no_unlisted_environment_variable_reaches_the_helper(
+        monkeypatch, configured, fake_vault):
+    """pkexec strips the environment and the helper re-applies an allowlist; the
+    CLI must not widen it. LD_PRELOAD is the one that turns a root helper into
+    arbitrary root code."""
+    monkeypatch.setenv("LD_PRELOAD", "/tmp/evil.so")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/evil")
+    _, argv = _run_open(monkeypatch, fake_vault, "kate")
+    joined = " ".join(argv)
+    assert "LD_PRELOAD" not in joined
+    assert "LD_LIBRARY_PATH" not in joined

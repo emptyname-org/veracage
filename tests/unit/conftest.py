@@ -12,10 +12,27 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _isolate_pub_dir(monkeypatch, tmp_path: Path) -> None:
-    """Redirect the compositor publish dir (config.publish_apps) to a tmp path so
-    tests can never overwrite a running session's real /run/veracage/pub."""
-    monkeypatch.setenv("VERACAGE_PUB_DIR", str(tmp_path / "pub-isolated"))
+def _isolate_from_the_real_session(monkeypatch, tmp_path_factory) -> None:
+    """Redirect everything a unit test could write into the developer's live
+    session: the compositor publish dir (`config.publish_apps`), the runtime dir
+    (`leader` seeds kdeglobals and user-places into `$XDG_RUNTIME_DIR`, and the
+    leader/agent socket paths are derived from it) and HOME (`cfg.exchange_path()`
+    creates `~/Veracage/Exchange`, and config reads `~/.config`).
+
+    Autouse, because the leak was silent: running the suite rewrote the real
+    `$XDG_RUNTIME_DIR/kdeglobals` and created the real shared directory, and a
+    few tests asserted against ambient state instead of their own fixtures."""
+    # A directory of its OWN, not the test's `tmp_path`: several tests scan
+    # `tmp_path` as a workspace root and would see these as volumes.
+    sandbox = tmp_path_factory.mktemp("isolated")
+    monkeypatch.setenv("VERACAGE_PUB_DIR", str(sandbox / "pub"))
+    home = sandbox / "home"
+    (home / ".config").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    runtime = sandbox / "runtime"
+    runtime.mkdir(exist_ok=True)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
 
 
 @pytest.fixture

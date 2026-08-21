@@ -213,11 +213,69 @@ def test_cursor_theme_absent_when_the_session_has_none(monkeypatch):
     assert "XCURSOR_SIZE" not in argv
 
 
+# Every bwrap flag that can bring a host path INTO the sandbox. A test that
+# checks only `--ro-bind` misses the `-try` variants, which is what the real
+# argv uses everywhere.
+_BIND_FLAGS = ("--bind", "--bind-try", "--ro-bind", "--ro-bind-try",
+               "--dev-bind", "--dev-bind-try")
+
+
+def _binds(argv):
+    """[(flag, source, dest)] for every bind in argv."""
+    out = []
+    for i, a in enumerate(argv):
+        if a in _BIND_FLAGS and i + 2 < len(argv):
+            out.append((a, argv[i + 1], argv[i + 2]))
+    return out
+
+
 def test_etc_is_not_wholesale_bound(argv):
-    """Security: the whole host /etc must not be exposed, only curated paths."""
-    pairs = list(zip(argv, argv[1:]))
-    assert ("--ro-bind", "/etc") not in pairs
-    assert ("--bind", "/etc") not in pairs
+    """Security: the whole host /etc must not be exposed, only curated paths.
+    Checks EVERY bind flavour: the real argv binds with the `-try` variants, so
+    a test that named only `--ro-bind` would not have noticed `--ro-bind-try
+    /etc /etc` being added."""
+    assert not [b for b in _binds(argv) if b[1] == "/etc" or b[2] == "/etc"]
+
+
+def test_no_host_filesystem_beyond_the_curated_set_is_bound_in(argv):
+    """The sandbox sees /usr, a curated /etc, the font cache, the GPU nodes, the
+    workspace and the Wayland socket. Anything else bound in from the host is a
+    hole in "no host filesystem", so this asserts the WHOLE set rather than
+    spot-checking absences."""
+    allowed_prefixes = (
+        "/usr", "/etc/", "/var/cache/fontconfig", "/dev/dri",
+        "/sys/dev/char", "/sys/devices",
+        "/run/veracage/",          # the workspace itself
+        "/tmp/veracage-test.sock",  # the nested Wayland socket in this fixture
+    )
+    for flag, src, dest in _binds(argv):
+        assert src.startswith(allowed_prefixes), \
+            f"{flag} {src} -> {dest} brings an uncurated host path in"
+
+
+def test_usr_is_read_only(argv):
+    """/usr is the app's own code and must not be writable from the sandbox."""
+    usr = [b for b in _binds(argv) if b[1] == "/usr"]
+    assert usr, "/usr must be bound"
+    assert all(flag.startswith("--ro-bind") for flag, _, _ in usr), usr
+
+
+def test_environment_is_cleared_before_anything_is_set(argv):
+    """--clearenv is what stops the app inheriting the leader's environment
+    (host DISPLAY, session tokens, auth socket paths). Without it every --setenv
+    below it is additive to whatever the leader happened to hold."""
+    assert "--clearenv" in argv
+    # And it must come before the --setenv flags it exists to bound.
+    assert argv.index("--clearenv") < argv.index("--setenv")
+
+
+def test_a_stray_host_variable_does_not_reach_the_sandbox(monkeypatch):
+    """The env is an allowlist, not inheritance: a variable the leader happens to
+    carry (a token, an auth socket) must not appear in the sandbox argv."""
+    monkeypatch.setenv("VERACAGE_TEST_SECRET", "swordfish")
+    argv = sandbox.bwrap_command("/run/veracage/abc", _KATE, Path("/tmp/s.sock"))
+    assert "VERACAGE_TEST_SECRET" not in argv
+    assert "swordfish" not in argv
 
 
 def test_essential_etc_paths_bound(argv):

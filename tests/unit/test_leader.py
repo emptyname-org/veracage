@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -214,7 +215,7 @@ def test_reap_reports_immediate_exit(tmp_path, monkeypatch):
     assert st.children == {}
     nonce, _, text = (tmp_path / "notice").read_text().partition("\t")
     assert nonce.isdigit()
-    assert "VeraCrypt failed to launch (exited immediately)" in text
+    assert text.strip() == "VeraCrypt failed to launch."
 
 
 def test_reap_does_not_report_normal_quit(tmp_path, monkeypatch):
@@ -410,6 +411,64 @@ def test_accept_app_launch_execs_by_index(tmp_path, monkeypatch):
     assert launched["spec"]["exec"] == "okular"
 
 
+@pytest.mark.parametrize("line, closing, launched_exec", [
+    (b"close\n", True, None),      # the compositor closing the Veracage window
+    (b"0\n", False, "kate"),       # an ordinary toolbar launch still works
+    (b"nonsense\n", False, None),  # anything else is ignored, session unharmed
+])
+def test_accept_app_launch_close_verb(tmp_path, monkeypatch, line, closing, launched_exec):
+    """`close` on the toolbar socket ends the session: that is how the window
+    close dismounts without the password the per-volume helper path needs."""
+    monkeypatch.setattr(leader, "COMPOSITOR_RUNTIME", tmp_path)
+    launched: dict = {}
+    monkeypatch.setattr(leader, "_launch_app",
+                        lambda st, spec: launched.update(spec=spec) or {"ok": True})
+    st = leader._LeaderState(mountpoint="/run/veracage/abc123",
+                             app_specs=[{"name": "Kate", "exec": "kate", "args": []}])
+    srv = leader._publish_apps(st)
+    assert srv is not None
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.connect(str(leader._app_socket_path(st)))
+        c.sendall(line)
+        c.close()
+        leader._accept_app_launch(srv, st)
+    finally:
+        srv.close()
+        leader._unpublish_apps(st)
+    assert st.closing is closing
+    assert launched.get("spec", {}).get("exec") == launched_exec
+
+
+def test_close_apps_stops_the_apps_keeps_the_session_and_says_so(tmp_path, monkeypatch):
+    """`close-apps` is the dismount path, not the quit path: a running app holds
+    the volume's dm device, so the apps have to go before it can be closed - but
+    the session stays up. The signal it writes is what lets the human side retry
+    the dismount at the right moment instead of polling pkexec."""
+    monkeypatch.setattr(leader, "COMPOSITOR_RUNTIME", tmp_path)
+    terminated: list = []
+    monkeypatch.setattr(leader, "_terminate_children", lambda st: terminated.append(st))
+    st = leader._LeaderState(mountpoint="/run/veracage/abc123",
+                             app_specs=[{"name": "Kate", "exec": "kate", "args": []}])
+    st.children[4242] = {"name": "Kate"}
+    srv = leader._publish_apps(st)
+    assert srv is not None
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.connect(str(leader._app_socket_path(st)))
+        c.sendall(b"close-apps\n")
+        c.close()
+        leader._accept_app_launch(srv, st)
+    finally:
+        srv.close()
+        leader._unpublish_apps(st)
+    assert terminated == [st]
+    assert st.children == {}
+    assert st.closing is False          # the session keeps running
+    done = tmp_path / "closeapps.done"
+    assert done.exists() and done.read_text().strip().isdigit()
+
+
 def test_write_places_file_one_entry_per_volume(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     p = leader._write_places_file(["Work", "Photos"])
@@ -419,6 +478,15 @@ def test_write_places_file_one_entry_per_volume(tmp_path, monkeypatch):
     assert 'href="file:///vaults/Work"' in body
     assert 'href="file:///vaults/Photos"' in body
     assert "<title>Work</title>" in body and "<title>Photos</title>" in body
+
+
+def test_write_places_file_has_no_volume_entry_when_none_is_mounted(tmp_path, monkeypatch):
+    """The front-door scratchpad has no volume, so Places must not offer one: a
+    placeholder entry pointed the file manager at a /vaults path that never exists."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    body = leader._write_places_file([], with_exchange=True).read_text()
+    assert "/vaults/" not in body
+    assert 'href="file:///exchange"' in body   # the shared directory still shows
 
 
 def test_write_places_file_escapes_hostile_label(tmp_path, monkeypatch):
@@ -474,7 +542,7 @@ def test_kdeglobals_carries_the_font_and_the_desktop_scheme(tmp_path, monkeypatc
         "[KDE]\ncontrast=4\n"
     )
     monkeypatch.setitem(leader.COLOR_SCHEMES, "dark", scheme)
-    body = leader._kdeglobals_body("dark", "Noto Sans", 12.0)
+    body = leader._kdeglobals_body("dark", "Noto Sans", 12.0, single_click=False)
 
     assert "font=Noto Sans,12,-1,5,50,0,0,0,0,0" in body
     assert "smallestReadableFont=Noto Sans,10," in body   # 0.85 of the base
@@ -489,9 +557,27 @@ def test_kdeglobals_carries_the_font_and_the_desktop_scheme(tmp_path, monkeypatc
 def test_kdeglobals_without_a_scheme_still_sets_the_font(tmp_path, monkeypatch):
     # A host with no KDE colour schemes installed: fonts apply, colours do not.
     monkeypatch.setitem(leader.COLOR_SCHEMES, "light", tmp_path / "absent.colors")
-    body = leader._kdeglobals_body("light", "DejaVu Sans", 11.0)
+    body = leader._kdeglobals_body("light", "DejaVu Sans", 11.0, single_click=False)
     assert "font=DejaVu Sans,11," in body
     assert "[Colors:" not in body
+
+
+def test_kdeglobals_seeds_the_hosts_click_behaviour_exactly_once(tmp_path, monkeypatch):
+    """Dolphin inside the sandbox must follow the host: without a seeded
+    SingleClick it falls back to KDE's own default (single click) on a
+    double-click host. The [KDE] group is written once either way."""
+    scheme = tmp_path / "BreezeLight.colors"
+    scheme.write_text("[Colors:Window]\nBackgroundNormal=252,252,252\n\n[KDE]\ncontrast=4\n")
+    monkeypatch.setitem(leader.COLOR_SCHEMES, "light", scheme)
+    for single_click, expected in ((False, "SingleClick=false"), (True, "SingleClick=true")):
+        body = leader._kdeglobals_body("light", "Noto Sans", 12.0, single_click)
+        assert expected in body
+        assert body.count("[KDE]") == 1
+        assert "contrast=4" in body        # the scheme's own [KDE] key survives
+    # No scheme file at all: the group is still written, so the setting applies.
+    monkeypatch.setitem(leader.COLOR_SCHEMES, "light", tmp_path / "absent.colors")
+    body = leader._kdeglobals_body("light", "Noto Sans", 12.0, True)
+    assert body.count("[KDE]") == 1 and "SingleClick=true" in body
 
 
 def test_kdeglobals_seed_needs_both_published_inputs(tmp_path, monkeypatch):
@@ -504,3 +590,83 @@ def test_kdeglobals_seed_needs_both_published_inputs(tmp_path, monkeypatch):
     p = leader._write_kdeglobals_file()
     assert p == tmp_path / "kdeglobals"
     assert "font=Noto Sans,12," in p.read_text()
+
+
+# ----------------------------------------------- hostile labels and names ---
+
+def test_a_crafted_volume_label_cannot_desync_the_apps_file(tmp_path, monkeypatch):
+    """The `.apps` file the compositor reads is newline- and tab-delimited, and
+    the volume label comes off an attacker-supplied filesystem. A label carrying
+    a newline (or a tab, or control characters) must not be able to add lines or
+    fields: that would forge a socket name, a title or an app entry in the menu."""
+    monkeypatch.setattr(leader, "COMPOSITOR_RUNTIME", tmp_path)
+    st = _state()
+    st.volumes = ["ok", "evil\nveracage-fake.sock\nPWNED"]
+    st.volume_label = "title\nSPOOFED"
+    st.app_specs = [{"name": "App\nInjected", "exec": "kate"}]
+    leader._write_apps_file(st)
+
+    body = leader._apps_file_path(st).read_text()
+    lines = body.splitlines()
+    # <sock>\n<title>\n<volumes>\n<opener>\n<name>...  : exactly one app name.
+    assert len(lines) == 5, lines
+    assert lines[0].endswith(".sock")
+    assert "SPOOFED" in lines[1] and "\n" not in lines[1]
+    assert len(lines[2].split("\t")) == 2, "a label must not add a volume field"
+    assert "PWNED" in lines[2]        # neutralised, not dropped
+    assert lines[4].startswith("App") and "Injected" in lines[4]
+
+
+def test_the_app_socket_is_owner_only(tmp_path, monkeypatch):
+    """A connect needs write on the socket inode, so the mode is what denies
+    every other uid even though the runtime dir is traversable."""
+    monkeypatch.setattr(leader, "COMPOSITOR_RUNTIME", tmp_path)
+    st = _state()
+    srv = leader._publish_apps(st)
+    assert srv is not None
+    try:
+        mode = leader._app_socket_path(st).stat().st_mode & 0o777
+        assert mode == 0o700, oct(mode)
+    finally:
+        srv.close()
+        leader._unpublish_apps(st)
+
+
+# ------------------------------------------------------- terminate children --
+
+def _sleeper(ignore_term: bool = False):
+    """A real child process that sleeps, optionally ignoring SIGTERM.
+
+    A subprocess rather than a fork + `signal.signal`: in a forked child of the
+    pytest process that call is not dependable (the child can end up not counting
+    as the main thread), and a "stubborn" child that quietly dies on SIGTERM
+    would make this test pass against a leader that never escalates."""
+    argv = ["sh", "-c", 'trap "" TERM; sleep 30'] if ignore_term else ["sleep", "30"]
+    return subprocess.Popen(argv)
+
+
+def test_terminate_children_really_ends_them_and_reaps(monkeypatch):
+    """close-apps and session teardown both depend on this: while an app is
+    alive its sandbox keeps the volume's mount, so `cryptsetup close` fails and
+    the key stays in RAM. A polite child must get SIGTERM, one that ignores it
+    must still be gone afterwards, and neither may be left as a zombie."""
+    polite, stubborn = _sleeper(), _sleeper(ignore_term=True)
+    st = _state()
+    st.children = {polite.pid: ("polite", 0.0), stubborn.pid: ("stubborn", 0.0)}
+    time.sleep(0.2)   # let `sh` install its trap before we signal it
+
+    t0 = time.monotonic()
+    leader._terminate_children(st, timeout=1.0)
+    elapsed = time.monotonic() - t0
+
+    # Bounded: the grace is shared across children and a child that ignores
+    # SIGTERM is escalated to SIGKILL rather than waited out. Without the
+    # escalation this call blocks until the app exits on its own, and the session
+    # (and its decrypted volume) waits for it.
+    assert elapsed < 2.5, f"took {elapsed:.1f}s: no SIGKILL escalation"
+    for proc in (polite, stubborn):
+        with pytest.raises(ChildProcessError):
+            os.waitpid(proc.pid, os.WNOHANG)   # already reaped: no zombie left
+        with pytest.raises(ProcessLookupError):
+            os.kill(proc.pid, 0)               # and really gone
+        proc.returncode = 0                    # already reaped by the leader

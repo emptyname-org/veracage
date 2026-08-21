@@ -4,9 +4,14 @@ on:
   push:
   pull_request:
 
-# Unit + lint only. The integration tests (markers requires_root /
-# requires_vault / requires_wayland) need a real Wayland session, a vault and
-# root, so they are not run in CI — they are the on-hardware verification gate.
+# What runs here: the Python unit suite, lint, all three Rust crates, the
+# helper's argument contract, and a parse of the polkit policy template.
+#
+# What does not: the privileged and GUI steps in tests/integration/MANUAL.md,
+# which need root, a real volume and a Wayland session. `pytest.ini`'s
+# `testpaths = tests/unit` is what keeps them out of the default run.
+# `tests/regression.sh` is the fuller gate (it adds a headless compositor smoke
+# and pins the helper to the distro's rustc for its MSRV).
 
 jobs:
   python:
@@ -45,3 +50,40 @@ jobs:
         run: cargo build --release
       - name: test
         run: cargo test
+      # SECURITY.md names these as the guard on the helper's argument contract
+      # (no caller-chosen --user / --group / --continuation, PKEXEC_UID required,
+      # --session bound to the caller). They run against the RELEASE binary built
+      # above and need no root, no volume and no Wayland: every case is crafted to
+      # fail before the helper would fork.
+      - name: argument contract (against the built helper)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 -m pip install --quiet pytest
+          PYTHONPATH=src python3 -m pytest -q tests/integration/test_helper_security.py
+
+  rust-gui:
+    name: rust agent + compositor (build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # One package, measured rather than guessed: on a Debian box with every GUI
+      # dev package REMOVED, `cargo test` on agent-rs passes untouched (winit, GL,
+      # wayland and the file portal are all dlopened at runtime), while
+      # compositor-rs fails at `rust-lld: unable to find library -lxkbcommon`.
+      # Putting libxkbcommon-dev back, and nothing else, builds and tests both.
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev
+      - name: build + test the agent
+        run: cargo test --manifest-path agent-rs/Cargo.toml
+      - name: build + test the compositor
+        run: cargo test --manifest-path compositor-rs/Cargo.toml
+
+  policy:
+    name: polkit policy is well-formed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make check-policy

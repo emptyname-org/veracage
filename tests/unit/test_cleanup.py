@@ -1,7 +1,10 @@
 """Cleanup module: lock file handling, dm device validation, idempotency."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
+import os
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -145,8 +148,9 @@ def test_remove_stale_session_sockets_refuses_symlinked_dir(tmp_path, monkeypatc
     assert (elsewhere / "victim.sock").exists()   # untouched
 
 
-def test_cleanup_session_keeps_lock_if_a_close_fails(tmp_path):
+def test_cleanup_session_keeps_lock_if_a_close_fails(tmp_path, monkeypatch):
     """One EBUSY device ⇒ the session may be live ⇒ keep the lock (recovery)."""
+    monkeypatch.setattr(cleanup, "CLOSE_RETRY_FOR", 0.0)
     p = _session_lock(tmp_path, "d" * 16,
                       [("veracage-abc123abc123", "A"),
                        ("veracage-def456def456", "B")])
@@ -154,8 +158,39 @@ def test_cleanup_session_keeps_lock_if_a_close_fails(tmp_path):
     with mock.patch("veracage.cleanup.subprocess.run", return_value=busy), \
          mock.patch("veracage.cleanup.Path.exists", return_value=True):
         rc = cleanup.cleanup_session(p)
-    assert rc == 5
+    assert rc == 1
     assert p.exists()
+
+
+def test_close_dm_waits_out_a_device_the_kernel_has_not_released_yet(monkeypatch):
+    """This teardown runs moments after the session leader exited, and the kernel
+    frees its mount namespace - the last holder of the filesystem - asynchronously.
+    A single attempt loses a race it only has to wait out, and losing it leaves the
+    volume open with its key still in RAM."""
+    monkeypatch.setattr(cleanup, "CLOSE_RETRY_FOR", 5.0)
+    monkeypatch.setattr(cleanup, "CLOSE_RETRY_EVERY", 0.0)
+    busy = mock.MagicMock(returncode=5, stderr="Device veracage-a is still in use.")
+    ok = mock.MagicMock(returncode=0, stderr="")
+    with mock.patch("veracage.cleanup.subprocess.run",
+                    side_effect=[busy, busy, ok]) as r, \
+         mock.patch("veracage.cleanup.Path.exists", return_value=True):
+        assert cleanup.close_dm("veracage-abc123abc123") is None
+    assert r.call_count == 3
+
+
+def test_close_dm_gives_up_and_reports_a_device_that_stays_busy(monkeypatch):
+    monkeypatch.setattr(cleanup, "CLOSE_RETRY_FOR", 0.0)
+    busy = mock.MagicMock(returncode=5, stderr="Device veracage-a is still in use.")
+    with mock.patch("veracage.cleanup.subprocess.run", return_value=busy), \
+         mock.patch("veracage.cleanup.Path.exists", return_value=True):
+        assert cleanup.close_dm("veracage-abc123abc123") == "Device veracage-a is still in use."
+
+
+def test_close_dm_is_a_no_op_for_a_device_that_is_already_gone():
+    with mock.patch("veracage.cleanup.subprocess.run") as r, \
+         mock.patch("veracage.cleanup.Path.exists", return_value=False):
+        assert cleanup.close_dm("veracage-abc123abc123") is None
+    r.assert_not_called()
 
 
 def test_cleanup_session_refuses_garbage_dm(tmp_path):
@@ -249,3 +284,125 @@ def test_cleanup_session_noop_while_leader_alive(tmp_path):
     assert rc == 0
     r.assert_not_called()      # leader alive → nothing closed
     assert p.exists()          # lock kept
+
+
+def test_close_dm_reports_an_os_error_instead_of_raising(monkeypatch, tmp_path):
+    """cryptsetup missing from pkexec's PATH, or a fork failure under the memory
+    pressure that just OOM-killed the leader. Raising here abandoned every volume
+    after the failing one, each still decrypted."""
+    monkeypatch.setattr(cleanup.Path, "exists", lambda self: True)
+
+    def boom(*a, **k):
+        raise OSError("cannot fork")
+    monkeypatch.setattr(cleanup.subprocess, "run", boom)
+    monkeypatch.setattr(cleanup, "CLOSE_RETRY_FOR", 0.0)
+
+    err = cleanup.close_dm("veracage-0123456789ab")
+    assert err is not None and "fork" in err
+
+
+def test_a_zombie_leader_does_not_count_as_a_live_session(tmp_path):
+    """A leader that was SIGKILLed but not yet reaped keeps its /proc entry with
+    an unchanged start-time. Reading that as "still running" makes the teardown a
+    no-op - including on the suspend hook's force path, which runs moments after
+    sending that very SIGKILL."""
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)          # becomes a zombie: nobody reaps it until below
+    try:
+        time.sleep(0.05)
+        p = tmp_path / "session-1000.pid"
+        st = Path(f"/proc/{pid}/stat").read_text()
+        start = st[st.rfind(")") + 1:].split()[19]
+        p.write_text(f"{pid}\n{start}\n")
+        assert cleanup.session_leader_alive(p) is False
+    finally:
+        os.waitpid(pid, 0)
+
+
+def test_the_scratch_is_not_removed_when_rmtree_cannot_resist_symlinks(tmp_path, monkeypatch):
+    """`<lock>.run` is veracage-owned, so a compromised sandbox app can plant
+    symlinks in it. Root only walks it with the fd-based rmtree; on a platform
+    without that guarantee the tree is left alone rather than followed."""
+    p = _session_lock(tmp_path, "a" * 16, [])
+    run_dir = p.with_suffix(".run")
+    run_dir.mkdir()
+    (run_dir / "keep").write_text("x")
+    monkeypatch.setattr(cleanup.shutil.rmtree, "avoids_symlink_attacks", False,
+                        raising=False)
+    assert cleanup.cleanup_session(p) == 0
+    assert run_dir.exists(), "root must not walk a tree it cannot walk safely"
+
+
+def test_a_symlinked_scratch_is_never_followed(tmp_path):
+    """The same guard for the case where `.run` IS the symlink."""
+    p = _session_lock(tmp_path, "b" * 16, [])
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (target / "precious").write_text("x")
+    p.with_suffix(".run").symlink_to(target)
+    assert cleanup.cleanup_session(p) == 0
+    assert (target / "precious").exists(), "followed a symlink as root"
+
+
+def test_the_teardown_takes_the_session_flock(tmp_path, monkeypatch):
+    """It serializes against a successor session bootstrapping the same sid. The
+    wait is BOUNDED and then proceeds: this runs from ExecStopPost, which systemd
+    kills at the unit's stop timeout, and a close-volume helper parked on a human
+    answer holds the same lock. Blocking here would mean the devices are never
+    closed at all."""
+    p = _session_lock(tmp_path, "c" * 16, [("veracage-abc123abc123", "A")])
+    monkeypatch.setattr(cleanup, "FLOCK_WAIT", 0.2)
+    monkeypatch.setattr("veracage.cleanup.SESSIONS_BASE", tmp_path / "run-user")
+
+    # It must actually TAKE the sidecar lock (not merely be able to run without
+    # it): that is what serializes this teardown against a successor session
+    # bootstrapping the same sid.
+    taken: list = []
+    real_take = cleanup._take_flock
+    monkeypatch.setattr(cleanup, "_take_flock",
+                        lambda path: (taken.append(path), real_take(path))[1])
+
+    # Somebody else holds it for the whole call.
+    held = open(p.with_suffix(".flock"), "w")
+    fcntl.flock(held, fcntl.LOCK_EX)
+    try:
+        ok = mock.MagicMock(returncode=0)
+        t0 = time.monotonic()
+        with mock.patch("veracage.cleanup.subprocess.run", return_value=ok) as r, \
+             mock.patch("veracage.cleanup.Path.exists", return_value=True):
+            rc = cleanup.cleanup_session(p)
+        elapsed = time.monotonic() - t0
+    finally:
+        held.close()
+
+    assert rc == 0
+    assert taken == [p.with_suffix(".flock")], "the session flock was not taken"
+    assert r.called, "the devices must be closed even when the lock is held"
+    assert elapsed < 5.0, f"waited {elapsed:.1f}s; the wait must be bounded"
+
+
+def test_the_cli_refuses_a_caller_supplied_path(tmp_path):
+    """`--lock`/`--vault-hash` were removed because the action is passwordless:
+    an arbitrary path would be a root file-delete primitive. Assert the parser
+    REJECTS them, rather than relying on --session being required."""
+    for flag in ("--lock", "--vault-hash"):
+        with pytest.raises(SystemExit):
+            cleanup.main([flag, str(tmp_path / "x"), "--session", "1000"])
+
+
+def test_the_lock_format_the_helper_actually_writes_parses(tmp_path):
+    """The fixtures elsewhere in this file write two-field volume lines, but the
+    helper writes four (`append_session_volume`: dm, label, source hash,
+    dev:ino) plus a `generation=` header. Parse the real shape, or a field the
+    helper adds could break the teardown and nothing here would notice."""
+    p = tmp_path / "session-1000.lock"
+    p.write_text(
+        "user_uid=1000\n"
+        "generation=00aabbccddeeff11\n"
+        "volume=veracage-aaaaaaaaaaaa\tWork\t0631c55cceb0614f\t66306:12345\n"
+        "volume=veracage-bbbbbbbbbbbb\t\tdeadbeefdeadbeef\t66306:67890\n")
+    owner, volumes = cleanup.parse_session_lock(p)
+    assert owner == "1000"
+    assert volumes == [("veracage-aaaaaaaaaaaa", "Work"),
+                       ("veracage-bbbbbbbbbbbb", "")]

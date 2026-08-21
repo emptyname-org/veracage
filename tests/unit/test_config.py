@@ -1,9 +1,12 @@
 """Config TOML round-trip + tolerance to malformed input."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from veracage import apps, config
+from veracage.apps import App
 
 
 def test_load_missing_returns_empty(tmp_xdg_config):
@@ -435,3 +438,107 @@ def test_mimeapps_published_and_empty_without_desktop_files(
         apps={"kate": apps.App("kate", "Kate", "kate")}))
     # No .desktop files and no host mimeapps.list: just the empty section.
     assert (pub / "mimeapps.list").read_text() == "[Default Applications]\n"
+
+
+def test_an_app_key_that_needs_quoting_survives_a_save(tmp_xdg_config):
+    """A key with a space is legal TOML when quoted, and both the hand-edited
+    form and `configure --key "my key"` produce one. Written back bare it made
+    the file unparsable, and the next load silently returned an EMPTY config:
+    every app, the theme, the shortcuts and the per-volume overrides gone."""
+    cfg = config.load()
+    cfg.theme = "dark"
+    cfg.apps = {"my key": App(key="my key", name="X", exec="true")}
+    config.save(cfg)
+
+    again = config.load()
+    assert list(again.apps) == ["my key"]
+    assert again.apps["my key"].exec == "true"
+    assert again.theme == "dark"
+
+
+def test_a_non_string_exchange_dir_does_not_crash_the_open_path(tmp_xdg_config):
+    """`cfg.exchange_path()` is called on the `veracage open` path, outside the
+    try that guards the shared directory, so a wrongly-typed value used to end
+    the command in a TypeError traceback."""
+    (tmp_xdg_config / "veracage").mkdir(parents=True, exist_ok=True)
+    (tmp_xdg_config / "veracage" / "config.toml").write_text(
+        "[default]\nexchange_dir = 123\n")
+    cfg = config.load()
+    assert isinstance(cfg.exchange_path(), Path)
+
+
+# ------------------------------------------------------------- shortcuts ---
+
+def test_shortcuts_round_trip_and_a_bad_bind_falls_back(tmp_xdg_config, capsys):
+    """The compositor matches these against every key press and acts on them by
+    moving the clipboard across the sandbox boundary, so a malformed bind must
+    not reach it: it falls back to the default instead."""
+    cfg = config.load()
+    cfg.shortcuts = {"copy_out": "Ctrl+Shift+C", "paste_in": "Ctrl+Shift+V"}
+    config.save(cfg)
+    assert config.load().shortcuts == {"copy_out": "Ctrl+Shift+C",
+                                       "paste_in": "Ctrl+Shift+V"}
+
+    (tmp_xdg_config / "veracage").mkdir(parents=True, exist_ok=True)
+    (tmp_xdg_config / "veracage" / "config.toml").write_text(
+        '[shortcuts]\ncopy_out = ""\npaste_in = "Ctrl+Alt+V"\n')
+    loaded = config.load()
+    assert loaded.shortcuts["copy_out"] == "Ctrl+Alt+C", "an empty bind must not stick"
+    assert loaded.shortcuts["paste_in"] == "Ctrl+Alt+V"
+    assert "invalid shortcut" in capsys.readouterr().err
+
+
+def test_an_unknown_theme_falls_back_to_light(tmp_xdg_config):
+    """theme is published to the compositor and seeded into every sandbox's
+    kdeglobals; an arbitrary string there is not something to pass on."""
+    (tmp_xdg_config / "veracage").mkdir(parents=True, exist_ok=True)
+    (tmp_xdg_config / "veracage" / "config.toml").write_text(
+        '[default]\ntheme = "neon"\n')
+    assert config.load().theme == "light"
+
+
+def test_a_string_is_not_a_boolean(tmp_xdg_config):
+    """TOML `exchange = "false"` is a STRING, and a truthy one. Treating it as
+    true would mount the shared directory for someone who wrote it to turn the
+    thing off."""
+    (tmp_xdg_config / "veracage").mkdir(parents=True, exist_ok=True)
+    (tmp_xdg_config / "veracage" / "config.toml").write_text(
+        '[default]\nexchange = "false"\nclip_clear = "yes"\n')
+    cfg = config.load()
+    assert cfg.exchange is False
+    assert cfg.clip_clear is False
+
+
+def test_the_config_is_replaced_atomically(tmp_xdg_config, monkeypatch):
+    """A concurrent `veracage open` reads this file while a dialog saves it. A
+    truncate-then-write leaves a window where it parses as EMPTY, and an empty
+    config then makes auto-detect overwrite the user's curated app list."""
+    cfg = config.load()
+    cfg.apps = {"kate": App(key="kate", name="Kate", exec="kate")}
+    config.save(cfg)
+    before = config.config_path().read_text()
+
+    # A save that dies mid-write must leave the previous file untouched.
+    def boom(self, target):
+        raise OSError("crash between write and rename")
+    monkeypatch.setattr(config.Path, "replace", boom)
+    cfg.apps = {"okular": App(key="okular", name="Okular", exec="okular")}
+    with pytest.raises(OSError):
+        config.save(cfg)
+    assert config.config_path().read_text() == before
+    assert list(config.load().apps) == ["kate"]
+
+
+def test_publish_apps_drops_a_key_that_would_break_the_menu_file(tmp_path, monkeypatch):
+    """`config.apps` is `<key>\t<name>` per line and the key also names an icon
+    file, so a key with a slash or a traversal must never be published."""
+    monkeypatch.setenv("VERACAGE_PUB_DIR", str(tmp_path))
+    cfg = config.Config(apps={
+        "kate": App(key="kate", name="Kate", exec="kate"),
+        "../evil": App(key="../evil", name="Evil", exec="evil"),
+        "a/b": App(key="a/b", name="Slash", exec="slash"),
+    })
+    config.publish_apps(cfg)
+    body = (tmp_path / "config.apps").read_text()
+    assert "kate\tKate" in body
+    assert "evil" not in body and "a/b" not in body
