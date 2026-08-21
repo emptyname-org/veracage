@@ -13,13 +13,26 @@
   <vendor_url>https://example.invalid/veracage</vendor_url>
 
   <action id="org.veracage.helper">
-    <description>Open an encrypted volume (LUKS or VeraCrypt) into an isolated workspace</description>
-    <message>Authentication is required to open a Veracage volume</message>
+    <description>Open or close an encrypted volume (LUKS or VeraCrypt) in an isolated workspace</description>
+    <message>Authenticate to open or close the volume</message>
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
       <allow_active>auth_self_keep</allow_active>
     </defaults>
+    <!--
+      One action, because polkit keys an action to the pkexec'd program PATH and
+      every privileged operation is this one helper: the mount, the per-volume
+      close (the helper's close-volume flag), and the compositor bring-up. So the
+      wording has to cover them all rather than say "open", which is what a close
+      prompt used to read.
+
+      Mind the punctuation: a double hyphen cannot appear inside an XML comment,
+      and a policy file that is not well-formed is dropped WHOLE by polkitd. Both
+      actions then vanish, pkexec falls back to org.freedesktop.policykit.exec,
+      and every call asks for a password: the compositor, the session, and the
+      cleanup that is meant to be passwordless.
+    -->
     <annotate key="org.freedesktop.policykit.exec.path">@HELPER@</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>

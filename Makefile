@@ -1,4 +1,4 @@
-.PHONY: help build build-agent test-agent build-compositor test-compositor install install-dev uninstall uninstall-dev test test-rs test-rs-root lint clean test-vault smoke veracage-user
+.PHONY: help build build-agent test-agent build-compositor test-compositor check-policy install install-dev uninstall uninstall-dev test test-rs test-rs-root lint clean test-vault smoke veracage-user
 
 PREFIX     ?= /usr/local
 BINDIR     ?= $(PREFIX)/bin
@@ -31,6 +31,12 @@ CARGO      ?= cargo
 RUSTUP_CARGO := $(HOME)/.cargo/bin/cargo
 AGENT_CARGO  ?= $(if $(wildcard $(RUSTUP_CARGO)),$(RUSTUP_CARGO),$(CARGO))
 
+# Where a generated file is staged for validation before it is installed.
+POLICY_TMP := $(DEV_ROOT)/.veracage-install.tmp
+
+# The continuation path baked into the helper. install/install-dev override it.
+CONT       ?= $(BINDIR)/veracage
+
 HELPER_BIN     := helper-rs/target/release/veracage-helper
 AGENT_BIN      := agent-rs/target/release/veracage-agent
 COMPOSITOR_BIN := compositor-rs/target/release/veracage-compositor
@@ -50,8 +56,11 @@ help:
 
 # --- build ---------------------------------------------------------------
 # CONT = the continuation path baked into the helper (the installed CLI).
-# Target-specific CONT (below) propagates to this prerequisite.
-build: CONT ?= $(BINDIR)/veracage
+# The default is GLOBAL, not `build: CONT ?= ...`: a target-specific `?=` on the
+# prerequisite wins over the value install/install-dev set for it, which silently
+# baked the INSTALLED path into a dev helper (so a dev session ran the installed
+# Python, or died at "continuation not executable" on a box without it).
+# `?=` still lets `make build CONT=/some/path` override from the command line.
 build:
 	VERACAGE_CONTINUATION='$(CONT)' $(CARGO) build --release --manifest-path helper-rs/Cargo.toml
 
@@ -111,9 +120,33 @@ veracage-user:
 	  sudo usermod -aG render veracage; fi
 	@echo "veracage user uid: $$(id -u veracage)"
 
+# --- polkit policy check -------------------------------------------------
+# polkitd drops a malformed policy file WHOLE and says nothing, so a broken one
+# does not fail loudly: it removes both Veracage actions, pkexec falls back to
+# org.freedesktop.policykit.exec, and every privileged step (compositor, session,
+# the cleanup that must stay passwordless) starts asking for a password. Parse
+# the template before either install writes it.
+check-policy:
+	@$(PY) -c "import xml.etree.ElementTree as ET; ET.parse('install/org.veracage.policy.in')" \
+	  || { echo 'install/org.veracage.policy.in is not well-formed XML'; exit 1; }
+
+# install-policy <helper-path> <cleanup-path> <destination>: substitute, parse the
+# RESULT (not just the template: a checkout path containing & < > " or | corrupts
+# the substitution, and polkitd drops a malformed file whole and silently), then
+# install it root-owned 0644. `tee` used to hide sed's exit status behind the
+# pipe, and nothing set the mode.
+define install-policy
+	sed -e 's|@HELPER@|$(1)|g' -e 's|@CLEANUP@|$(2)|g' \
+	    install/org.veracage.policy.in > "$(POLICY_TMP)"
+	$(PY) -c "import xml.etree.ElementTree as ET; ET.parse('$(POLICY_TMP)')" \
+	  || { echo 'generated polkit policy is not well-formed XML (check the paths for & < > " |)'; rm -f "$(POLICY_TMP)"; exit 1; }
+	$(SUDO) install -m 0644 "$(POLICY_TMP)" "$(3)"
+	@rm -f "$(POLICY_TMP)"
+endef
+
 # --- real install --------------------------------------------------------
 install: CONT := $(BINDIR)/veracage
-install: build build-agent build-compositor
+install: check-policy build build-agent build-compositor
 	# Dedicated vault system user (skipped for staged/packaged DESTDIR builds,
 	# where a package postinst should create it instead).
 	@if [ -z "$(DESTDIR)" ]; then id veracage >/dev/null 2>&1 || sudo useradd -r -M -s /usr/sbin/nologin veracage; fi
@@ -145,9 +178,7 @@ install: build build-agent build-compositor
 	$(SUDO) chmod 0755 "$(DESTDIR)$(BINDIR)/veracage"
 	# polkit policy (paths must match the launcher's VERACAGE_* env)
 	$(SUDO) install -d "$(DESTDIR)$(POLKIT_DIR)"
-	sed -e 's|@HELPER@|$(LIBEXEC)/veracage-helper|g' \
-	    -e 's|@CLEANUP@|$(LIBEXEC)/veracage-cleanup|g' \
-	    install/org.veracage.policy.in | $(SUDO) tee "$(DESTDIR)$(POLKIT_DIR)/org.veracage.policy" >/dev/null
+	$(call install-policy,$(LIBEXEC)/veracage-helper,$(LIBEXEC)/veracage-cleanup,$(DESTDIR)$(POLKIT_DIR)/org.veracage.policy)
 	# Launcher .desktop app + icon (Name=Veracage, the bird-in-a-cage icon)
 	$(SUDO) install -d "$(DESTDIR)$(APPDIR)" "$(DESTDIR)$(ICONDIR)" "$(DESTDIR)$(PIXMAPDIR)"
 	sed 's|@AGENT@|$(BINDIR)/veracage-agent|g' install/veracage.desktop.in \
@@ -173,19 +204,31 @@ install: build build-agent build-compositor
 
 # --- dev install: polkit points at this checkout -------------------------
 install-dev: CONT := $(DEV_ROOT)/src/bin/veracage
-install-dev: veracage-user build
+install-dev: check-policy veracage-user build
 	chmod +x "$(DEV_ROOT)/src/bin/veracage" "$(DEV_ROOT)/helpers/veracage-cleanup"
-	sed -e 's|@HELPER@|$(DEV_ROOT)/$(HELPER_BIN)|g' \
-	    -e 's|@CLEANUP@|$(DEV_ROOT)/helpers/veracage-cleanup|g' \
-	    install/org.veracage.policy.in | sudo tee "$(POLKIT_DIR)/org.veracage.policy" >/dev/null
-	sudo mkdir -p /run/veracage
+	$(call install-policy,$(DEV_ROOT)/$(HELPER_BIN),$(DEV_ROOT)/helpers/veracage-cleanup,$(POLKIT_DIR)/org.veracage.policy)
+	# The udev rule and the system-sleep hook are host-global, not $(PREFIX)-scoped,
+	# and both FAIL OPEN when absent: without the rule the decrypted volume's label
+	# and UUID are published under /dev/disk to every local user and UDisks offers
+	# it in the drive menu; without the hook there is no suspend teardown at all.
+	# A dev box needs them exactly as much as a real install does.
+	sudo install -d "$(UDEVDIR)"
+	sudo rm -f "$(UDEVDIR)/99-veracage.rules"
+	sudo install -m 0644 install/57-veracage.rules "$(UDEVDIR)/57-veracage.rules"
+	sudo udevadm control --reload 2>/dev/null || true
+	sudo install -d "$(SLEEPDIR)"
+	sed 's|@LIBDIR@|$(DEV_ROOT)/src|g' install/veracage-sleep.in > "$(POLICY_TMP)"
+	sudo install -m 0755 "$(POLICY_TMP)" "$(SLEEPDIR)/veracage"
+	@rm -f "$(POLICY_TMP)"
 	@echo 'Dev install done. The CLI auto-detects the built Rust helper.'
 	@echo 'Run: $(DEV_ROOT)/src/bin/veracage configure'
 	@echo ''
-	@echo '*** SECURITY: dev install points polkit at a helper in this USER-WRITABLE'
-	@echo '*** checkout and runs it as ROOT. Any process running as you can overwrite'
-	@echo '*** it and gain root on the next `veracage open`. Use ONLY on a single-user'
-	@echo '*** or disposable box - NEVER on a shared/multi-user machine. Use `make'
+	@echo '*** SECURITY: this points polkit at TWO programs in this USER-WRITABLE'
+	@echo '*** checkout and runs them as ROOT. The cleanup one (helpers/veracage-cleanup,'
+	@echo '*** and every file it imports from src/veracage/) is authorised PASSWORDLESS,'
+	@echo '*** so anything that can write this checkout has root for the asking - no'
+	@echo '*** prompt, no `veracage open` needed. Use ONLY on a single-user or'
+	@echo '*** disposable box - NEVER on a shared/multi-user machine. Use `make'
 	@echo '*** install` (root-owned /usr/local) for anything real.'
 
 uninstall:
@@ -196,8 +239,21 @@ uninstall:
 	sudo rm -rf "$(LIBDIR)" "$(LIBEXEC)" "$(BINDIR)/veracage" \
 	    "$(BINDIR)/veracage-agent" "$(BINDIR)/veracage-compositor"
 
+# Removes what install-dev put on the HOST. The udev rule and the sleep hook are
+# global paths a real `make install` writes too, so this only touches them when
+# there is no real install left behind them (a stale rule would keep the
+# decrypted volume out of /dev/disk, which is harmless, but a sleep hook whose
+# $(LIBDIR) is gone would run and fail on every suspend).
 uninstall-dev:
 	sudo rm -f "$(POLKIT_DIR)/org.veracage.policy"
+	@if [ -d "$(LIBDIR)/veracage" ]; then \
+	  echo "keeping the udev rule + sleep hook: $(LIBDIR)/veracage is still installed"; \
+	else \
+	  sudo rm -f "$(UDEVDIR)/57-veracage.rules"; \
+	  sudo udevadm control --reload 2>/dev/null || true; \
+	  sudo rm -f "$(SLEEPDIR)/veracage"; \
+	  echo "removed the udev rule and the system-sleep hook"; \
+	fi
 
 # --- dev workflow --------------------------------------------------------
 test:

@@ -9,7 +9,7 @@
 #     bypassing the sandbox entirely.
 #   * 60-persistent-storage-dm.rules probes the decrypted filesystem and links it
 #     under /dev/disk/by-label/<label> and /dev/disk/by-uuid/<uuid>, readable by
-#     every local user. The dm name is a hash precisely so a mounted volume stays
+#     every local user. The dm name is random precisely so a mounted volume stays
 #     anonymous outside the sandbox, and those symlinks undo that.
 #
 # A volume must be reached only through the sandbox, so mark the device ignored

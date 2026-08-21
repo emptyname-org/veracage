@@ -17,6 +17,20 @@ target/
 /tmp/
 *.swp
 *.orig
+*~
+
+# Art kept locally but not carried in the repo: earlier drafts and generator
+# output that nothing builds against. The tracked set is what the binaries
+# include (Icons/veracage_icon.png, Icons/generic_app.png), what `make install`
+# ships (Icons/veracage_256.png) and the master the 256 is resized from
+# (Icons/veracage_icon_turquoise_transparent_corners.png, see the Makefile).
+/Icons/25569259-166a-45c0-ad5b-dffc7c3afc39.png
+/Icons/ChatGPT Image Jul 2, 2026, 12_03_48 PM.png
+/Icons/veracage_icon_transparent_bg_black_outline.png
+/Icons/spinner.png
+
+# Staged for validation by `make install` before it is installed
+/.veracage-install.tmp
 
 # Throwaway de-risk prototype (not part of the product)
 /prototype/
