@@ -174,10 +174,11 @@ mod tests {
             .expect("the embedded epaint font must rasterise");
         assert!(w > 100 && h > 20, "unexpected block size {w}x{h}");
         assert_eq!(rgba.len(), (w * h * 4) as usize);
-        let inked = rgba.chunks_exact(4).filter(|p| p[3] > 0).count();
+        let pixels = rgba.as_chunks::<4>().0;
+        let inked = pixels.iter().filter(|p| p[3] > 0).count();
         assert!(inked > 200, "only {inked} inked pixels: the glyphs did not land");
         // Premultiplied: no channel may exceed its own alpha.
-        assert!(rgba.chunks_exact(4).all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3]));
+        assert!(pixels.iter().all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3]));
     }
 
     #[test]

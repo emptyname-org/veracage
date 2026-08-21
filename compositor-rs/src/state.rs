@@ -513,7 +513,7 @@ fn build_hint_icon() -> Option<smithay::backend::renderer::element::memory::Memo
     use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
     use smithay::utils::Transform;
     let (w, h, mut rgba) = crate::toolbar::decode_icon_rgba()?;
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         let a = px[3] as u16;
         px[0] = (px[0] as u16 * a / 255) as u8;
         px[1] = (px[1] as u16 * a / 255) as u8;

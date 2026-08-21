@@ -48,7 +48,7 @@ pub fn apply_theme(ctx: &egui::Context, theme: &str) {
     }
 
     v.selection.bg_fill = ACCENT.gamma_multiply(if dark { 0.55 } else { 0.35 });
-    v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
+    v.selection.stroke = egui::Stroke::new(1.0_f32, ACCENT);
     v.hyperlink_color = ACCENT;
 
     let r = egui::Rounding::same(6.0);
@@ -59,8 +59,8 @@ pub fn apply_theme(ctx: &egui::Context, theme: &str) {
     v.widgets.open.rounding = r;
     v.window_rounding = egui::Rounding::same(10.0);
 
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.7));
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.7));
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT);
 
     ctx.set_visuals(v);
     ctx.style_mut(|s| {

@@ -143,7 +143,9 @@ fn browse_button(
 /// An RGBA icon as one ink colour: luminance, inverted under the dark theme so a
 /// dark-drawn glyph shows light. Transparency is untouched, so the shape stays.
 fn mono(rgba: &[u8], dark: bool) -> Vec<u8> {
-    rgba.chunks_exact(4)
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|px| {
             let lum = 0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32;
             let ink = if dark { 255.0 - lum } else { lum } as u8;
