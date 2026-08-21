@@ -213,7 +213,7 @@ impl Config {
     pub fn exchange_path(&self) -> PathBuf {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         match self.exchange_dir.as_deref() {
-            Some(d) if d == "~" => home.unwrap_or_else(|| PathBuf::from("~")),
+            Some("~") => home.unwrap_or_else(|| PathBuf::from("~")),
             Some(d) => {
                 if let Some(rest) = d.strip_prefix("~/") {
                     if let Some(h) = home {

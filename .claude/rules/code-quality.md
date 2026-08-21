@@ -125,6 +125,34 @@ When modifying existing code:
 - Do not duplicate the same test logic across many test cases when it can be parameterized clearly.
 - Keep test data minimal and relevant.
 
+## Linters
+
+Run the linter before calling a change done, and treat its output as part of the
+build rather than advice:
+
+- Rust: `cargo clippy --all-targets -- -D warnings`, on every crate, with the
+  rustup toolchain (clippy ships there). The gate runs it as its own component
+  and CI runs the same command.
+- Python: `make lint` (ruff + mypy).
+
+A lint you decide not to follow is a decision to record, not one to leave
+failing: allow it at the narrowest scope that works, with a comment saying why.
+This project allows `clippy::collapsible_if` crate-wide in the two GUI crates,
+because the nested form keeps a comment attached to the condition it explains,
+and enforces everything else.
+
+Do not reformat code to satisfy a formatter. All three Rust crates are
+hand-formatted and rustfmt disagrees with them in dozens of places; that is a
+style the project has chosen, so there is no `cargo fmt --check` anywhere.
+
+The reason this is a rule: a clippy step sat in this repo's CI for two months
+without ever executing, because the repo had no remote. When it finally ran it
+found an `#[allow(clippy::too_many_arguments)]` that had drifted off the function
+it was written for (a doc comment and a block of constants had been inserted
+between them, so it was silently allowing a `const`), and a doc comment left
+behind by a function deleted in v0.5.0. Two human code reviews had passed over
+both. A check that exists is not a check that runs.
+
 ## Before completing a change
 
 Review the result and check:

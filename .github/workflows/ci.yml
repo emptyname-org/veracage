@@ -66,11 +66,13 @@ jobs:
           PYTHONPATH=src python3 -m pytest -q tests/integration/test_helper_security.py
 
   rust-gui:
-    name: rust agent + compositor (build)
+    name: rust agent + compositor (clippy + test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       # One package, measured rather than guessed: on a Debian box with every GUI
       # dev package REMOVED, `cargo test` on agent-rs passes untouched (winit, GL,
       # wayland and the file portal are all dlopened at runtime), while
@@ -80,6 +82,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev
+      - name: clippy (agent)
+        run: cargo clippy --manifest-path agent-rs/Cargo.toml --all-targets -- -D warnings
+      - name: clippy (compositor)
+        run: cargo clippy --manifest-path compositor-rs/Cargo.toml --all-targets -- -D warnings
       - name: build + test the agent
         run: cargo test --manifest-path agent-rs/Cargo.toml
       - name: build + test the compositor

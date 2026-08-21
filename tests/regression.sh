@@ -12,6 +12,7 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 export PATH="$HOME/.cargo/bin:$PATH"
+RUSTUP_CARGO="$HOME/.cargo/bin/cargo"
 
 WANT_SMOKE=1
 [ "${1:-}" = "--no-smoke" ] && WANT_SMOKE=0
@@ -69,6 +70,20 @@ c_py_tests() {
   # vault/Wayland are marked in tests/integration/MANUAL.md and skipped here.
   # PYTHONPATH=src so `from veracage import ...` resolves without an editable install.
   PYTHONPATH="$ROOT/src" "$py" -m pytest -q tests/unit
+}
+
+c_clippy() { # every lint that is not the house style, on all three crates
+  # Uses RUSTUP's toolchain, not the distro one the helper build is pinned to:
+  # clippy ships with rustup and CI runs the same version, so this is the check
+  # that matches CI rather than the MSRV floor.
+  local cargo="$RUSTUP_CARGO"
+  [ -x "$cargo" ] || { echo "no rustup cargo"; return 2; }
+  "$cargo" clippy --version >/dev/null 2>&1 || { echo "clippy component not installed"; return 2; }
+  local rc=0
+  for c in helper-rs agent-rs compositor-rs; do
+    "$cargo" clippy --quiet --manifest-path "$ROOT/$c/Cargo.toml" --all-targets -- -D warnings || rc=1
+  done
+  return $rc
 }
 
 c_helper_contract() { # the privilege-boundary tests, against the BUILT helper
@@ -179,13 +194,14 @@ component "rust: compositor build"   c_compositor_build
 component "rust: agent build"        c_agent_build
 component "python: unit tests"       c_py_tests
 component "helper argument contract" c_helper_contract
+component "rust: clippy (3 crates)"  c_clippy
 component "python: lint (ruff+mypy)" c_py_lint
 component "headless compositor smoke" c_headless_smoke
 
 # ------------------------------------------------------------- summary ------
 # A SKIP of a CORE component (a build or the unit tests) means the environment
 # can't actually run the gate - treat it as a failure, not a silent pass.
-CORE_RE='helper build|compositor build|agent build|unit tests|lint|argument contract'
+CORE_RE='helper build|compositor build|agent build|unit tests|lint|argument contract|clippy'
 printf '\n'; bold "================ SUMMARY ================"
 fails=0
 for name in "${ORDER[@]}"; do

@@ -36,11 +36,11 @@ impl State {
                         // own copy/paste. Read live from state.binds.
                         if pressed {
                             let sym = keysym.modified_sym();
-                            if state.binds.copy_out.as_ref().is_some_and(|b| b.matches(&modifiers, sym)) {
+                            if state.binds.copy_out.as_ref().is_some_and(|b| b.matches(modifiers, sym)) {
                                 crate::clipboard::pull_to_host(state);
                                 return FilterResult::Intercept(());
                             }
-                            if state.binds.paste_in.as_ref().is_some_and(|b| b.matches(&modifiers, sym)) {
+                            if state.binds.paste_in.as_ref().is_some_and(|b| b.matches(modifiers, sym)) {
                                 crate::clipboard::push_from_host(state);
                                 return FilterResult::Intercept(());
                             }

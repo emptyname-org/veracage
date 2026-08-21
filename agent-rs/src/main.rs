@@ -8,6 +8,14 @@
 //! Everything goes through `proto` (the control socket); the agent holds no
 //! privilege and never touches the vault.
 
+// `collapsible_if` is allowed crate-wide: this code nests `if let Some(x) = scan()`
+// around `if x != current` on purpose, so the comment above each outer test still
+// reads as a comment about that test. Collapsing them into let-chains buys nothing
+// and costs the explanation. Every other clippy lint is enforced (CI runs
+// `--all-targets -D warnings`), including the ones that found real defects here:
+// a doc comment left behind by a deleted function, and an `#[allow]` that had
+// drifted off the function it was written for.
+#![allow(clippy::collapsible_if)]
 mod apps;
 mod broker;
 mod config;

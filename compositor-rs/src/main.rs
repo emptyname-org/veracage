@@ -3,6 +3,14 @@
 //! apps into one window on the host (nested via the inherited WAYLAND_SOCKET fd),
 //! exposes NO `data-control` global (the host clipboard bridge is a private
 //! socket only the leader holds).
+// `collapsible_if` is allowed crate-wide: this code nests `if let Some(x) = scan()`
+// around `if x != current` on purpose, so the comment above each outer test still
+// reads as a comment about that test. Collapsing them into let-chains buys nothing
+// and costs the explanation. Every other clippy lint is enforced (CI runs
+// `--all-targets -D warnings`), including the ones that found real defects here:
+// a doc comment left behind by a deleted function, and an `#[allow]` that had
+// drifted off the function it was written for.
+#![allow(clippy::collapsible_if)]
 #![allow(irrefutable_let_patterns)]
 
 mod clipboard;

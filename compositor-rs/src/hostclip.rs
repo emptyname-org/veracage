@@ -614,25 +614,25 @@ mod tests {
     #[test]
     fn clipboard_cleared_only_while_owned() {
         // We still own it -> current clipboard is still our value -> clear it.
-        assert_eq!(plan_clear(true, false, SECRET, None).0, true);
+        assert!(plan_clear(true, false, SECRET, None).0);
         // Replaced by the host (our source was cancelled) -> preserve it.
-        assert_eq!(plan_clear(false, false, SECRET, None).0, false);
+        assert!(!(plan_clear(false, false, SECRET, None).0));
     }
 
     #[test]
     fn primary_cleared_only_on_exact_match() {
         // Matches the pushed value -> clear it.
-        assert_eq!(plan_clear(false, true, SECRET, Some(SECRET)).1, true);
+        assert!(plan_clear(false, true, SECRET, Some(SECRET)).1);
         // Host replaced it with newer text -> preserve it.
-        assert_eq!(plan_clear(false, true, SECRET, Some(b"other")).1, false);
+        assert!(!(plan_clear(false, true, SECRET, Some(b"other")).1));
         // No primary offer to read -> nothing to clear.
-        assert_eq!(plan_clear(false, true, SECRET, None).1, false);
+        assert!(!(plan_clear(false, true, SECRET, None).1));
     }
 
     #[test]
     fn primary_untouched_without_v2_support() {
         // Even a byte-identical primary is left alone when the device is v1.
-        assert_eq!(plan_clear(true, false, SECRET, Some(SECRET)).1, false);
+        assert!(!(plan_clear(true, false, SECRET, Some(SECRET)).1));
     }
 }
 

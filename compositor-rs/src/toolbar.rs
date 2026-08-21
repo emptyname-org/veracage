@@ -768,8 +768,6 @@ pub fn volumes_title(leaders: &[LeaderApps]) -> String {
     }
 }
 
-/// Backdrop-hint text colors (big line, small line) for the theme. Solid, not
-
 /// A menu item widget: a small host-theme icon (when cached) + text. Icon-less
 /// items fall back to text only.
 fn menu_item(icon: Option<&egui::TextureHandle>, text: &str) -> egui::Button<'static> {
@@ -1521,7 +1519,7 @@ mod tests {
         let window_mapped = START + 700_000_000; // 0.7s after the note, before the scan
         let (shown, note) = pick_status(None, leader, window(window_mapped), None, START + 1_000_000_000, START);
         assert_eq!(shown, None, "the note should be finished the first time it is seen");
-        assert!(note.map_or(false, |n| n.done));
+        assert!(note.is_some_and(|n| n.done));
     }
 
     #[test]
