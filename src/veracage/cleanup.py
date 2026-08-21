@@ -24,6 +24,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # The session id is the human uid (cli.py passes str(os.getuid())). Must accept
@@ -51,8 +52,13 @@ def vault_hash(vault: str) -> str:
 # so a crash still closes them all:
 #
 #     user_uid=1000
-#     volume=veracage-<12hex>\t<label>
-#     volume=veracage-<12hex>\t<label>
+#     generation=<16hex>
+#     volume=veracage-<12hex>\t<label>\t<source hash>\t<dev>:<ino>
+#     volume=veracage-<12hex>\t<label>\t<source hash>\t<dev>:<ino>
+#
+# Only the first two fields matter here; the rest are the helper's own keys for
+# the duplicate-open guard and are ignored (a line written by an older helper
+# carries fewer fields and must still parse).
 #
 # `session-<sid>.lock`, root-owned 0600. `<sid>` is the human uid (digits).
 
@@ -82,15 +88,25 @@ def parse_session_lock(p: Path) -> tuple[str, list[tuple[str, str]]]:
 
 
 def _proc_starttime(pid: int) -> str | None:
-    """`/proc/<pid>/stat` field 22 (start-time). comm (field 2) is parenthesised
-    and may contain spaces, so split after the last ')': the remaining fields
-    start at field 3, so start-time is index 19."""
+    """`/proc/<pid>/stat` field 22 (start-time), or None if the process is gone
+    or a ZOMBIE. comm (field 2) is parenthesised and may contain spaces, so
+    split after the last ')': the remaining fields start at field 3, so state
+    is index 0 and start-time is index 19.
+
+    The zombie test is what makes this usable as a liveness check. A leader
+    that was SIGKILLed but not yet reaped keeps its /proc entry with an
+    unchanged start-time, and reading that as "still running" makes the
+    teardown a no-op - including on the suspend hook's force path, which
+    calls us moments after sending that very SIGKILL. Mirrors
+    wayland._pid_alive."""
     try:
         data = Path(f"/proc/{pid}/stat").read_text()
     except OSError:
         return None
     rest = data[data.rfind(")") + 1:].split()
-    return rest[19] if len(rest) > 19 else None
+    if len(rest) <= 19 or rest[0] == "Z":
+        return None
+    return rest[19]
 
 
 def session_leader_alive(pid_path: Path) -> bool:
@@ -114,20 +130,106 @@ def _remove_stale_session_sockets(owner: str) -> None:
     keys the session's control socket by the BOOTSTRAP VAULT's hash (not the
     session id), which the session lock does not record, but there is exactly
     one session per uid, so once that session is dead every socket in the dir is
-    stale. Runs as root under a human-writable tree, so: refuse a dir path any
-    component of which is a symlink, and unlink only actual socket inodes."""
-    d = SESSIONS_BASE / owner / "veracage" / "sessions"
+    stale.
+
+    Runs as ROOT under a tree the caller owns, so the path is never resolved
+    twice: each component is opened with O_NOFOLLOW relative to the previous
+    directory fd, and the unlink is done with `dir_fd`. Resolving the path,
+    checking it, and then globbing it again let the caller swap a component for a
+    symlink in between and have root unlink sockets anywhere on the system, and
+    the cleanup action is passwordless so it could be retried until it won."""
+    parts = [c for c in SESSIONS_BASE.parts if c != os.sep]
+    parts += [owner, "veracage", "sessions"]
     try:
-        if d.resolve(strict=True) != d:
-            print(f"veracage-cleanup: {d} has symlinked components, "
-                  "not removing sockets", file=sys.stderr)
-            return
+        fd = os.open(os.sep if SESSIONS_BASE.is_absolute() else ".", os.O_RDONLY | os.O_DIRECTORY)
     except OSError:
-        return  # dir gone, nothing to clean
-    for sp in d.glob("*.sock"):
+        return
+    try:
+        for comp in parts:
+            try:
+                nxt = os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                return  # gone, or a symlinked component: refuse either way
+            os.close(fd)
+            fd = nxt
+        for name in os.listdir(fd):
+            if not name.endswith(".sock"):
+                continue
+            try:
+                if stat.S_ISSOCK(os.lstat(name, dir_fd=fd).st_mode):
+                    os.unlink(name, dir_fd=fd)
+            except OSError:
+                continue
+    finally:
         with contextlib.suppress(OSError):
-            if stat.S_ISSOCK(sp.lstat().st_mode):
-                sp.unlink()
+            os.close(fd)
+
+
+# How long to keep retrying a `cryptsetup close` that reports the device busy,
+# and how long to wait between tries. This teardown runs from the unit's
+# ExecStopPost, i.e. moments after the session leader exited, and the kernel
+# releases the leader's mount namespace (and with it the last holder of the
+# filesystem) asynchronously. A single attempt therefore loses a race it only has
+# to wait out - and losing it leaves the volume open with its key still in RAM.
+CLOSE_RETRY_FOR = 5.0
+CLOSE_RETRY_EVERY = 0.2
+
+
+def close_dm(dm_name: str) -> str | None:
+    """`cryptsetup close` a dm device, retrying while it reports busy. Returns
+    None once the device is gone (including "it was never there"), else the last
+    error text. The caller must have validated `dm_name`."""
+    deadline = time.monotonic() + CLOSE_RETRY_FOR
+    while True:
+        if not Path(f"/dev/mapper/{dm_name}").exists():
+            return None
+        try:
+            r = subprocess.run(["cryptsetup", "close", dm_name],
+                               capture_output=True, text=True)
+        except OSError as e:
+            # Fork failure under the memory pressure that just OOM-killed the
+            # leader, or cryptsetup missing from pkexec's PATH. Report it as
+            # this device's error: raising here would abandon every volume
+            # after it, each one still decrypted.
+            return str(e)
+        if r.returncode == 0:
+            return None
+        err = r.stderr.strip() or f"exit {r.returncode}"
+        if time.monotonic() >= deadline:
+            return err
+        time.sleep(CLOSE_RETRY_EVERY)
+
+
+# How long to wait for the session flock before cleaning up WITHOUT it. The wait
+# is bounded because this runs from the unit's ExecStopPost, which systemd kills
+# at the unit's stop timeout (90s by default), and because a close-volume helper
+# parked on a human answer holds that same flock for up to five minutes. Blocking
+# here would mean the dm devices are never closed at all, which is strictly worse
+# than racing a successor session: this is the last thing standing between a
+# decrypted device and a machine that believes it closed it.
+FLOCK_WAIT = 2.0
+FLOCK_RETRY_EVERY = 0.05
+
+
+def _take_flock(path: Path):
+    """Take the session flock, waiting at most FLOCK_WAIT. Returns the open file
+    (locked or not) so the caller can hold it for the teardown, or None if it
+    could not be opened at all."""
+    try:
+        f = open(path, "w")
+    except OSError:
+        return None
+    deadline = time.monotonic() + FLOCK_WAIT
+    while True:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f
+        except OSError:
+            if time.monotonic() >= deadline:
+                print(f"veracage-cleanup: {path.name} is held by another Veracage "
+                      "process; closing the volumes anyway", file=sys.stderr)
+                return f
+            time.sleep(FLOCK_RETRY_EVERY)
 
 
 def cleanup_session(p: Path) -> int:
@@ -146,13 +248,8 @@ def cleanup_session(p: Path) -> int:
     # Serialize with the helper's open/teardown paths (they flock the same
     # sidecar, `session-<sid>.flock`): without this, a cleanup firing while a
     # successor session bootstraps the same sid could close a dm the successor
-    # just opened, or delete its freshly written lock. Best-effort: if the
-    # sidecar can't be locked we still clean up (never leave a key in RAM).
-    try:
-        _lockf = open(p.with_suffix(".flock"), "w")
-        fcntl.flock(_lockf, fcntl.LOCK_EX)
-    except OSError:
-        _lockf = None
+    # just opened, or delete its freshly written lock.
+    _lockf = _take_flock(p.with_suffix(".flock"))
     try:
         return _cleanup_session_locked(p)
     finally:
@@ -193,13 +290,11 @@ def _cleanup_session_locked(p: Path) -> int:
                   f"(does not match veracage-<12-hex>)", file=sys.stderr)
             rc = 2
             continue
-        if Path(f"/dev/mapper/{dm_name}").exists():
-            r = subprocess.run(["cryptsetup", "close", dm_name],
-                               capture_output=True, text=True)
-            if r.returncode != 0:
-                print(f"veracage-cleanup: cryptsetup close {dm_name}: "
-                      f"{r.stderr.strip()}", file=sys.stderr)
-                rc = r.returncode or 1
+        err = close_dm(dm_name)
+        if err is not None:
+            print(f"veracage-cleanup: cryptsetup close {dm_name}: {err}",
+                  file=sys.stderr)
+            rc = 1
 
     # Only drop the lock + socket once every device is actually closed: a failed
     # close (EBUSY) means the session may still be live; leave the lock as a

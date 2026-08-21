@@ -255,7 +255,7 @@ def ensure_empty_session() -> None:
     rc = subprocess.run(cmd).returncode
     if rc != 0:
         print(f"veracage: could not start the empty session (rc={rc}). "
-              "Apps stay disabled until a volume is mounted.", file=sys.stderr)
+              "Apps stay disabled until a volume is open.", file=sys.stderr)
 
 
 def cmd_up(args: argparse.Namespace) -> int:
@@ -389,7 +389,7 @@ def cmd_open(args: argparse.Namespace) -> int:
     try:
         existing = leader.send_request(str(vault), {"cmd": "list"})
         if existing.get("ok") and existing.get("bootstrap_open", True):
-            print(f"veracage: {vault} is already mounted\n"
+            print(f"veracage: {vault} is already open\n"
                   f"Its window is in the compositor - use the toolbar to add apps.",
                   file=sys.stderr)
             return 2
@@ -537,8 +537,12 @@ def cmd_close(args: argparse.Namespace) -> int:
 def cmd_close_volume(args: argparse.Namespace) -> int:
     """Close ONE volume of the running session (Phase 5). `label` is the workspace
     directory name (a single component). pkexecs the helper's --close-volume,
-    which setns'es into the session and dismounts + deferred-closes just that
+    which setns'es into the session and really dismounts + closes just that
     volume, leaving the rest running. Driven by the compositor's per-volume close.
+
+    stdin and stdout are inherited, not captured: while apps hold the volume the
+    helper reports them and waits there for the caller's answer, so closing those
+    apps and finishing the job stays inside this ONE authentication.
     """
     label = args.label
     if not label or "/" in label or label in (".", ".."):
@@ -554,7 +558,7 @@ def main() -> int:
     p = argparse.ArgumentParser(prog="veracage")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    p_open = sub.add_parser("open", help="mount a volume into the Veracage session")
+    p_open = sub.add_parser("open", help="open a volume in the Veracage session")
     p_open.add_argument("volume")
     p_open.add_argument("app", nargs="?", default=None,
                         help="app key (see `veracage configure --list`)")
@@ -584,11 +588,11 @@ def main() -> int:
     p_list.add_argument("volume")
     p_list.set_defaults(func=cmd_list)
 
-    p_close = sub.add_parser("close", help="close the running session (dismount every volume)")
+    p_close = sub.add_parser("close", help="close the running session (every volume)")
     p_close.add_argument("volume")
     p_close.set_defaults(func=cmd_close)
 
-    p_cv = sub.add_parser("close-volume", help="dismount one volume of the session")
+    p_cv = sub.add_parser("close-volume", help="close one volume of the session")
     p_cv.add_argument("label", help="the volume's label (workspace directory name)")
     p_cv.set_defaults(func=cmd_close_volume)
 

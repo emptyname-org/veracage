@@ -114,12 +114,19 @@ _MODIFIER_KEYS = ("system", "none", "altwin:ctrl_win", "altwin:alt_win",
 _MODIFIER_GROUPS = ("altwin", "ctrl")
 
 
+# Host-detection tools (kreadconfig, gsettings, fc-match) run on the `veracage
+# open` path. One that hangs would block a mount for as long as it hangs, so
+# every probe is bounded: no answer in this long is read as "not installed".
+_PROBE_TIMEOUT = 2.0
+
+
 def _run(bin_: str, args: list[str]) -> str | None:
     """Run a command, return trimmed stdout, or None on any failure."""
     import subprocess
     try:
-        r = subprocess.run([bin_, *args], capture_output=True, text=True)
-    except OSError:
+        r = subprocess.run([bin_, *args], capture_output=True, text=True,
+                           timeout=_PROBE_TIMEOUT)
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         return None
     if r.returncode != 0:
         return None
@@ -179,6 +186,19 @@ def host_keyboard() -> tuple[str, str, str, str]:
         return ("", "", "", "")
     return (read("Model") or "", read("LayoutList") or "",
             read("VariantList") or "", read("Options") or "")
+
+
+def host_single_click() -> bool:
+    """Whether the host desktop opens files on a SINGLE click (KDE's
+    `[KDE] SingleClick` in kdeglobals). Undetectable hosts get False: KDE's own
+    built-in default is single click, so an unseeded sandbox opens files on one
+    click even when the host is set to two, which is the surprise this exists to
+    remove."""
+    for tool in ("kreadconfig6", "kreadconfig5"):
+        v = _run(tool, ["--group", "KDE", "--key", "SingleClick"])
+        if v is not None:
+            return v.strip().lower() == "true"
+    return False
 
 
 def modifier_options(host_options: str, choice: str) -> str:
@@ -347,7 +367,7 @@ class Config:
     theme: str = "light"                  # compositor/agent egui theme: light|dark|system
     ui_font: str = "system"               # UI font key (see _VALID_FONTS); system = host
     ui_font_size: str = "system"          # "system" (host size) | a point size
-    window_size: str = "default"          # compositor default window size
+    window_size: str = "default"          # window size at compositor start
     modifier_keys: str = "system"         # modifier mapping (see _MODIFIER_KEYS)
     exchange: bool = True                 # host<->volume shared directory
     exchange_dir: str | None = None       # default ~/Veracage/Exchange when unset
@@ -432,6 +452,12 @@ def load() -> Config:
     # passed through to the sandbox.
     exchange = _coerce_bool(default.get("exchange", True), "default.exchange")
     exchange_dir = default.get("exchange_dir") or None
+    if exchange_dir is not None and not isinstance(exchange_dir, str):
+        # It becomes a path (and a bwrap argument). A non-string used to
+        # raise out of cfg.exchange_path() and traceback `veracage open`.
+        print(f"veracage: invalid exchange_dir {exchange_dir!r}, using the default",
+              file=sys.stderr)
+        exchange_dir = None
     clip_clear = _coerce_bool(default.get("clip_clear", True), "default.clip_clear")
     debug = _coerce_bool(default.get("debug", False), "default.debug")
     clip_clear_timeout = _coerce_clip_timeout(
@@ -534,7 +560,13 @@ def save(cfg: Config) -> Path:
         lines += [f'{action:<9} = "{_esc(cfg.shortcuts.get(action, _DEFAULT_SHORTCUTS[action]))}"']
     lines += [""]
     for key, a in cfg.apps.items():
-        lines += [f"[apps.{key}]",
+        # Quoted like the [volumes."..."] tables below. A bare key is only
+        # valid TOML for [A-Za-z0-9_-], and an app key that is not (a
+        # hand-edited [apps."VS Code"], or `configure --key "my key"`) used to
+        # be written back unquoted: the file then failed to parse and the NEXT
+        # load silently fell back to an empty config, losing every app, the
+        # theme, the shortcuts and every per-volume override.
+        lines += [f'[apps."{_esc(key)}"]',
                   f'name     = "{_esc(a.name)}"',
                   f'exec     = "{_esc(a.exec)}"',
                   ""]
@@ -717,16 +749,17 @@ def publish_apps(cfg: Config) -> None:
         f"{a.key}\t{a.name}\n" for a in cfg.apps.values()
         if a.key and len(a.key) <= 64 and "/" not in a.key and a.key != ".."
     )
-    # Each file the compositor reads on its scan: the app list, the default
-    # window size (it resizes live), the UI font (path + base size), and the
-    # keyboard shortcuts. All published atomically (temp + replace).
+    # Each file the compositor reads on its scan: the app list, the UI font
+    # (path + base size), and the keyboard shortcuts. All published atomically
+    # (temp + replace). The window size is NOT here: it applies when the window
+    # is created, forwarded as VERACAGE_WINDOW_SIZE by cli.py.
     _publish_atomic(pub, "config.apps", apps)
-    _publish_atomic(pub, "window.size", cfg.window_size + "\n")
     _publish_atomic(pub, "theme", cfg.theme + "\n")
     # The app-side font (family + points): the leader builds the sandbox's
-    # kdeglobals from this and pub/theme.
+    # kdeglobals from this, pub/theme and pub/singleclick.
     family, points = app_font(cfg)
     _publish_atomic(pub, "appfont", f"{family}\n{points:g}\n")
+    _publish_atomic(pub, "singleclick", f"{1 if host_single_click() else 0}\n")
     _publish_atomic(pub, "font",
                     f"{font_file(cfg.ui_font)}\n{base_font_size(cfg.ui_font_size, cfg.ui_font)}\n")
     _publish_atomic(pub, "shortcuts",

@@ -70,6 +70,10 @@ MIMEAPPS_SEED = Path("/run/veracage/pub/mimeapps.list")
 # values are the desktop's own scheme files, not ours.
 THEME_PUB = Path("/run/veracage/pub/theme")
 APPFONT_PUB = Path("/run/veracage/pub/appfont")
+# The host desktop's click behaviour ("1" = open on a single click), published by
+# config.host_single_click. Seeded too, because KDE's own default is single click
+# and an unseeded sandbox would ignore a host set to double click.
+SINGLECLICK_PUB = Path("/run/veracage/pub/singleclick")
 COLOR_SCHEMES = {
     "dark": Path("/usr/share/color-schemes/BreezeDark.colors"),
     "light": Path("/usr/share/color-schemes/BreezeLight.colors"),
@@ -379,7 +383,7 @@ def _reap_children(state: _LeaderState) -> None:
                       f"after {now - launched_at:.1f}s")
         _clear_status()
         if now - launched_at < _EARLY_EXIT_SECONDS:
-            _post_notice(f"{label} failed to launch (exited immediately)")
+            _post_notice(f"{label} failed to launch.")
 
 
 # --------------------------------------------------------- accept / serve --
@@ -478,7 +482,19 @@ def _write_apps_file(state: _LeaderState) -> None:
     title = _sanitize_label(state.volume_label or "Volume")
     volumes = "\t".join(_sanitize_label(v) for v in state.volumes)
     body = [_app_socket_path(state).name, title, volumes, str(opener), *names]
-    _apps_file_path(state).write_text("\n".join(body) + "\n")
+    # Atomic, and 0600: the compositor polls this file, so a truncate-then-write
+    # can be read mid-update (the toolbar loses its launchers and volume list
+    # for a tick), and the runtime dir is world-traversable.
+    path = _apps_file_path(state)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text("\n".join(body) + "\n")
+        tmp.chmod(0o600)
+        tmp.replace(path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
 
 
 def _unpublish_apps(state: _LeaderState) -> None:
@@ -487,19 +503,64 @@ def _unpublish_apps(state: _LeaderState) -> None:
             p.unlink()
 
 
+# The non-numeric lines the toolbar socket accepts. Must match CLOSE_VERB and
+# CLOSE_APPS_VERB in the compositor's toolbar.rs.
+#   close       end this session (the human closed the Veracage window)
+#   close-apps  stop the apps but KEEP the session, so a volume they hold can be
+#               dismounted for real (a running app pins the dm device)
+_CLOSE_VERB = "close"
+_CLOSE_APPS_VERB = "close-apps"
+
+
 def _accept_app_launch(app_srv: socket.socket, state: _LeaderState) -> None:
-    """A toolbar click: read a bare app index and launch that enabled app."""
+    """A toolbar poke: an app index launches that enabled app, `close` ends the
+    session. Only the veracage uid can reach this socket."""
     conn, _ = app_srv.accept()
     with conn:
         conn.settimeout(2.0)
         try:
-            idx = int(conn.recv(64).decode().strip())
-        except (ValueError, OSError):
+            line = conn.recv(64).decode().strip()
+        except (OSError, UnicodeDecodeError):
+            return
+        if line == _CLOSE_VERB:
+            # The serve loop breaks on this, terminates the apps and exits, which
+            # stops the transient unit and runs its ExecStopPost dismount.
+            state.closing = True
+            return
+        if line == _CLOSE_APPS_VERB:
+            # Blocks for the terminate grace, which is the point: the caller
+            # dismounts as soon as this returns, and until every app is gone the
+            # volume's dm device stays in use and cannot be closed.
+            _terminate_children(state)
+            state.children.clear()
+            _post_apps_closed()
+            return
+        try:
+            idx = int(line)
+        except ValueError:
             return
         if 0 <= idx < len(state.app_specs):
             r = _launch_app(state, state.app_specs[idx])
             if not r["ok"]:
                 print(f"veracage: toolbar launch: {r['error']}", file=sys.stderr)
+
+
+def _post_apps_closed() -> None:
+    """Touch `/run/veracage/rt/closeapps.done` so the human side knows the apps
+    are really gone and a dismount that they hold can be retried. Only the
+    leader knows the moment (it reaps them), and rt is veracage-owned but
+    world-traversable, so this is the one direction the signal can travel.
+    Best-effort: without it the retry just does not happen and the volume stays
+    mounted, which is the safe outcome."""
+    path = COMPOSITOR_RUNTIME / "closeapps.done"
+    tmp = COMPOSITOR_RUNTIME / f"closeapps.{os.getpid()}.tmp"
+    try:
+        tmp.write_text(f"{time.time_ns()}\n")
+        tmp.chmod(0o644)
+        tmp.replace(path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
 
 
 # ------------------------------------------------------------- places ------
@@ -558,11 +619,13 @@ def _bookmark(href: str, title: str, icon: str, ident: str) -> str:
 def _places_xbel(labels: list[str], with_exchange: bool) -> str:
     # One Places entry per open volume, each pointing at /vaults/<label>. The
     # names are the workspace directory names (helper-sanitised: no spaces/slashes),
-    # so they need no URL-encoding.
+    # so they need no URL-encoding. With NO volume open (the front-door
+    # scratchpad) there is no volume entry at all: a placeholder would point the
+    # file manager at a /vaults path that does not exist.
     body = "".join(
         _bookmark(f"file:///vaults/{lbl}", lbl, "drive-harddisk-encrypted",
                   f"veracage-vault-{lbl}")
-        for lbl in (labels or ["Volume"])
+        for lbl in labels
     )
     if with_exchange:
         # The shared host<->vault directory, mounted at /exchange in the sandbox.
@@ -585,9 +648,11 @@ def _qt_font(family: str, points: float) -> str:
     return f"{family},{points:g},-1,5,50,0,0,0,0,0"
 
 
-def _kdeglobals_body(theme: str, family: str, points: float) -> str:
-    """The kdeglobals seeded into the sandbox: the Veracage font and theme, so
-    apps match the compositor instead of falling back to their built-in look.
+def _kdeglobals_body(theme: str, family: str, points: float,
+                     single_click: bool) -> str:
+    """The kdeglobals seeded into the sandbox: the Veracage font, theme and click
+    behaviour, so apps match the compositor and the host instead of falling back
+    to their built-in look.
 
     The colours are the desktop's own scheme file verbatim (its [Colors:*] and
     [ColorEffects:*] groups are exactly what kdeglobals reads), minus its
@@ -607,22 +672,33 @@ def _kdeglobals_body(theme: str, family: str, points: float) -> str:
         f"Theme={ICON_THEMES.get(theme, 'breeze')}",
         "",
     ]
+    # [KDE] carries both the widget style (a scheme without Breeze widgets looks
+    # half-applied) and the click behaviour, and it is written exactly once:
+    # folded into the scheme's own [KDE] group when it has one (that group also
+    # holds its contrast), appended otherwise.
+    kde_group = [
+        "[KDE]",
+        f"SingleClick={'true' if single_click else 'false'}",
+        "widgetStyle=Breeze",
+    ]
     scheme = COLOR_SCHEMES.get(theme)
+    wrote_kde = False
     if scheme is not None:
         try:
             in_general = False
             for line in scheme.read_text().splitlines():
                 if line.startswith("["):
                     in_general = line.strip() == "[General]"
-                    # The style lives with the colours: a scheme without Breeze
-                    # widgets looks half-applied.
                     if line.strip() == "[KDE]":
-                        lines += [line, "widgetStyle=Breeze"]
+                        wrote_kde = True
+                        lines += kde_group
                         continue
                 if not in_general:
                     lines.append(line)
         except OSError as e:
             print(f"veracage: could not read {scheme}: {e}", file=sys.stderr)
+    if not wrote_kde:
+        lines += kde_group
     return "\n".join(lines) + "\n"
 
 
@@ -633,8 +709,15 @@ def _write_kdeglobals_file() -> Path | None:
     try:
         theme = THEME_PUB.read_text().strip()
         family, points = APPFONT_PUB.read_text().split("\n")[:2]
+        # An unpublished/unreadable click setting means double click, the same
+        # fallback config.host_single_click uses for an undetectable host.
+        try:
+            single_click = SINGLECLICK_PUB.read_text().strip() == "1"
+        except OSError:
+            single_click = False
         path = Path(os.environ["XDG_RUNTIME_DIR"]) / "kdeglobals"
-        path.write_text(_kdeglobals_body(theme, family.strip(), float(points)))
+        path.write_text(
+            _kdeglobals_body(theme, family.strip(), float(points), single_click))
         return path
     except (OSError, KeyError, ValueError) as e:
         print(f"veracage: could not seed the app theme: {e}", file=sys.stderr)
@@ -782,7 +865,20 @@ def run_leader(mountpoint: str, app_specs: list, first_app: dict | None,
         srv.close()
 
 
-def _terminate_children(state: _LeaderState, timeout: float = 3.0) -> None:
+# How long the apps get between SIGTERM and SIGKILL when the session ends. Long
+# enough for an app that handles SIGTERM to flush and exit (three seconds was not,
+# and an app killed mid-write loses whatever it had not written to the volume);
+# bounded, because one app that ignores it must not block the teardown. The
+# compositor stays up for this whole window (it exits only once the volumes are
+# really closed), so the wait is not a frozen screen.
+#
+# Public because the suspend hook has to outwait it: sleep_hook.GRACE_SECONDS is
+# derived from this, and SIGKILLing the leader sooner would kill the apps
+# mid-flush, which is exactly what this grace exists to prevent.
+TERMINATE_GRACE = 8.0
+
+
+def _terminate_children(state: _LeaderState, timeout: float = TERMINATE_GRACE) -> None:
     """SIGTERM tracked apps, wait up to `timeout`s, then SIGKILL stragglers."""
     for pid in list(state.children):
         with contextlib.suppress(ProcessLookupError):

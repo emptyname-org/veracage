@@ -29,12 +29,13 @@ from __future__ import annotations
 import contextlib
 import os
 import signal
+import stat
 import sys
 import time
 import tomllib
 from pathlib import Path
 
-from . import cleanup
+from . import cleanup, leader
 
 # systemd passes the transition name as argv[1]; these are the sleep states.
 SLEEP_STATES = frozenset(
@@ -42,9 +43,18 @@ SLEEP_STATES = frozenset(
 )
 
 # Per-session teardown budget (seconds). Graceful window first, then force.
-GRACE_SECONDS = 6.0
+# The graceful window must OUTLAST the leader's own app shutdown budget
+# (leader.TERMINATE_GRACE): the leader SIGTERMs its apps, waits that long for
+# them to flush, and only then exits and lets the dm devices close. SIGKILLing
+# it sooner (6s against the leader's 8s) killed the apps mid-write and left the
+# filesystem dirty, which is what the leader's grace exists to prevent.
+GRACE_SECONDS = leader.TERMINATE_GRACE + 1.0
 FORCE_SECONDS = 4.0
 POLL_INTERVAL = 0.1
+
+# Most of a config.toml is comments and a handful of keys; anything past this
+# is not something this hook needs to read as root.
+_CONFIG_READ_CAP = 64 * 1024
 
 
 
@@ -63,10 +73,28 @@ def owner_wants_dismount(uid: str) -> bool:
     except (KeyError, ValueError):
         return True
     cfg = home / ".config" / "veracage" / "config.toml"
+    # Root, reading a path the session owner controls, inside a hook that
+    # BLOCKS the sleep transition (systemd-suspend.service has no start
+    # timeout). So: no symlink following, a regular file only, non-blocking
+    # (a FIFO there would otherwise park the hook, and the machine, forever),
+    # and a size cap.
     try:
-        with cfg.open("rb") as f:
-            data = tomllib.load(f)
-    except (OSError, tomllib.TOMLDecodeError):
+        fd = os.open(cfg, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return True
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            print(f"veracage-sleep: {cfg} is not a regular file; closing anyway",
+                  file=sys.stderr)
+            return True
+        raw = os.read(fd, _CONFIG_READ_CAP)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    try:
+        data = tomllib.loads(raw.decode())
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
         return True
     action = data.get("default", {}).get("suspend_action", "dismount")
     return action != "ignore"
@@ -130,12 +158,15 @@ def teardown_shared_session(lock_path: Path) -> None:
     leader = _session_leader_pid(lock_path)
 
     # Graceful: SIGTERM the leader → apps terminated, workspace NS destroyed,
-    # the helper parent / ExecStopPost closes every volume's dm.
+    # the helper parent / ExecStopPost closes every volume's dm. With no
+    # leader to signal there is nothing to be graceful about: skip straight
+    # to closing the devices ourselves rather than burn the whole budget
+    # waiting for an exit that already happened.
     if leader is not None:
         with contextlib.suppress(ProcessLookupError):
             os.kill(leader, signal.SIGTERM)
-    if _wait_dms_gone(dm_names, GRACE_SECONDS):
-        return
+        if _wait_dms_gone(dm_names, GRACE_SECONDS):
+            return
 
     # Force: SIGKILL the leader (bwrap --die-with-parent takes the apps, freeing
     # the mounts), then close the devices ourselves via the cleanup path.
