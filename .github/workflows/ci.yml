@@ -94,21 +94,18 @@ jobs:
   audit:
     name: dependency advisories (cargo-audit)
     runs-on: ubuntu-latest
-    # Advisory, not blocking: a finding here is usually fixed by an UPSTREAM
-    # release, so failing the build would only teach people to ignore it. It
-    # still has to be visible, which is what this job is for. `make audit` runs
-    # the same check locally.
-    continue-on-error: true
+    # Blocking, because `tests/audit-reviewed.txt` now separates a NEW advisory
+    # from one already reviewed: an advisory that only an upstream release can
+    # fix goes on that list with its reason, and everything else is a finding
+    # someone has to look at. This job ran bare `cargo-audit` before the list
+    # existed, which made it fail on the reviewed ones and taught nobody
+    # anything. `make audit` is the same command the local gate runs.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-audit
-      - name: helper (the tree that matters most, 11 crates)
-        run: cargo-audit audit --file helper-rs/Cargo.lock
-      - name: agent
-        run: cargo-audit audit --file agent-rs/Cargo.lock
-      - name: compositor
-        run: cargo-audit audit --file compositor-rs/Cargo.lock
+      - name: make audit (all three trees, reviewed advisories excepted)
+        run: make audit
 
   policy:
     name: polkit policy is well-formed
