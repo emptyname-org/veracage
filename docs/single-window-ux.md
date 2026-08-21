@@ -27,42 +27,59 @@ and delegates host-side actions to the broker.
   into one prompt). So apps are launchable immediately, sandboxed against an
   empty workspace plus `/exchange` - a secure scratchpad (open an editor, work
   with no network or host filesystem, then clipboard-out or save to the
-  shared directory). File > Mount volume adds a volume to that same session via
+  shared directory). File > Open volume adds a volume to that same session via
   the add-volume path. Apps launched after the mount see it (a fixed-at-launch
   mount namespace, same rule as multi-volume). If the empty session can't
   bootstrap, the Apps menu falls back to showing the configured apps disabled
-  until a volume is mounted (the compositor reads `pub/config.apps`).
+  until a volume is open (the compositor reads `pub/config.apps`).
 
 ### Menu layout
 
 | Menu | Items |
 |---|---|
-| **File** | Mount volume... / Shared directory / Dismount > (one item per mounted volume) / Quit |
+| **File** | Open volume... / Shared directory / Close volume > (one item per open volume, plus All) / Quit |
 | **Clipboard** | Copy out / Paste in (configurable shortcuts, defaults Ctrl+Alt+C / Ctrl+Alt+V) |
 | **Apps** | one item per app, with its host icon / Configure apps... |
-| **Settings** | System Integration... (clipboard clear, idle dismount, suspend, shared directory) / Appearance... (theme, window size, font) / Keyboard and Shortcuts... (modifier mapping, clipboard binds) |
+| **Settings** | System Integration... (clipboard clear, idle close, suspend, shared directory) / Appearance... (theme, window size, font) / Keyboard and Shortcuts... (modifier mapping, clipboard binds) |
 | **Help** | Help... / About Veracage... |
 
-**Clipboard** and **Apps** (launch, with a volume mounted) act in-process in the
+**Clipboard** and **Apps** (launch, with a volume open) act in-process in the
 compositor: the clipboard is compositor-owned, and an app launch goes to the
 leader over the veracage-owned socket. Everything needing host-side work
-(open, exchange, configure, settings, help, about, dismount) emits a command
+(open, exchange, configure, settings, help, about, close-volume) emits a command
 to the broker.
+
+**Quit** (and the window's close button) goes to the leader over that same
+socket, as a `close` line: the leader stops its apps and exits, which stops its
+transient unit and runs the `ExecStopPost` cleanup that closes the dm devices.
+That is the passwordless teardown path (polkit `org.veracage.cleanup`), unlike
+the per-volume Close volume, which pkexecs the full helper and does prompt. The
+window stays up while it runs (no banner: quitting is not news) and goes once the
+session lock is gone, which the cleanup unlinks only after every device is
+closed.
 
 ## Compositor -> broker command channel
 
-On a menu selection needing the broker, the compositor writes
-`/run/veracage/rt/cmd.req`, one verb line (verbs: `open`, `configure`,
-`settings`, `shortcuts`, `exchange`, `help`, `about`, `close-volume:<label>`.
+On a menu selection needing the broker, the compositor APPENDS to
+`/run/veracage/rt/cmd.log`, one `<nonce>\t<verb>` line per verb (verbs:
+`open`, `configure`, `settings`, `appearance`, `shortcuts`, `exchange`, `help`,
+`about`, `close-volume:<label>`.
 Apps launch in-process over the leader socket, not through the broker),
 mode 0644 (`/run/veracage/rt` is `0711 veracage`, so the broker traverses
-and reads by exact path). The broker polls the file's mtime and dispatches
-new verbs.
+and reads by exact path). The broker drains everything after the last nonce it
+handled, oldest first, and a trailing line with no newline is left for the next
+poll rather than dispatched half-written.
+
+An append-only log rather than a file replaced in place: the earlier `cmd.req`
+was a single slot, so two batches written inside one 300ms broker poll, or any
+batch written while the broker was busy, collapsed into the last one and the
+rest were lost silently. The compositor empties the log at startup, because the
+broker cannot unlink in `rt` (0711 veracage) and only ever reads there.
 
 **Why this is safe.** The authority lives in the compositor: a click on its
 menu is a real user action a same-uid attacker cannot forge. The attacker is
 a different uid than `veracage`, can't be a client of the compositor, and the
-host compositor won't grant it input synthesis. It cannot write `cmd.req`
+host compositor won't grant it input synthesis. It cannot write `cmd.log`
 either: `/run/veracage/rt` is `0711 veracage`, so it can't create files
 there. The verbs themselves aren't secret (0644-readable is fine, at most an
 observer learns "an open was requested"). The broker only ever acts on
@@ -82,7 +99,7 @@ compositor validates everything it reads from there (sizes, key shapes,
 icon dimensions).
 
 The same channel carries the compositor's live look: `theme`, `font`,
-`window.size`, `shortcuts`, `clipclear` and `keyboard` (the host desktop's XKB
+`shortcuts`, `clipclear` and `keyboard` (the host desktop's XKB
 configuration with the configured modifier mapping applied). The discovery scan
 picks each up within 250ms, so a Settings change applies to the running session
 instead of waiting for a restart.
@@ -135,7 +152,7 @@ dialogs, not a daemon.
 - **Veracage side:** the helper idmap-mounts it (human to veracage,
   `nosuid,nodev,noexec`) into the private NS. The sandbox binds it at
   **`/exchange`** (top-level, NOT under `/vaults`, so the "everything in
-  HOME is encrypted" invariant holds), with a seeded "Exchange (host-shared)"
+  HOME is encrypted" invariant holds), with a seeded "Shared directory"
   Place.
 - **UX:** a file dropped on either side appears instantly on the other,
   owned natively by the user. The idmap reverse-maps the sandbox's writes
@@ -157,6 +174,8 @@ outside the threat model (`veracage-design.md` section 10). Veracage
 does not defend the volume against the apps the user chose to run. Two cheap
 in-scope guards: the helper validates the caller-supplied exchange path
 (`O_NOFOLLOW`, owner == human, which stops `--exchange /etc`), and the mount
-is `nosuid,nodev,noexec`. Per-volume/global `exchange = false` turns it off.
+is `nosuid,nodev,noexec`. `exchange = false` under `[default]` turns it off.
+There is no per-volume override: `VolumeConfig` carries `default_app`,
+`display_name` and `backend` only.
 It is session-level (like the clipboard), independent of any volume.
 RAM-backing is a future config knob for no-plaintext-at-rest.

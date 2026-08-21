@@ -92,21 +92,68 @@ be dragged fully off left/right/bottom and become unreachable (no
 overview/keyboard move). Not a crash. *Fix:* keep a visible sliver on every
 edge.
 
+## [TRACK, needs a live desktop] Opening a file from the file manager does not raise or focus it
+Double-clicking a file in a sandboxed Dolphin opens the app, but its window does
+not take focus, and often appears behind Dolphin. Two mechanisms, one symptom:
+
+- **A new window is raised but never focused.** `new_toplevel`
+  (`handlers/xdg_shell.rs`) maps with `map_element(..., activate = true)`, which
+  smithay documents as "move it to top of the stack" and marks the new window
+  active - but the keyboard focus transfer right below it is deliberately
+  gated on `current_focus().is_none()` (anti focus-steal). So the new window is
+  on top and drawn active while typing still goes to Dolphin.
+- **An already-running app gets no new window at all.** KDE apps are
+  single-instance over the per-sandbox D-Bus (`dbus-run-session` per bwrap, and
+  a file manager spawns the opener *inside its own sandbox*), so the second open
+  hands the document to the running instance, which then tries to raise itself.
+
+The Wayland answer to the second one is `xdg_activation_v1`, and the compositor
+does not implement it - **but implementing it alone would not fix this host**:
+Debian 12's `qtwayland5` / `libqt5waylandclient5` 5.15.8 contain no
+`xdg_activation` at all (checked across every `.so` in both packages), so a Qt 5
+KDE app cannot request activation from any compositor. Upstream Qt gained it in
+6.3.
+
+*Fix:* compositor policy is the only lever that works for both cases today -
+focus a newly mapped toplevel unconditionally (optionally behind a setting).
+That reverses the anti-focus-steal rule, which is defensible here (a malicious
+sandboxed app is outside the threat model and every app is human-enabled) but is
+a deliberate decision, not a bug fix. Add `xdg_activation_v1` as well when the
+app set moves to Qt 6, so a well-behaved client can ask instead of the
+compositor guessing.
+`obsolete-if:` the sandbox becomes one bwrap instance per app *launch* (no
+shared D-Bus, so every open maps a fresh toplevel) AND focus-on-map lands.
+
+## [TRACK] Live window resize was removed, not fixed
+Settings > Appearance used to resize the running window. It was withdrawn (the
+size now applies when the window is created, and the dropdown says so) because
+the resize left the menu bar laid out for the OLD width: the strip drawn at one
+size and hit-tested at another, flicker, and clicks landing on the wrong menu.
+
+**Dragging the window edge is fine** and always was, which is the clue: a manual
+resize arrives as a host configure -> `WindowEvent::SurfaceResized` ->
+`WinitEvent::Resized`, and that arm updates the output mode, forces a full
+redraw and re-lays out the strip. The programmatic path produced no such event.
+winit documents `request_surface_size` as "the applied size will be returned
+immediately, resize event in such case may not be generated", and it returned
+`Some(1280x800)` - applied, no event. So the surface resized while the output
+mode, egui's screen rect and the pointer gating all stayed at the old size.
+
+*Fix, if the setting is ever wanted live again:* when `request_surface_size`
+returns `Some(size)`, run the same update the `Resized` arm does rather than
+waiting for an event that is not coming. Roughly five lines, but it needs a live
+desktop to confirm, and the setting reads fine as a start-time one.
+
 ## Misc LOW - residuals + hardening
 - **`.apps` world-readable**: `leader.py` `write_text` creates
   `/run/veracage/rt/<id>.apps` 0644 in the 0711 dir -> any uid reads the
-  volume label + enabled-app names during a session. *Fix:*
-  `os.open(..., 0o600)`.
+  volume label + enabled-app names during a session. *Fixed:* `_write_apps_file`
+  now writes a pid-tagged temp file, chmods it 0600 and renames it into place
+  (which also removes the torn-read window the compositor's poll could hit).
 - **Volume mounts not `noexec`**: `helper-rs/main.rs` mounts `nodev,nosuid`
   only. Add `noexec` to block direct `execve` of a volume-resident binary
   (interpreted files still run). Gate per-volume if "run a binary from the
   volume" is ever wanted.
-- **`cleanup.py` `..` in mountpoint**: the post-close scratch delete gates on
-  `startswith("/run/veracage/")`, which allows `..`, a latent root
-  arbitrary-delete (`rmdir`/`rmtree`), not reachable today (the lock is
-  root-owned, the helper writes a validated path). *Fix:* match the helper's
-  `mountpoint_ok` (parent == `/run/veracage`, reject `..`), applied to the
-  `.raw`/`.run` siblings too.
 - **bwrap `--unshare-user --disable-userns`** (bwrap >= 0.8) would narrow the
   kernel attack surface a compromised app can reach. Confining the app is
   outside the threat model, so this is defense in depth only, not a fix this

@@ -1,6 +1,6 @@
 # Veracage - Design
 
-Veracage mounts an encrypted volume (LUKS or VeraCrypt) and runs apps against
+Veracage opens an encrypted volume (LUKS or VeraCrypt) and runs apps against
 it in a sandbox, so the decrypted contents stay unreadable to the rest of the
 host. Files and clipboard cross the boundary **only** on explicit user action.
 
@@ -31,7 +31,7 @@ data from leaking out, not to confine the app. **Non-goals:** local root
 trust domain), network from the sandbox, X11, multi-user. Full analysis in
 `uid-isolation.md`.
 
-**Functional:** F1 mount/dismount a LUKS or VeraCrypt volume with a passphrase
+**Functional:** F1 open/close a LUKS or VeraCrypt volume with a passphrase
 prompt. F2 launch any user-enabled app in the sandbox. F3 multiple apps and
 multiple volumes share one compositor session. F4 clean teardown on exit,
 crash, SIGKILL, suspend. F5 read-write volume access. F6 explicit,
@@ -178,7 +178,7 @@ lock + `veracage-<12hex>` device only) and `PKEXEC_UID`-owner-checked.
 ```toml
 [default]
 last_used_app  = "kate"
-suspend_action = "dismount"     # dismount on suspend, or "ignore"
+suspend_action = "dismount"     # close on suspend, or "ignore"
 clip_clear     = true           # auto-clear host clipboard after Copy out
 clip_clear_timeout = 30         # seconds before the auto-clear fires
 

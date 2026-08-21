@@ -28,7 +28,8 @@ and denies everyone.
 
 ## Access model
 
-- Apps run **as the veracage uid in the init namespace** (`setpriv` +
+- Apps run **as the veracage uid in the init namespace** (an in-process
+  `initgroups`/`setresgid`/`setresuid` drop in the helper, then
   `bwrap`). They are *not* inside the idmap userns: the relabel is a property
   of the mount, so a plain init-ns veracage-uid process reads it.
 - The human, root, and any other init-ns uid are **denied**. The file's
@@ -82,12 +83,19 @@ data from leaking out, not to cage the app.
 
 ## On-disk owner / portability
 
-idmap reads the volume's stored ownership and presents it as the veracage
-uid, so **volumes stay portable with zero on-disk changes**: open on any
-machine regardless of its local veracage-uid value. The helper detects the
-volume's owner at mount (stat the root after a plain mount) and maps
-`<that uid> → <veracage uid>`. Single-user volumes (the common case) have one
-owner. Multi-owner volumes would need a range map and are out of scope.
+idmap presents the volume's files as owned by the veracage uid without
+rewriting them, so the volume opens on any machine regardless of its local
+veracage-uid value.
+
+The mapping source is the **calling human's uid**, not a probe of the volume:
+`mount_volume_at_workspace` chowns the staged root to the caller (best effort,
+so a read-only or ownerless filesystem still mounts) and passes `human_uid` to
+`idmap_mount`. Files owned by any OTHER uid are therefore not mapped and appear
+as `nobody` inside the sandbox: a volume written on another machine under a
+different uid is readable only where its files are world-readable. Detecting the
+on-disk owner (stat the staged root) and mapping that instead would remove the
+restriction, and a multi-owner volume would need a range map. Both are out of
+scope today.
 
 ## Process architecture
 

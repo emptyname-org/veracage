@@ -32,7 +32,9 @@ from leaking out, not to confine the app.
 | Crashes carry no plaintext | The helper clears `coredump_filter` before it execs anything, so a core dump from the compositor, the session leader, `bwrap` or an app holds no memory at all. The setting survives `execve` and is inherited by children, so one call covers the whole session. The agent does the same for the passphrase it holds. `RLIMIT_CORE` is not the knob: the kernel ignores it when `kernel.core_pattern` is a pipe, which is the systemd default. |
 | Block device sealed | `/dev/mapper/veracage-*` is `root:disk 0660` + `UDISKS_IGNORE=1`: no unprivileged `open`, and no desktop "mount this drive" path. `57-veracage.rules` also sets `DM_UDEV_DISABLE_DISK_RULES_FLAG`, so udev never probes the decrypted filesystem into `/dev/disk/by-label/<label>` and `/dev/disk/by-uuid/<uuid>`, which would publish the volume's identity to every local user. |
 | Decrypted data has no path out to network / host FS | `bwrap` unshares pid/uts/ipc/cgroup/**net**, `--die-with-parent`, `--clearenv` + env allowlist, `HOME=/vaults`, host `$XDG_RUNTIME_DIR` hidden, with only the compositor's Wayland socket bound in. This keeps the volume data from leaking out. It protects the data, it is not a cage on the app (a malicious app is outside the threat model). |
-| Minimal host surface | `/usr` read-only, **curated** `/etc` (linker, fontconfig, tz, NSS, machine-id, TLS) instead of all of `/etc`, no host home, no D-Bus, no portals. The GPU exception: `/dev/dri` plus `/sys/dev/char` and `/sys/devices` read-only, which Mesa needs to pick the hardware driver. That exposes host *device metadata* (NIC addresses, DMI ids, the device tree) to the app, which the one-directional model accepts: it is not volume data, and a malicious app is outside the threat model. |
+| Minimal host surface | `/usr` read-only, **curated** `/etc` (linker, fontconfig, tz, NSS, machine-id, TLS) instead of all of `/etc`, no host home, no HOST D-Bus (each app gets a private `dbus-run-session` bus
+inside its own sandbox, so Qt/KDE apps do not stall on a missing bus), no
+portals. The GPU exception: `/dev/dri` plus `/sys/dev/char` and `/sys/devices` read-only, which Mesa needs to pick the hardware driver. That exposes host *device metadata* (NIC addresses, DMI ids, the device tree) to the app, which the one-directional model accepts: it is not volume data, and a malicious app is outside the threat model. |
 | Clipboard isolation | The sandbox runs against the project's own nested `veracage-compositor`, which owns the selection. **No `data-control` global** is exposed to apps, so a clipboard manager inside the sandbox can't scrape it. Host<->sandbox transfer is one-shot, user-triggered (Ctrl+Alt+V/C or the toolbar), text-only. After a Copy out, the host clipboard is auto-cleared after a timeout (default 30 seconds) and again on exit, so a copied secret does not linger on the host. |
 | Control socket carries no execution | The human-owned control socket exposes `ping`/`list`/`close`/`set-apps`: deliberately no command execution and no file transfer, because any same-uid process can reach it. `set-apps` only replaces the enabled-app list, the same human-trust data as `config.toml`. |
 | File transfer confined to the shared directory | Host<->volume transfer goes through `~/Veracage/Exchange`, idmap-mounted at `/exchange`: a separate mount from the volume, `nosuid,nodev,noexec`, path validated by the helper. Only what the user consciously placed there is exposed. |
@@ -54,8 +56,9 @@ user via pkexec (`auth_self_keep`), so:
   _compositor}`, not a caller argument.
 - forwarded env vars are **allowlisted** (no `LD_PRELOAD` /
   `LD_LIBRARY_PATH` smuggling).
-- it rejects unknown arguments, and the mountpoint is validated to a child of
-  `/run/veracage`.
+- it rejects unknown arguments. There is no caller-supplied mountpoint at all:
+  the helper derives it as `<workspace>/<label>` from the volume's own label,
+  through `sanitize_label`, which reduces the label to one safe path component.
 - the `--session` id is **bound to `PKEXEC_UID`** (it is the caller's own uid),
   so a second local user can't `setns`/mount/close against another user's
   session by passing a foreign session id. `veracage-cleanup` enforces the
@@ -80,7 +83,7 @@ contract.
   `/sys/block/loopN/loop/backing_file` and the helper's `/proc/<pid>/cmdline`
   (the volume's path), polkit's own journal line for the mount, and the recent
   files the volume picker leaves behind (`known-problems.md`). Veracage avoids
-  adding to that where it can: the dm device is named by hash, the transient
+  adding to that where it can: the dm device is named at random, the transient
   unit and its description carry the same hash instead of the filename, and
   `57-veracage.rules` keeps the decrypted filesystem's label and UUID out of
   `/dev/disk`. The kernel and polkit surfaces are not ours to close.
