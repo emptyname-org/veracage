@@ -156,7 +156,10 @@ fn read_font(path: &str) -> Option<Vec<u8>> {
         return None;
     }
     let md = std::fs::metadata(path).ok()?;
-    (md.is_file() && md.len() <= 20_000_000).then(|| std::fs::read(path).ok())?
+    let bytes = (md.is_file() && md.len() <= 20_000_000).then(|| std::fs::read(path).ok())??;
+    // epaint panics on a face it cannot parse, and this runs inside the redraw
+    // callback (see fonts::is_scalable_font).
+    crate::fonts::is_scalable_font(&bytes).then_some(bytes)
 }
 
 #[cfg(test)]
@@ -167,7 +170,7 @@ mod tests {
     fn rasterises_visible_glyphs_with_premultiplied_alpha() {
         // The blit is the part that is ours (epaint does layout and glyphs), so
         // check it actually produces ink: a sized buffer with non-zero coverage.
-        let (w, h, rgba) = rasterise("No volume mounted", "File > Mount volume", "", 16.0)
+        let (w, h, rgba) = rasterise("No volume open", "File > Open volume", "", 16.0)
             .expect("the embedded epaint font must rasterise");
         assert!(w > 100 && h > 20, "unexpected block size {w}x{h}");
         assert_eq!(rgba.len(), (w * h * 4) as usize);
@@ -179,8 +182,8 @@ mod tests {
 
     #[test]
     fn second_line_is_optional_and_nothing_means_no_buffer() {
-        let (_, tall, _) = rasterise("1 volume mounted (work)", "hint", "", 16.0).unwrap();
-        let (_, short, _) = rasterise("1 volume mounted (work)", "", "", 16.0).unwrap();
+        let (_, tall, _) = rasterise("1 volume open (work)", "hint", "", 16.0).unwrap();
+        let (_, short, _) = rasterise("1 volume open (work)", "", "", 16.0).unwrap();
         assert!(short < tall, "an empty second line should not reserve its height");
         assert!(HintText::default().buffer("", "", "", 16.0).is_none());
     }

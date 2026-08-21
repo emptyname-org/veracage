@@ -87,6 +87,17 @@ pub fn push_from_host(state: &mut State) {
     set_data_device_selection(&state.display_handle, &state.seat, mimes(), ());
 }
 
+/// Drop the sandbox selection we are serving (Paste in's text) and stop offering
+/// it. Called when the last volume closes: the compositor outlives every volume,
+/// so without this a password pasted into one volume is still handed, byte for
+/// byte, to the apps of a volume opened hours later. The host-side copy has its
+/// own auto-clear; this is the sandbox side of the same rule.
+pub fn clear_sandbox_selection(state: &mut State) {
+    if state.clip_source.take().is_some() {
+        set_data_device_selection(&state.display_handle, &state.seat, Vec::new(), ());
+    }
+}
+
 /// Pull sandbox selection -> host clipboard (Copy out). Reads the current sandbox
 /// selection (an app's, or our own pushed one) and stores it to the host via
 /// data-control, which needs no focus serial.

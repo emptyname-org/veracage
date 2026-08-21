@@ -56,6 +56,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let display: Display<State> = Display::new()?;
     let mut state = State::new(&mut event_loop, display, socket);
 
+    // The command log is append-only and the broker cannot unlink in our runtime
+    // dir, so we start it empty: otherwise it carries every verb of every earlier
+    // session forever.
+    crate::toolbar::reset_command_log();
+
     // Open our nested output window on the host (via the inherited WAYLAND_SOCKET).
     // The host clipboard bridge is set up inside init_winit (needs the backend).
     crate::winit::init_winit(&mut event_loop, &mut state)?;

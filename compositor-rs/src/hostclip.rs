@@ -429,6 +429,10 @@ fn clear_pushed(state: &mut State, conn: &Connection, queue: &mut wayland_client
     let Some(pushed) = state.pushed.take() else {
         return;
     };
+    // `serve` holds the same bytes for host pasters. Dropping only `pushed` left
+    // the text of the last Copy out resident in this worker until the next one,
+    // i.e. across every volume open and close, while the UI said it was cleared.
+    state.serve = Arc::new(Vec::new());
     // Read the current primary selection (if the device supports it) so
     // `plan_clear` can decide whether it still holds our value.
     let current_primary = if state.has_primary {

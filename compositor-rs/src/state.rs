@@ -60,6 +60,27 @@ pub fn xkb_config(kb: &crate::toolbar::KeyboardConfig) -> smithay::input::keyboa
     }
 }
 
+/// The stages of quitting Veracage, in order. The window stays up throughout.
+///
+/// `AskingApps` is the polite phase, and it has no time limit and no override:
+/// every app window is sent the same close request its own title-bar X would
+/// send, so an app with unsaved work puts its own "save changes?" dialog up and
+/// the human answers it INSIDE the still-open Veracage window. Nothing is killed
+/// and nothing is dismounted while any app window is still there. Asking to quit
+/// again just asks the windows again.
+///
+/// `Dismounting` is the point of no return: the sessions are told to close,
+/// which stops their apps for real, drops their namespaces and closes the dm
+/// devices. Only when the last session lock is gone - the cleanup unlinks it
+/// solely after every device is closed - does the compositor exit. Neither phase
+/// puts a banner up: quitting is not news, and the window going away when it is
+/// done is the feedback.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Closing {
+    AskingApps,
+    Dismounting,
+}
+
 pub struct State {
     pub start_time: std::time::Instant,
     pub socket_name: OsString,
@@ -141,11 +162,6 @@ pub struct State {
     /// listed in the Apps menu when no volume is mounted.
     pub cfg_apps: Vec<crate::toolbar::ConfigApp>,
 
-    /// The window size last applied from `/run/veracage/pub/window.size`, so a
-    /// Settings change resizes the live window (initialized to the startup env
-    /// value, so the first matching scan is a no-op).
-    pub window_size_applied: String,
-
     /// Active Veracage keyboard shortcuts (clipboard transfers), refreshed from
     /// `/run/veracage/pub/shortcuts` on the discovery scan.
     pub binds: crate::shortcuts::Binds,
@@ -169,10 +185,33 @@ pub struct State {
     /// whether the human is actually using Veracage.
     pub auto_dismount: u32,
     pub last_input: std::time::Instant,
+    /// When the session sockets were last probed for a leader that has gone away,
+    /// and the sockets that had none. See `winit::run_discovery_scan`.
+    pub last_leader_probe: std::time::Instant,
+    pub dead_leaders: Vec<std::path::PathBuf>,
+    /// True once the idle timer has asked for this idle episode's volumes to
+    /// close, cleared by the next input. Without it the request repeats every
+    /// DISMOUNT_RETRY_GAP for as long as the human is away.
+    pub idle_dismount_asked: bool,
     /// When the last dismount was requested, so the requests are paced: they go
     /// through a single-verb file the broker polls, and one per volume sent back
     /// to back would overwrite each other.
     pub last_dismount_request: Option<std::time::Instant>,
+    /// Volume labels still waiting to be dismounted, drained one per pacing gap
+    /// (Dismount > All queues them all; the idle timer queues one at a time).
+    pub dismount_queue: Vec<String>,
+
+    /// How far the quit has got, or None when we are not quitting. The window
+    /// stays up for the whole of it: Veracage must never disappear while a
+    /// volume is still decrypted (see `crate::winit::begin_quit`).
+    pub closing: Option<Closing>,
+
+    /// The broker's last seen clear-the-apps request, and whether we are still
+    /// waiting for the app windows to go before telling the sessions to stop
+    /// them (see the discovery scan). This is the dismount path, not the quit
+    /// path: the session keeps running afterwards.
+    pub closeapps_seen: u128,
+    pub clearing_apps: bool,
 
     /// The current drag-and-drop icon surface (the "ghost" that follows the
     /// cursor during a DnD), set when a client starts a drag and cleared on drop.
@@ -180,17 +219,17 @@ pub struct State {
     /// feedback even though the drop itself works.
     pub dnd_icon: Option<DndIcon>,
 
-    /// The "No volume mounted" hint icon as a smithay memory buffer, drawn
+    /// The "No volume open" hint icon as a smithay memory buffer, drawn
     /// directly by the renderer, bypasses the egui_glow texture path (whose
     /// sRGB handling fringes a transparent-edged icon), so it renders cleanly
     /// like the app windows and backdrop.
     pub hint_icon: Option<smithay::backend::renderer::element::memory::MemoryRenderBuffer>,
 
-    /// When a client last announced a new window, as a wall-clock nanosecond
-    /// count. A progress note ends when a window appeared AFTER the note was
+    /// The moments a window last appeared and a volume was last mounted. A
+    /// progress note ends when what it waits for happened AFTER the note was
     /// written (see toolbar::pick_status): comparing counts instead cannot tell a
     /// window that mapped inside the scan gap from one that was already there.
-    pub last_window_ns: u128,
+    pub seen: crate::toolbar::Seen,
 
     /// The launch progress note being tracked (see toolbar::LaunchNote): it
     /// finishes when a window appears after it, and stays finished.
@@ -348,7 +387,7 @@ impl State {
             hint_text: Default::default(),
             font: None,
             shadows: Default::default(),
-            last_window_ns: 0,
+            seen: Default::default(),
             status_note: None,
             frames: 0,
             submits: 0,
@@ -361,15 +400,22 @@ impl State {
             // stale one from before this compositor started stays hidden.
             notice_nonce: crate::toolbar::scan_notice().map(|(n, _)| n).unwrap_or(0),
             cfg_apps: Vec::new(),
-            window_size_applied: std::env::var("VERACAGE_WINDOW_SIZE")
-                .unwrap_or_else(|_| "default".into()),
             binds: crate::shortcuts::Binds::default(),
             clip_clear_applied: crate::hostclip::DEFAULT_CLEAR_POLICY,
             keyboard_applied: keyboard,
             dark: crate::toolbar::initial_dark(),
             auto_dismount: crate::toolbar::scan_autodismount().unwrap_or(0),
             last_input: std::time::Instant::now(),
+            last_leader_probe: std::time::Instant::now(),
+            dead_leaders: Vec::new(),
+            idle_dismount_asked: false,
             last_dismount_request: None,
+            dismount_queue: Vec::new(),
+            closing: None,
+            // Adopt any request already on disk without acting on it: a stale one
+            // from before this compositor started must not close today's apps.
+            closeapps_seen: crate::toolbar::scan_closeapps_request(),
+            clearing_apps: false,
         }
     }
 

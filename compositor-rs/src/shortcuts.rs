@@ -77,6 +77,14 @@ pub fn parse(s: &str) -> Option<Keybind> {
     if chars.next().is_some() || !c.is_ascii_alphanumeric() {
         return None;
     }
+    // At least one modifier, the same rule the capture dialog enforces
+    // (agent-rs ui_shortcuts::combo_from). A bare key here would make every press
+    // of that letter inside an app fire a clipboard transfer across the sandbox
+    // boundary, and the compositor is where the rule has to hold: it reads this
+    // from a file, so the dialog is not the only way a bind gets set.
+    if !(kb.ctrl || kb.alt || kb.shift || kb.logo) {
+        return None;
+    }
     kb.key = c.to_ascii_lowercase();
     Some(kb)
 }
@@ -142,6 +150,18 @@ mod tests {
         assert!(parse("Ctrl+Bogus+C").is_none()); // unknown modifier
         assert!(parse("Ctrl+Alt+CC").is_none()); // multi-char key
         assert!(parse("Ctrl+Alt++").is_none()); // non-alphanumeric key
+    }
+
+    #[test]
+    fn a_bind_without_a_modifier_is_refused() {
+        // The capture dialog enforces this (agent-rs ui_shortcuts::combo_from),
+        // but binds also arrive from a file, and the compositor is where the rule
+        // has to hold: a bare key would make every press of that letter inside an
+        // app move the clipboard across the sandbox boundary.
+        assert!(parse("C").is_none());
+        assert!(parse("7").is_none());
+        assert!(parse("Ctrl+C").is_some());
+        assert!(parse("Super+V").is_some());
     }
 
     #[test]

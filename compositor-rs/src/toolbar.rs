@@ -31,9 +31,13 @@ pub enum ToolbarAction {
     ClipPush, // host selection -> sandbox
     ClipPull, // sandbox selection -> host
     LaunchApp { sock: std::path::PathBuf, index: usize },
-    Command(String),     // broker verbs: open/open-app:<key>/configure/settings/exchange/help/about
-    CloseVolume(String), // dismount ONE volume of the session (by label)
-    Quit,                // stop the compositor loop (in-process)
+    /// Broker verbs: open / configure / settings / appearance / shortcuts /
+    /// exchange / help / about.
+    Command(String),
+    /// Dismount these volumes (by label), in order.
+    CloseVolumes(Vec<String>),
+    /// Close Veracage, dismounting the mounted volumes first (see `begin_quit`).
+    Quit,
 }
 
 /// One session's launchers, discovered from `/run/veracage/rt/<id>.apps`:
@@ -95,9 +99,22 @@ pub struct Toolbar {
     /// starting): the spinner turns over the desktop icon. The text itself is not
     /// drawn, it only names the note in the debug log.
     status: Option<String>,
-    /// A transient user-facing banner (e.g. a failed launch a leader reported),
-    /// with the instant it was set. Cleared after NOTICE_TTL.
-    notice: Option<(String, std::time::Instant)>,
+    /// The user-facing banner currently shown, if any.
+    notice: Option<Notice>,
+}
+
+/// A user-facing banner over the desktop: something happened that the human did
+/// not ask for and would otherwise not see (a failed launch, an idle dismount).
+/// Expires after NOTICE_TTL. Operations the human just triggered do NOT get one.
+struct Notice {
+    text: String,
+    at: std::time::Instant,
+}
+
+impl Notice {
+    fn expired(&self) -> bool {
+        self.at.elapsed() >= NOTICE_TTL
+    }
 }
 
 /// Veracage's own two-color menu glyphs, baked into textures in the theme's ink.
@@ -291,7 +308,7 @@ impl Toolbar {
     /// Show a transient banner (e.g. a leader-reported failed launch). Cleared
     /// automatically after NOTICE_TTL.
     pub fn set_notice(&mut self, msg: String) {
-        self.notice = Some((msg, std::time::Instant::now()));
+        self.notice = Some(Notice { text: msg, at: std::time::Instant::now() });
     }
 
     /// True while egui still wants to animate (an open menu, a hover transition,
@@ -490,7 +507,7 @@ impl Toolbar {
                     ui.add_space(((ui.available_height() - row_h) * 0.5).max(0.0));
                     egui::menu::bar(ui, |ui| {
                         ui.menu_button("File", |ui| {
-                            if ui.add(menu_item(mi("mount"), "Mount volume...")).clicked() {
+                            if ui.add(menu_item(mi("mount"), "Open volume...")).clicked() {
                                 action = ToolbarAction::Command("open".into());
                                 ui.close_menu();
                             }
@@ -498,16 +515,25 @@ impl Toolbar {
                                 action = ToolbarAction::Command("exchange".into());
                                 ui.close_menu();
                             }
-                            // Dismount ▸ one item per mounted volume across the
-                            // session. Absent when nothing is mounted.
-                            let vols: Vec<String> =
+                            // Close volume ▸ one item per open volume across
+                            // the session, plus All once there is more than one.
+                            // Absent when no volume is open.
+                            let mut vols: Vec<String> =
                                 leaders.iter().flat_map(|l| l.volumes.clone()).collect();
+                            vols.sort();
                             if !vols.is_empty() {
                                 ui.separator();
-                                ui.menu_button("Dismount", |ui| {
+                                ui.menu_button("Close volume", |ui| {
                                     for v in &vols {
                                         if ui.add(menu_item(mi("dismount"), v)).clicked() {
-                                            action = ToolbarAction::CloseVolume(v.clone());
+                                            action = ToolbarAction::CloseVolumes(vec![v.clone()]);
+                                            ui.close_menu();
+                                        }
+                                    }
+                                    if vols.len() > 1 {
+                                        ui.separator();
+                                        if ui.add(menu_item(mi("dismount"), "All")).clicked() {
+                                            action = ToolbarAction::CloseVolumes(vols.clone());
                                             ui.close_menu();
                                         }
                                     }
@@ -537,9 +563,9 @@ impl Toolbar {
                         });
                         ui.menu_button("Apps", |ui| {
                             if leaders.is_empty() {
-                                // No volume mounted: apps operate on volume
+                                // No volume open: apps operate on volume
                                 // contents, so show the configured apps DISABLED
-                                // until a volume is mounted (File > Mount volume).
+                                // until one is open (File > Open volume).
                                 if cfg_apps.is_empty() {
                                     ui.add_enabled(
                                         false,
@@ -628,8 +654,8 @@ impl Toolbar {
 
             // Transient banner (e.g. a leader-reported failed launch), floating
             // bottom-center over the app/desktop for NOTICE_TTL. Non-interactive.
-            if let Some((msg, at)) = notice {
-                if at.elapsed() < NOTICE_TTL {
+            if let Some(notice) = notice {
+                if !notice.expired() {
                     egui::Area::new(egui::Id::new("veracage_notice"))
                         .order(egui::Order::Foreground)
                         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -28.0))
@@ -641,7 +667,7 @@ impl Toolbar {
                                 (egui::Color32::from_rgb(250, 224, 224), egui::Color32::from_rgb(120, 20, 20))
                             };
                             egui::Frame::popup(ui.style()).fill(bg).show(ui, |ui| {
-                                ui.colored_label(fg, msg.as_str());
+                                ui.colored_label(fg, notice.text.as_str());
                             });
                         });
                 }
@@ -649,7 +675,7 @@ impl Toolbar {
         });
 
         // Drop an expired notice so it stops repainting and doesn't linger.
-        if self.notice.as_ref().is_some_and(|(_, at)| at.elapsed() >= NOTICE_TTL) {
+        if self.notice.as_ref().is_some_and(Notice::expired) {
             self.notice = None;
         }
 
@@ -728,7 +754,7 @@ fn rebake_font_textures(delta: &mut egui::TexturesDelta) {
     }
 }
 
-/// The "N volumes mounted (a, b)" summary of a session's open volumes, used for
+/// The "N volumes open (a, b)" summary of a session's volumes, used for
 /// both the host window title and the desktop hint. "Veracage" when none.
 pub fn volumes_title(leaders: &[LeaderApps]) -> String {
     let vols: Vec<&str> = leaders
@@ -737,8 +763,8 @@ pub fn volumes_title(leaders: &[LeaderApps]) -> String {
         .collect();
     match vols.len() {
         0 => "Veracage".to_string(),
-        1 => format!("1 volume mounted ({})", vols[0]),
-        n => format!("{n} volumes mounted ({})", vols.join(", ")),
+        1 => format!("1 volume open ({})", vols[0]),
+        n => format!("{n} volumes open ({})", vols.join(", ")),
     }
 }
 
@@ -793,23 +819,79 @@ const RUNTIME_DIR: &str = "/run/veracage/rt";
 /// Writable only by the human uid, the same trust level as config.toml itself.
 const PUB_DIR: &str = "/run/veracage/pub";
 
-/// The file the human-side broker polls for commands (verb line). Must match
-/// CMD_REQ in agent-rs/src/broker.rs.
-const CMD_REQ: &str = "cmd.req";
+/// The append-only log the human-side broker drains for commands, one
+/// `<nonce>\t<verb>` line per verb. Must match CMD_LOG in agent-rs/src/broker.rs.
+///
+/// A log, not a file we replace: the old `cmd.req` was one slot the compositor
+/// atomically renamed over, and the broker noticed it by mtime. Two batches
+/// written inside one broker poll (300ms), or any batch written while the broker
+/// sat in a modal dialog, collapsed into the last one and the earlier verbs were
+/// lost with no error anywhere - a menu item that did nothing, or a close-volume
+/// that silently never happened. Appending keeps every verb, and the nonce lets
+/// the broker resume exactly where it stopped.
+///
+/// The broker cannot unlink here (`rt` is 0711 veracage, so the human uid can
+/// traverse but not write), which is why the compositor truncates the log itself
+/// at startup rather than the reader deleting what it consumed.
+const CMD_LOG: &str = "cmd.log";
 
 /// The leaders' transient user-notice file (must match `_post_notice` in
 /// leader.py): one `<nonce>\t<text>` line, veracage-written.
 const NOTICE_FILE: &str = "notice";
 
-/// Read the transient notice a leader published (e.g. a failed launch), as
-/// `(nonce, text)`. The nonce (a wall-clock ns stamp) lets the caller show each
-/// distinct notice once. Bounded read, control chars stripped, malformed ignored.
+/// The broker's request for the apps to be cleared out of the way of a dismount
+/// (`PUB_DIR/closeapps`, written by the human side, whose dir this is). The
+/// compositor owns the app windows, so only it can ask them politely; the broker
+/// owns the pkexec that does the dismount. This is the one thing the human side
+/// needs to ask the compositor for, so it is a file with a timestamp rather than
+/// a channel: the scan shows each distinct request once.
+const CLOSEAPPS_REQ: &str = "closeapps";
+
+/// The mtime of the broker's clear-the-apps request, 0 when there is none. Same
+/// nonce discipline as the notice file: the caller acts when it changes.
+pub fn scan_closeapps_request() -> u128 {
+    file_mtime(&std::path::Path::new(PUB_DIR).join(CLOSEAPPS_REQ))
+}
+
+/// Where the session locks live (must match LOCKS_DIR in cleanup.py). 0755, so
+/// the compositor can list it even though the locks themselves are root-only.
+const LOCKS_DIR: &str = "/run/veracage";
+
+/// True while a `session-<sid>.lock` is still on disk.
+///
+/// The cleanup that runs when a session's transient unit stops unlinks that lock
+/// only AFTER every volume's dm device has actually been closed (see
+/// `cleanup.py`), so its disappearance is the honest end of a dismount - later
+/// than the leader exiting, which only takes the mounts down. An unreadable
+/// directory reads as "nothing left": the wait must not become a hang.
+pub fn session_lock_present() -> bool {
+    let Ok(entries) = std::fs::read_dir(LOCKS_DIR) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with("session-") && name.ends_with(".lock")
+    })
+}
+
 /// A progress note the compositor is tracking: which note (its file's timestamp)
 /// and whether it has finished.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LaunchNote {
     stamp: u128,
     done: bool,
+}
+
+/// What the compositor has SEEN happen, as wall-clock nanosecond counts directly
+/// comparable with a note's own file timestamp. This is how a progress note ends
+/// early: the operation it names has visibly landed (see `pick_status`).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct Seen {
+    /// When a client last announced a new window (ends a launch note).
+    pub window_ns: u128,
+    /// When a volume was last mounted into the workspace (ends an unlock note).
+    pub volume_ns: u128,
 }
 
 /// How long a note may keep the spinner turning. A launch note is bounded tightly:
@@ -825,19 +907,19 @@ const STATUS_TTL_BROKER: std::time::Duration = std::time::Duration::from_secs(90
 /// Also deletes a leader note left behind by an earlier session: `rt/status` lives
 /// in a runtime directory shared by every session, and the compositor owns it.
 pub fn scan_status(
-    last_window_ns: u128,
+    seen: Seen,
     note: Option<LaunchNote>,
 ) -> (Option<String>, Option<LaunchNote>) {
     let leader_path = std::path::Path::new(RUNTIME_DIR).join("status");
     let from_leader = read_status_line(&leader_path);
     if from_leader.as_ref().is_some_and(|(stamp, _)| *stamp < session_start_ns()) {
         let _ = std::fs::remove_file(&leader_path);
-        return pick_status(None, None, last_window_ns, note, now_ns(), session_start_ns());
+        return pick_status(None, None, seen, note, now_ns(), session_start_ns());
     }
     pick_status(
         read_status_line(&std::path::Path::new(PUB_DIR).join("status")),
         from_leader,
-        last_window_ns,
+        seen,
         note,
         now_ns(),
         session_start_ns(),
@@ -871,19 +953,26 @@ fn session_start_ns() -> u128 {
 ///   1. its file is gone, because the publisher resolved the operation;
 ///   2. it predates this compositor, so it is a leftover from an earlier session
 ///      (the runtime directory outlives one session);
-///   3. a window appeared AFTER it was written - the launched app putting its window
-///      up - and then it STAYS finished, so a later window cannot revive it. This is
-///      a timestamp comparison, not a window count: an app can map its window inside
-///      the gap between two scans, and a count taken when the note is first READ
-///      would then already include it and never rise;
+///   3. what it was waiting for has visibly landed AFTER it was written: a window
+///      appeared for a launch note, a volume was mounted for an unlock note. Both
+///      are timestamp comparisons, not counts: the thing can happen inside the gap
+///      between two scans, and a count taken when the note is first READ would then
+///      already include it and never rise. A launch note additionally STAYS
+///      finished, so a later window cannot revive it;
 ///   4. it is older than its TTL (see the constants above).
+///
+/// Rule 3 is what the broker's note needs and cannot get from its own file: the
+/// broker deletes that file when `veracage open` exits, but an open that BOOTSTRAPS
+/// the session does not exit until the session ends (the CLI runs the transient
+/// unit with --pipe), so the file would sit there and spin the whole TTL out over a
+/// volume that is long since mounted.
 ///
 /// The broker's note wins while both exist: unlocking is the operation the user is
 /// waiting on, and an app launch that follows publishes a fresher note anyway.
 fn pick_status(
     from_broker: Option<(u128, String)>,
     from_leader: Option<(u128, String)>,
-    last_window_ns: u128,
+    seen: Seen,
     note: Option<LaunchNote>,
     now_ns: u128,
     session_start_ns: u128,
@@ -893,8 +982,10 @@ fn pick_status(
             *stamp >= session_start_ns && now_ns.saturating_sub(*stamp) < ttl.as_nanos()
         })
     };
-    if let Some((_, text)) = fresh(from_broker, STATUS_TTL_BROKER) {
-        return (Some(text), note);
+    if let Some((stamp, text)) = fresh(from_broker, STATUS_TTL_BROKER) {
+        if seen.volume_ns <= stamp {
+            return (Some(text), note);
+        }
     }
     let Some((stamp, text)) = fresh(from_leader, STATUS_TTL_LAUNCH) else {
         return (None, None);
@@ -903,7 +994,7 @@ fn pick_status(
         Some(n) if n.stamp == stamp => n,
         _ => LaunchNote { stamp, done: false },
     };
-    if last_window_ns > stamp {
+    if seen.window_ns > stamp {
         note.done = true;
     }
     ((!note.done).then_some(text), Some(note))
@@ -930,6 +1021,9 @@ fn read_status_line(path: &std::path::Path) -> Option<(u128, String)> {
     (!text.is_empty()).then_some((stamp, text))
 }
 
+/// Read the transient notice a leader published (e.g. a failed launch), as
+/// `(nonce, text)`. The nonce (a wall-clock ns stamp) lets the caller show each
+/// distinct notice once. Bounded read, control chars stripped, malformed ignored.
 pub fn scan_notice() -> Option<(u64, String)> {
     let path = std::path::Path::new(RUNTIME_DIR).join(NOTICE_FILE);
     let md = std::fs::metadata(&path).ok()?;
@@ -944,10 +1038,10 @@ pub fn scan_notice() -> Option<(u64, String)> {
 }
 
 /// Emit a command to the human-uid broker. The compositor runs as the `veracage`
-/// uid and cannot spawn a human GUI / `pkexec` / open host files, so it drops a
-/// one-line verb into its own runtime dir; the broker (human uid) polls the file's
-/// mtime and dispatches the verb. Verbs: open/open-app:<key>/configure/settings/
-/// exchange/help/about/close-volume:<label>.
+/// uid and cannot spawn a human GUI / `pkexec` / open host files, so it appends a
+/// verb to a log in its own runtime dir; the broker (human uid) drains everything
+/// newer than the last verb it handled. Verbs: open/configure/settings/appearance/
+/// shortcuts/exchange/help/about/close-volume:<label>.
 ///
 /// Security: `/run/veracage/rt` is `0711 veracage`, so a same-uid attacker CANNOT
 /// create/forge this file, only the compositor writes it, and a compositor menu
@@ -955,27 +1049,49 @@ pub fn scan_notice() -> Option<(u64, String)> {
 /// file is world-readable (the broker reads it by exact path through the 0711 dir);
 /// at most an attacker learns a command was issued.
 pub fn request_command(verb: &str) {
+    request_commands(std::slice::from_ref(&verb));
+}
+
+/// Ask the broker for SEVERAL verbs at once. Each is appended as its own
+/// `<nonce>\t<verb>` line, so a batch (Close volume > All) arrives whole and
+/// nothing a later batch writes can overwrite it.
+pub fn request_commands(verbs: &[&str]) {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let path = std::path::Path::new(RUNTIME_DIR).join(CMD_REQ);
-    // Write a temp file, make it broker-readable, THEN atomically rename it into
-    // place. A plain write-then-chmod leaves a window where the file exists 0600
-    // (the compositor's umask is 077): the broker polls the mtime and can read it
-    // during that window, get EACCES, and silently DROP the command, losing e.g.
-    // the very first menu click. rename() bumps the target's mtime (the broker's
-    // signal) and the file is 0644 the instant it appears.
-    let tmp = std::path::Path::new(RUNTIME_DIR).join(format!("{CMD_REQ}.tmp"));
-    let write = || -> std::io::Result<()> {
+    let path = std::path::Path::new(RUNTIME_DIR).join(CMD_LOG);
+    let mut body = String::new();
+    for verb in verbs {
+        // Nanoseconds since the epoch: monotonic enough to order the log and to
+        // survive a compositor restart, which a per-run counter would not.
+        body.push_str(&format!("{}\t{}\n", now_ns(), verb));
+    }
+    let append = || -> std::io::Result<()> {
         let mut f = std::fs::OpenOptions::new()
-            .write(true).create(true).truncate(true).mode(0o644).open(&tmp)?;
-        f.write_all(format!("{verb}\n").as_bytes())?;
-        // create() honours the umask, so force 0644 even if 077 masked it off.
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
-        std::fs::rename(&tmp, &path)
+            .append(true)
+            .create(true)
+            .mode(0o644)
+            .open(&path)?;
+        // create() honours the umask (077 here), so force 0644 or the broker,
+        // which runs as the human uid, cannot read what we just wrote.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+        // One write per batch: the kernel appends it atomically, so the broker
+        // never sees a half-written line.
+        f.write_all(body.as_bytes())
     };
-    if let Err(e) = write() {
-        tracing::warn!("toolbar: command {verb}: {e}");
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = append() {
+        tracing::warn!("toolbar: command {verbs:?}: {e}");
+    }
+}
+
+/// Start the command log empty. Called once at startup: the log is append-only,
+/// so without this it would carry every verb of every previous session, and the
+/// broker would have to skip a backlog that grows forever.
+pub fn reset_command_log() {
+    let path = std::path::Path::new(RUNTIME_DIR).join(CMD_LOG);
+    if let Err(e) = std::fs::remove_file(&path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("toolbar: could not clear {}: {e}", path.display());
+        }
     }
 }
 
@@ -1127,20 +1243,6 @@ pub fn scan_keyboard() -> Option<KeyboardConfig> {
     ok.then_some(cfg)
 }
 
-/// Read the human-published desired window size from `PUB_DIR/window.size`
-/// ("default" | "max" | "<w>x<h>"). None if absent/unreadable. Validated by the
-/// caller before it touches the window.
-pub fn scan_window_size() -> Option<String> {
-    let path = std::path::Path::new(PUB_DIR).join("window.size");
-    let md = std::fs::symlink_metadata(&path).ok()?;
-    if !md.file_type().is_file() || md.len() > 64 {
-        return None;
-    }
-    let s = std::fs::read_to_string(&path).ok()?;
-    let s = s.trim();
-    (!s.is_empty()).then(|| s.to_string())
-}
-
 /// Scan the human-published configured-app list at `PUB_DIR/config.apps`
 /// (`<key>\t<name>` per line). Shown in the Apps menu when no volume is mounted;
 /// clicking runs the broker's open flow with that app. Size- and count-capped,
@@ -1232,24 +1334,96 @@ pub fn scan_leaders() -> Vec<LeaderApps> {
     out
 }
 
+/// True when `sock` is a socket file with NOTHING listening on it, i.e. the
+/// leader that published it is gone. Used to drop a `.apps` file left behind by a
+/// leader that was SIGKILLed (the suspend hook's force path does exactly that,
+/// and `_unpublish_apps` only runs on a graceful exit): the toolbar would
+/// otherwise keep listing a volume that no longer exists, and the quit gate would
+/// wait for a session that cannot answer.
+///
+/// The connect is NON-BLOCKING, and only ECONNREFUSED/ENOENT count as dead. A
+/// live leader whose accept loop is busy (it blocks for up to 8s inside
+/// `close-apps`) fills its listen backlog and answers EAGAIN, which must read as
+/// alive: pruning it would drop a real session from the menu.
+pub fn leader_socket_dead(sock: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(sock.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let fd = unsafe {
+        libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0)
+    };
+    if fd < 0 {
+        return false;
+    }
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = c_path.as_bytes_with_nul();
+    if bytes.len() > addr.sun_path.len() {
+        unsafe { libc::close(fd) };
+        return false;
+    }
+    for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+        *dst = *src as libc::c_char;
+    }
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    let err = std::io::Error::last_os_error().raw_os_error();
+    unsafe { libc::close(fd) };
+    rc != 0 && matches!(err, Some(libc::ECONNREFUSED) | Some(libc::ENOENT))
+}
+
 /// Ask a session's leader to launch enabled app `index` by poking its app socket
-/// with a bare index line. The blocking connect+write runs on a short-lived
-/// thread so a stalled or missing leader socket can never freeze the compositor's
-/// single-threaded event loop (matching the clipboard bridge's discipline).
+/// with a bare index line.
 pub fn launch_app(sock: &std::path::Path, index: usize) {
+    poke_leader(sock, &index.to_string(), "launch app");
+}
+
+/// Ask a session's leader to end the session: it stops its apps and exits, which
+/// stops its transient unit and runs the ExecStopPost cleanup that dismounts the
+/// volumes. The verb the leader's app socket understands (see
+/// `_accept_app_launch` in leader.py); nothing else can reach that socket.
+pub fn close_session(sock: &std::path::Path) {
+    poke_leader(sock, CLOSE_VERB, "close session");
+}
+
+/// Ask a session's leader to stop its apps and keep running. What makes a
+/// dismount possible: a running app holds the volume's dm device (see
+/// `foreign_holders` in the helper), so the apps have to go before the volume
+/// can actually be closed.
+pub fn close_session_apps(sock: &std::path::Path) {
+    poke_leader(sock, CLOSE_APPS_VERB, "close session apps");
+}
+
+/// The lines the leader's app socket reads as "end this session" and "stop the
+/// apps but keep the session" (must match leader.py).
+const CLOSE_VERB: &str = "close";
+const CLOSE_APPS_VERB: &str = "close-apps";
+
+/// Write one line to a leader's app socket. The blocking connect+write runs on a
+/// short-lived thread so a stalled or missing leader socket can never freeze the
+/// compositor's single-threaded event loop (matching the clipboard bridge's
+/// discipline).
+fn poke_leader(sock: &std::path::Path, line: &str, what: &'static str) {
     let sock = sock.to_path_buf();
+    let line = line.to_string();
     // Builder::spawn (not thread::spawn) so an OS thread-creation failure returns
     // Err and is dropped, never panicking and unwinding the compositor.
     let _ = std::thread::Builder::new()
-        .name("veracage-launch".into())
+        .name("veracage-leader-poke".into())
         .spawn(move || {
             use std::io::Write;
             use std::os::unix::net::UnixStream;
             match UnixStream::connect(&sock) {
                 Ok(mut s) => {
-                    let _ = s.write_all(format!("{index}\n").as_bytes());
+                    let _ = s.write_all(format!("{line}\n").as_bytes());
                 }
-                Err(e) => tracing::warn!("toolbar: launch app {index}: {e}"),
+                Err(e) => tracing::warn!("toolbar: {what}: {e}"),
             }
         });
 }
@@ -1280,6 +1454,11 @@ mod tests {
         Some((stamp, text.to_string()))
     }
 
+    /// A compositor that has seen a window at `ns` and no volume mounted.
+    fn window(ns: u128) -> Seen {
+        Seen { window_ns: ns, volume_ns: 0 }
+    }
+
     #[test]
     fn broker_note_wins_while_unlocking() {
         // The broker deletes its file when the open ends, so whatever is there is
@@ -1289,26 +1468,45 @@ mod tests {
         let leader = note_at(START, "Starting Dolphin");
         for last_window in [0, START + 1] {
             let (shown, _) =
-                pick_status(broker.clone(), leader.clone(), last_window, None, START, START);
+                pick_status(broker.clone(), leader.clone(), window(last_window), None, START, START);
             assert_eq!(shown, Some("Unlocking work.vc".to_string()));
         }
+    }
+
+    #[test]
+    fn unlock_note_ends_when_the_volume_is_mounted() {
+        // An open that BOOTSTRAPS the session keeps `veracage open` running for the
+        // whole session, so the broker never deletes its file and the spinner used
+        // to turn until the 90s TTL over a volume mounted seconds earlier. The
+        // volume appearing is what ends it. A volume mounted BEFORE the note (the
+        // second volume of a workspace) proves nothing about this open.
+        let broker = note_at(START, "Unlocking work.vc");
+        let seen = |volume_ns| Seen { window_ns: 0, volume_ns };
+        let (shown, _) = pick_status(broker.clone(), None, seen(START - 5), None, START, START);
+        assert_eq!(shown, Some("Unlocking work.vc".to_string()));
+        let (shown, _) = pick_status(broker.clone(), None, seen(START + 1), None, START, START);
+        assert_eq!(shown, None);
+        // And a leader note published after the mount takes over from there.
+        let leader = note_at(START + 2, "Starting Dolphin");
+        let (shown, _) = pick_status(broker, leader, seen(START + 1), None, START + 2, START);
+        assert_eq!(shown, Some("Starting Dolphin".to_string()));
     }
 
     #[test]
     fn launch_note_ends_when_a_window_appears_after_it_and_stays_ended() {
         let leader = note_at(START, "Starting Kate");
         // A window that was already there (mapped BEFORE the note) proves nothing.
-        let (shown, note) = pick_status(None, leader.clone(), START - 5, None, START, START);
+        let (shown, note) = pick_status(None, leader.clone(), window(START - 5), None, START, START);
         assert_eq!(shown, Some("Starting Kate".to_string()));
-        let (shown, note) = pick_status(None, leader.clone(), START - 5, note, START, START);
+        let (shown, note) = pick_status(None, leader.clone(), window(START - 5), note, START, START);
         assert_eq!(shown, Some("Starting Kate".to_string()));
         // Kate puts its window up: done.
-        let (shown, note) = pick_status(None, leader.clone(), START + 1, note, START, START);
+        let (shown, note) = pick_status(None, leader.clone(), window(START + 1), note, START, START);
         assert_eq!(shown, None);
         // And it stays done, whatever happens to windows afterwards.
-        let (shown, note) = pick_status(None, leader.clone(), START + 1, note, START, START);
+        let (shown, note) = pick_status(None, leader.clone(), window(START + 1), note, START, START);
         assert_eq!(shown, None);
-        let (shown, _) = pick_status(None, leader, 0, note, START, START);
+        let (shown, _) = pick_status(None, leader, window(0), note, START, START);
         assert_eq!(shown, None);
     }
 
@@ -1321,7 +1519,7 @@ mod tests {
         // for the whole timeout (the reported Konsole case).
         let leader = note_at(START, "Starting Konsole");
         let window_mapped = START + 700_000_000; // 0.7s after the note, before the scan
-        let (shown, note) = pick_status(None, leader, window_mapped, None, START + 1_000_000_000, START);
+        let (shown, note) = pick_status(None, leader, window(window_mapped), None, START + 1_000_000_000, START);
         assert_eq!(shown, None, "the note should be finished the first time it is seen");
         assert!(note.map_or(false, |n| n.done));
     }
@@ -1332,9 +1530,9 @@ mod tests {
         let leader = note_at(START, "Starting Dolphin");
         let inside = START + STATUS_TTL_LAUNCH.as_nanos() - 1;
         let outside = START + STATUS_TTL_LAUNCH.as_nanos();
-        let (shown, note) = pick_status(None, leader.clone(), 0, None, inside, START);
+        let (shown, note) = pick_status(None, leader.clone(), window(0), None, inside, START);
         assert!(shown.is_some());
-        let (shown, _) = pick_status(None, leader, 0, note, outside, START);
+        let (shown, _) = pick_status(None, leader, window(0), note, outside, START);
         assert_eq!(shown, None);
     }
 
@@ -1344,8 +1542,8 @@ mod tests {
         let broker = note_at(START, "Unlocking work.vc");
         let inside = START + STATUS_TTL_BROKER.as_nanos() - 1;
         let outside = START + STATUS_TTL_BROKER.as_nanos();
-        assert!(pick_status(broker.clone(), None, 0, None, inside, START).0.is_some());
-        assert_eq!(pick_status(broker, None, 0, None, outside, START).0, None);
+        assert!(pick_status(broker.clone(), None, window(0), None, inside, START).0.is_some());
+        assert_eq!(pick_status(broker, None, window(0), None, outside, START).0, None);
     }
 
     #[test]
@@ -1356,11 +1554,11 @@ mod tests {
         let before = START - 1;
         let leader = note_at(before, "Starting Konsole");
         let broker = note_at(before, "Unlocking work.vc");
-        assert_eq!(pick_status(None, leader, 0, None, START, START).0, None);
-        assert_eq!(pick_status(broker, None, 0, None, START, START).0, None);
+        assert_eq!(pick_status(None, leader, window(0), None, START, START).0, None);
+        assert_eq!(pick_status(broker, None, window(0), None, START, START).0, None);
         // A note written after startup is fine.
         let live = note_at(START + 1, "Starting Konsole");
-        assert!(pick_status(None, live, 0, None, START + 2, START).0.is_some());
+        assert!(pick_status(None, live, window(0), None, START + 2, START).0.is_some());
     }
 
     #[test]
@@ -1368,16 +1566,38 @@ mod tests {
         // Launching another app writes the file again, which must show again even
         // though the previous note was finished.
         let first = note_at(START, "Starting Kate");
-        let (_, note) = pick_status(None, first.clone(), 0, None, START, START);
-        let (_, note) = pick_status(None, first, START + 1, note, START + 1, START); // finished
+        let (_, note) = pick_status(None, first.clone(), window(0), None, START, START);
+        let (_, note) = pick_status(None, first, window(START + 1), note, START + 1, START); // finished
         let second = note_at(START + 5, "Starting Dolphin");
-        let (shown, _) = pick_status(None, second, START + 1, note, START + 5, START);
+        let (shown, _) = pick_status(None, second, window(START + 1), note, START + 5, START);
         assert_eq!(shown, Some("Starting Dolphin".to_string()));
     }
 
     #[test]
     fn no_note_published_forgets_the_previous_one() {
-        assert_eq!(pick_status(None, None, START, None, START, START), (None, None));
+        assert_eq!(pick_status(None, None, window(START), None, START, START), (None, None));
+    }
+
+    #[test]
+    fn a_socket_with_no_listener_reads_as_dead_and_a_live_one_does_not() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("vc-sock-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Alive: a listener is bound.
+        let live = dir.join("live.sock");
+        let _ = std::fs::remove_file(&live);
+        let listener = UnixListener::bind(&live).unwrap();
+        assert!(!leader_socket_dead(&live));
+
+        // Dead: the leader was SIGKILLed, so the socket FILE is still there with
+        // nothing behind it. This is the case that leaves a stale `.apps`.
+        drop(listener);
+        assert!(leader_socket_dead(&live));
+
+        // A path that is not there at all reads as dead too.
+        assert!(leader_socket_dead(&dir.join("nope.sock")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

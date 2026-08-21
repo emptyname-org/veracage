@@ -111,8 +111,9 @@ impl<R: smithay::backend::renderer::Renderer> smithay::backend::renderer::elemen
     }
 }
 
-/// Parse a "<w>x<h>" window-size string into bounded logical dimensions. Bounds
-/// match agent-rs config::window_size_valid; None on anything malformed.
+/// Parse the startup "<w>x<h>" window-size string into bounded logical
+/// dimensions. Bounds match agent-rs config::window_size_valid; None on anything
+/// malformed. Only used when the window is CREATED: see `init_winit`.
 fn parse_size(s: &str) -> Option<(u32, u32)> {
     let (w, h) = s.split_once('x')?;
     let w: u32 = w.parse().ok()?;
@@ -120,30 +121,14 @@ fn parse_size(s: &str) -> Option<(u32, u32)> {
     ((320..=16384).contains(&w) && (240..=16384).contains(&h)).then_some((w, h))
 }
 
-/// Apply a window-size value ("max" | "<w>x<h>" | "default") to the live window.
-fn apply_window_size(window: &dyn smithay::reexports::winit::window::Window, size: &str) {
-    use smithay::reexports::winit::dpi::LogicalSize;
-    match size {
-        "max" => window.set_maximized(true),
-        "default" => window.set_maximized(false),
-        s => {
-            if let Some((w, h)) = parse_size(s) {
-                window.set_maximized(false);
-                let _ = window.request_surface_size(LogicalSize::new(w, h).into());
-            }
-        }
-    }
-}
-
-/// Minimum gap between two dismount requests. They travel through a single-verb
-/// file the broker polls every 300ms, so back-to-back requests would overwrite
-/// each other and only the last volume would close. It also paces the retries if
-/// a dismount does not take.
-const DISMOUNT_REQUEST_GAP: Duration = Duration::from_secs(5);
+/// How long the idle timer waits before asking again for volumes that are still
+/// mounted, i.e. the pacing of a dismount that did not take. Nothing the human
+/// waits on: it only stops the idle timer re-asking four times a second.
+const DISMOUNT_RETRY_GAP: Duration = Duration::from_secs(5);
 
 /// Whether an idle dismount is due: a timeout is configured, the human has left
 /// Veracage alone for at least that long, and the last request (if any) has had
-/// time to reach the broker.
+/// time to reach the broker and act.
 fn dismount_due(
     minutes: u32,
     idle: Duration,
@@ -151,7 +136,134 @@ fn dismount_due(
 ) -> bool {
     minutes > 0
         && idle >= Duration::from_secs(minutes as u64 * 60)
-        && since_last_request.is_none_or(|d| d >= DISMOUNT_REQUEST_GAP)
+        && since_last_request.is_none_or(|d| d >= DISMOUNT_RETRY_GAP)
+}
+
+/// Every open volume's label across the running sessions, sorted so two scans
+/// can be compared and so Dismount > All is deterministic.
+fn volume_labels(leaders: &[crate::toolbar::LeaderApps]) -> Vec<String> {
+    let mut labels: Vec<String> = leaders.iter().flat_map(|l| l.volumes.clone()).collect();
+    labels.sort();
+    labels
+}
+
+/// Send every queued dismount, in one write. The command file carries a verb per
+/// line and the broker reads it whole, so there is nothing to pace: Dismount >
+/// All goes out at once. Returns true when something went out, so the caller
+/// repaints.
+fn send_dismount_queue(state: &mut State) -> bool {
+    if state.dismount_queue.is_empty() {
+        return false;
+    }
+    let verbs: Vec<String> = state
+        .dismount_queue
+        .drain(..)
+        .map(|label| format!("close-volume:{label}"))
+        .collect();
+    tracing::debug!("dismount: requesting {verbs:?}");
+    let lines: Vec<&str> = verbs.iter().map(String::as_str).collect();
+    crate::toolbar::request_commands(&lines);
+    state.last_dismount_request = Some(std::time::Instant::now());
+    true
+}
+
+/// Windows with content ON SCREEN, which is what "an app the human can answer
+/// for" means.
+///
+/// NOT `space.elements()`: a window enters the space in `new_toplevel`, at
+/// role-creation time, before the client has committed a buffer, and
+/// `Space::refresh` drops an element only when its surface is dead, not when it
+/// is unmapped. So an app launched seconds before Quit - still starting, nothing
+/// drawn - counted as a window that had to agree to close. It cannot agree: it
+/// is not listening for the close request yet. The quit then sat in AskingApps
+/// with an empty screen and no banner, which looks exactly like the deliberate
+/// "an app is holding this open" behaviour, and the close-apps handshake stalled
+/// its full 180s the same way.
+fn windows_on_screen(state: &State) -> usize {
+    use smithay::backend::renderer::utils::with_renderer_surface_state;
+    state
+        .space
+        .elements()
+        .filter(|w| {
+            w.toplevel().is_some_and(|tl| {
+                with_renderer_surface_state(tl.wl_surface(), |st| st.buffer().is_some())
+                    .unwrap_or(false)
+            })
+        })
+        .count()
+}
+
+/// Ask every open app window to close, the same request its own title-bar X
+/// sends, so an app with unsaved work raises its own "save changes?" dialog
+/// instead of being killed under it. Returns how many were asked.
+fn ask_apps_to_close(state: &State) -> usize {
+    let mut asked = 0;
+    for window in state.space.elements() {
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.send_close();
+            asked += 1;
+        }
+    }
+    asked
+}
+
+/// Begin quitting, or carry it forward when asked again.
+///
+/// The window does NOT go away while this runs, and nothing is ever closed over
+/// an app's head. Quitting is: ask the apps to close (they may prompt, and the
+/// human answers in this still-open window), and only once they have ALL agreed
+/// tear the sessions down, then exit when every volume is really closed. There is
+/// no override and no second-quit escape: an app that keeps its window up keeps
+/// Veracage open, which is the human's own unanswered prompt, not a hang.
+/// Veracage must never disappear while a volume is still decrypted either, so the
+/// exit is gated on the session lock being gone - the cleanup unlinks it only
+/// after every dm device is closed - and NOT on a timer.
+///
+/// The sessions are told to close on their own app sockets rather than through
+/// the broker's per-volume dismount, which pkexecs the full helper: this is the
+/// teardown a window close has always used (leader exits -> the transient unit
+/// stops -> its ExecStopPost cleanup closes the dm), so it stays passwordless.
+fn begin_quit(state: &mut State) {
+    match state.closing {
+        // Asked again while the apps are having their say. Ask them AGAIN - never
+        // over their heads: an app is only closed when it agrees to close, so an
+        // unsaved-work prompt is the human's to answer and nothing overrides it.
+        // (The re-ask also reaches a window that opened since the first one.)
+        Some(crate::state::Closing::AskingApps) => {
+            let asked = ask_apps_to_close(state);
+            tracing::debug!("quit: asked {asked} app window(s) again");
+        }
+        // Already tearing down. Asking again cannot help and must not exit: the
+        // volumes are mid-close.
+        Some(crate::state::Closing::Dismounting) => {}
+        None => {
+            // Nothing to close only if no session is up AND no session lock is on
+            // disk. The lock is written BEFORE the mount, so it covers the window
+            // where a volume is being unlocked and no `.apps` file exists yet:
+            // exiting there would take the window away mid-open and leave the
+            // leader serving a decrypted volume with nothing on screen.
+            if state.leaders.is_empty() && !crate::toolbar::session_lock_present() {
+                state.loop_signal.stop(); // nothing open, nothing to close
+                return;
+            }
+            // Always the same rule, no special case for "nothing running": ask
+            // whatever windows there are, and the scan below moves on as soon as
+            // none is left - which, with nothing running, is straight away.
+            let asked = ask_apps_to_close(state);
+            tracing::debug!("quit: asked {asked} app window(s) to close");
+            state.closing = Some(crate::state::Closing::AskingApps);
+        }
+    }
+}
+
+/// Move from asking to acting: the sessions stop their apps, drop their mount
+/// namespaces and close their dm devices.
+fn start_dismount(state: &mut State) {
+    tracing::debug!("quit: dismounting {:?}", volume_labels(&state.leaders));
+    for leader in &state.leaders {
+        crate::toolbar::close_session(&leader.sock);
+    }
+    state.closing = Some(crate::state::Closing::Dismounting);
 }
 
 /// The backdrop IS the desktop: drawn first, behind every window. Light-gray
@@ -162,6 +274,10 @@ fn backdrop_color(_dark: bool) -> [f32; 4] {
     // backdrop is the product's surface, not a shade of the theme.
     [7.0 / 255.0, 169.0 / 255.0, 175.0 / 255.0, 1.0]
 }
+
+/// How often a session's socket is probed for a leader that is really gone. See
+/// `toolbar::leader_socket_dead`.
+const LEADER_PROBE_EVERY: Duration = Duration::from_secs(1);
 
 /// How often the discovery scan runs: it is what makes a mounted volume show up
 /// in the title and the Apps menu, and what picks up a progress note, so it also
@@ -177,7 +293,24 @@ fn run_discovery_scan(
     state: &mut State,
     window: &dyn smithay::reexports::winit::window::Window,
 ) -> bool {
-    let fresh = crate::toolbar::scan_leaders();
+    let mut fresh = crate::toolbar::scan_leaders();
+    // Drop sessions whose leader is gone but whose `.apps` file survived it (a
+    // SIGKILLed leader never runs `_unpublish_apps`). The verdict is refreshed on
+    // a timer and remembered in between: the probe is two syscalls, but a
+    // successful one is a connection the live leader has to accept, and there is
+    // no reason to make it do that four times a second.
+    if state.last_leader_probe.elapsed() >= LEADER_PROBE_EVERY {
+        state.last_leader_probe = std::time::Instant::now();
+        state.dead_leaders = fresh
+            .iter()
+            .filter(|l| crate::toolbar::leader_socket_dead(&l.sock))
+            .map(|l| {
+                tracing::debug!("toolbar: session {:?} has no leader, dropping it", l.sock);
+                l.sock.clone()
+            })
+            .collect();
+    }
+    fresh.retain(|l| !state.dead_leaders.contains(&l.sock));
     let leaders_changed = fresh.len() != state.leaders.len()
         || fresh.iter().zip(&state.leaders).any(|(a, b)| {
             a.names != b.names || a.label != b.label || a.volumes != b.volumes
@@ -190,8 +323,56 @@ fn run_discovery_scan(
         // Title = the mounted volumes; the app_id keeps the icon.
         window.set_title(&crate::toolbar::volumes_title(&fresh));
     }
+    let was_mounted = volume_labels(&state.leaders);
     state.leaders = fresh;
+    let now_mounted = volume_labels(&state.leaders);
+    // A volume appeared: this is what ends the broker's "Unlocking ..." note.
+    if now_mounted.iter().any(|v| !was_mounted.contains(v)) {
+        state.seen.volume_ns = crate::toolbar::now_ns();
+    }
+    // The last volume just closed. The compositor is persistent, so whatever
+    // Paste in put on the sandbox clipboard would otherwise still be served to
+    // the apps of the next volume opened in this session.
+    if now_mounted.is_empty() && !was_mounted.is_empty() {
+        crate::clipboard::clear_sandbox_selection(state);
+    }
     let mut changed = leaders_changed;
+
+    // Quitting: nothing else on this scan matters, only how far the quit has got.
+    match state.closing {
+        // The apps are answering for themselves. Move on the moment the last
+        // window is gone, which is what "they all agreed to close" looks like.
+        // No timer: an app waiting on a save prompt is waiting on the human.
+        Some(crate::state::Closing::AskingApps) => {
+            if windows_on_screen(state) == 0 {
+                tracing::debug!("quit: all app windows closed");
+                start_dismount(state);
+                return true;
+            }
+            return changed;
+        }
+        // Tearing down. Done means BOTH the sessions are gone (their `.apps`
+        // files with them) and the session lock is unlinked, which the cleanup
+        // does only once every dm device is closed. There is deliberately no
+        // deadline: exiting with a volume still decrypted is not an option, so a
+        // teardown that drags says so and the window stays.
+        Some(crate::state::Closing::Dismounting) => {
+            if now_mounted.is_empty() && !crate::toolbar::session_lock_present() {
+                tracing::debug!("quit: volumes closed, exiting");
+                state.loop_signal.stop();
+                return changed;
+            }
+            // Re-send on every scan, not once at start_dismount: a session that
+            // appeared after that snapshot (an open the broker already had in
+            // flight) would otherwise never be told to close, and the quit would
+            // wait for it forever. The leader's `close` verb is idempotent.
+            for leader in &state.leaders {
+                crate::toolbar::close_session(&leader.sock);
+            }
+            return changed;
+        }
+        None => {}
+    }
 
     let cfg_apps = crate::toolbar::scan_config_apps();
     if cfg_apps != state.cfg_apps {
@@ -218,14 +399,6 @@ fn run_discovery_scan(
     if font.is_some() && font != state.font {
         state.font = font;   // the backdrop text re-rasterises with it
         changed = true;
-    }
-    // Live window resize: pick up a Settings change to the default window size
-    // (published to /run/veracage/pub/window.size).
-    if let Some(sz) = crate::toolbar::scan_window_size() {
-        if sz != state.window_size_applied {
-            apply_window_size(window, &sz);
-            state.window_size_applied = sz;
-        }
     }
     // Live keyboard shortcuts (Copy out / Paste in).
     if let Some(binds) = crate::shortcuts::scan() {
@@ -254,33 +427,61 @@ fn run_discovery_scan(
             state.keyboard_applied = kb;
         }
     }
+    // The broker asking for the apps to be cleared out of the way of a dismount
+    // the human agreed to push through. Same two steps as quitting, minus the
+    // quitting: ask the windows (so unsaved work still prompts), then have the
+    // sessions stop whatever is left. The leader says when that is done and the
+    // broker retries the dismount then.
+    let closeapps = crate::toolbar::scan_closeapps_request();
+    if closeapps != state.closeapps_seen {
+        state.closeapps_seen = closeapps;
+        if closeapps != 0 {
+            state.clearing_apps = true;
+            let asked = ask_apps_to_close(state);
+            tracing::debug!("dismount: asked {asked} app window(s) to close");
+        }
+    }
+    if state.clearing_apps && windows_on_screen(state) == 0 {
+        state.clearing_apps = false;
+        for leader in &state.leaders {
+            crate::toolbar::close_session_apps(&leader.sock);
+        }
+    }
+
     // Idle dismount: close the volumes when Veracage has been left alone for the
-    // configured time. One volume per request (the broker's command file carries
-    // one verb), the rest follow on later scans while the session stays idle.
+    // configured time. They go on the same queue Dismount > All uses, so both
+    // paths are paced by the one drain below.
     if let Some(minutes) = crate::toolbar::scan_autodismount() {
         state.auto_dismount = minutes;
     }
-    if dismount_due(
-        state.auto_dismount,
-        state.last_input.elapsed(),
-        state.last_dismount_request.map(|t| t.elapsed()),
-    ) {
-        if let Some(label) = state.leaders.iter().flat_map(|l| l.volumes.iter()).next() {
-            tracing::debug!(
-                "auto-dismount: {label:?} after {}s idle",
-                state.last_input.elapsed().as_secs()
-            );
-            crate::toolbar::request_command(&format!("close-volume:{label}"));
-            state.last_dismount_request = Some(std::time::Instant::now());
-            if let Some(tb) = state.toolbar.as_mut() {
-                tb.set_notice(format!(
-                    "Dismounting {label} after {} minutes idle",
-                    state.auto_dismount
-                ));
-            }
-            changed = true;
-        }
+    // Cleared by any input (below), so this is once per idle episode rather than
+    // once every DISMOUNT_RETRY_GAP for as long as the human is away. Each request
+    // is a pkexec and, when apps hold the volume, a dialog nobody is there to
+    // answer, so repeating it just stacks up prompts and parked root helpers.
+    if state.idle_dismount_asked && state.last_input.elapsed() < DISMOUNT_RETRY_GAP {
+        state.idle_dismount_asked = false;
     }
+    if state.dismount_queue.is_empty()
+        && !now_mounted.is_empty()
+        && !state.idle_dismount_asked
+        && dismount_due(
+            state.auto_dismount,
+            state.last_input.elapsed(),
+            state.last_dismount_request.map(|t| t.elapsed()),
+        )
+    {
+        state.idle_dismount_asked = true;
+        tracing::debug!(
+            "auto-dismount: {now_mounted:?} after {}s idle",
+            state.last_input.elapsed().as_secs()
+        );
+        if let Some(tb) = state.toolbar.as_mut() {
+            tb.set_notice(format!("Closing after {} minutes idle", state.auto_dismount));
+        }
+        state.dismount_queue = now_mounted;
+        changed = true;
+    }
+    changed |= send_dismount_queue(state);
     // Live host-clipboard auto-clear policy; push to the worker only on a
     // change so we don't poke it every scan.
     if let Some(policy) = crate::toolbar::scan_clipclear() {
@@ -302,9 +503,9 @@ fn run_discovery_scan(
         }
     }
     // Progress note (unlocking a volume, starting an app), shown with a spinner.
-    // A launch note clears when a window appears after it, so the moment the last
-    // one did is carried along.
-    let (status, note) = crate::toolbar::scan_status(state.last_window_ns, state.status_note);
+    // A note clears when what it waits for lands - a window for a launch, a mount
+    // for an unlock - so the moments those last happened are carried along.
+    let (status, note) = crate::toolbar::scan_status(state.seen, state.status_note);
     state.status_note = note;
     if let Some(tb) = state.toolbar.as_mut() {
         changed |= tb.set_status(status);
@@ -507,10 +708,10 @@ pub fn init_winit(
                     crate::toolbar::ToolbarAction::Command(verb) => {
                         crate::toolbar::request_command(&verb)
                     }
-                    crate::toolbar::ToolbarAction::CloseVolume(label) => {
-                        crate::toolbar::request_command(&format!("close-volume:{label}"))
+                    crate::toolbar::ToolbarAction::CloseVolumes(labels) => {
+                        state.dismount_queue.extend(labels);
                     }
-                    crate::toolbar::ToolbarAction::Quit => state.loop_signal.stop(),
+                    crate::toolbar::ToolbarAction::Quit => begin_quit(state),
                     crate::toolbar::ToolbarAction::None => {}
                 }
                 if state.toolbar_changed {
@@ -583,7 +784,7 @@ pub fn init_winit(
                                 }
                                 _ => Vec::new(),
                             };
-                        // Combine the DnD ghost with the "No volume mounted"
+                        // Combine the DnD ghost with the "No volume open"
                         // hint icon, drawn by the renderer (not egui) so it has
                         // no egui_glow sRGB-texture fringe.
                         let mut custom: Vec<HintElement<GlesRenderer>> =
@@ -671,7 +872,7 @@ pub fn init_winit(
                             .flat_map(|l| l.volumes.iter().map(|s| s.as_str()))
                             .collect();
                         let (line1, line2) = if mounted.is_empty() {
-                            ("No volume mounted".to_string(), "File > Mount volume")
+                            ("No volume open".to_string(), "File > Open volume")
                         } else {
                             (crate::toolbar::volumes_title(&state.leaders), "")
                         };
@@ -835,9 +1036,11 @@ pub fn init_winit(
                     state.submits = state.submits.saturating_add(1);
                     if let Err(e) = backend.submit(Some(damage.as_slice())) {
                         tracing::warn!("submit skipped this frame: {e}");
+                        // Stay dirty so the ~60fps pacing timer retries, but do NOT
+                        // ask for the next frame here: on a persistent failure (EGL
+                        // context loss, GL OOM) that is a 100% CPU loop emitting a
+                        // warning per iteration.
                         state.dirty = true;
-                        drop(backend);
-                        state.wake();
                         return;
                     }
                 }
@@ -863,7 +1066,7 @@ pub fn init_winit(
                 }
             }
             WinitEvent::CloseRequested => {
-                state.loop_signal.stop();
+                begin_quit(state);
             }
             _ => (),
         };
@@ -934,10 +1137,20 @@ pub fn init_winit(
 
 #[cfg(test)]
 mod tests {
-    use super::{DISMOUNT_REQUEST_GAP, dismount_due};
+    use super::{DISMOUNT_RETRY_GAP, dismount_due, volume_labels};
     use std::time::Duration;
 
     const HOUR: Duration = Duration::from_secs(3600);
+
+    fn leader(volumes: &[&str]) -> crate::toolbar::LeaderApps {
+        crate::toolbar::LeaderApps {
+            sock: std::path::PathBuf::from("/run/veracage/rt/app-x.sock"),
+            label: volumes.join(", "),
+            volumes: volumes.iter().map(|v| (*v).to_string()).collect(),
+            opener: None,
+            names: Vec::new(),
+        }
+    }
 
     #[test]
     fn off_never_dismounts() {
@@ -953,9 +1166,16 @@ mod tests {
     }
 
     #[test]
-    fn requests_are_paced_so_the_broker_sees_each_one() {
-        // A second volume waits: the command file carries one verb at a time.
-        assert!(!dismount_due(30, HOUR, Some(Duration::from_millis(200))));
-        assert!(dismount_due(30, HOUR, Some(DISMOUNT_REQUEST_GAP)));
+    fn the_idle_timer_waits_before_asking_again_for_a_volume_that_stayed() {
+        assert!(!dismount_due(30, HOUR, Some(DISMOUNT_RETRY_GAP - Duration::from_millis(1))));
+        assert!(dismount_due(30, HOUR, Some(DISMOUNT_RETRY_GAP)));
+    }
+
+    #[test]
+    fn every_volume_of_every_session_is_listed_once_in_a_stable_order() {
+        // What Dismount > All queues, and what the closing wait watches.
+        let leaders = [leader(&["work", "archive"]), leader(&["photos"])];
+        assert_eq!(volume_labels(&leaders), ["archive", "photos", "work"]);
+        assert!(volume_labels(&[]).is_empty());
     }
 }
