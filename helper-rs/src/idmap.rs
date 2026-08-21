@@ -1,8 +1,8 @@
 //! Idmapped-mount primitive: the heart of the UID-isolation core.
 //!
 //! Presents an already-mounted filesystem at `target` as owned by the vault
-//! uid/gid, WITHOUT touching the data. Validated recipe (docs/uid-isolation.md,
-//! proven by prototype/spike5): a transient user namespace mapping
+//! uid/gid, WITHOUT touching the data. Validated recipe (docs/uid-isolation.md):
+//! a transient user namespace mapping
 //! `inside = on-disk owner`, `outside = vault id`, then
 //! `open_tree(OPEN_TREE_CLONE)` -> `mount_setattr(MOUNT_ATTR_IDMAP)` ->
 //! `move_mount`. Requires kernel >= 5.12.
@@ -101,8 +101,13 @@ fn make_userns(on_disk_uid: u32, vault_uid: u32, on_disk_gid: u32, vault_gid: u3
     res
 }
 
-/// Idmap-mount `source_mount` (must already be a mountpoint) at `target`,
-/// presenting the on-disk owner as the vault uid/gid. The data is untouched.
+/// Idmap-mount the directory `source_mount` names at `target`, presenting the
+/// on-disk owner as the vault uid/gid. The data is untouched.
+///
+/// For a path WE control (the staging mount of a decrypted volume). A path the
+/// CALLER controls has to go through `idmap_mount_at` instead, or the check and
+/// the use resolve the name twice.
+#[allow(clippy::too_many_arguments)]
 pub fn idmap_mount(
     source_mount: &Path,
     target: &Path,
@@ -112,9 +117,38 @@ pub fn idmap_mount(
     vault_gid: u32,
     extra_attr: u64,
 ) -> io::Result<()> {
-    let ns = make_userns(on_disk_uid, vault_uid, on_disk_gid, vault_gid)?;
     let src = CString::new(source_mount.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "source path has NUL"))?;
+    let fd = unsafe {
+        libc::open(src.as_ptr(), libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+    };
+    if fd < 0 {
+        return Err(oserr("open source"));
+    }
+    let r = idmap_mount_at(fd, target, on_disk_uid, on_disk_gid, vault_uid, vault_gid, extra_attr);
+    unsafe { libc::close(fd) };
+    r
+}
+
+/// Idmap-mount the directory `src_fd` ALREADY refers to at `target`.
+///
+/// Taking a descriptor is the point: the shared directory is validated (a real
+/// directory, owned by the caller) and then mounted, and the caller owns the
+/// parent, so re-resolving the name in between let them swap the final component
+/// for a symlink to somewhere else and have root clone THAT into the sandbox.
+/// `open_tree` with `AT_EMPTY_PATH` acts on the descriptor, so there is only one
+/// resolution and it is the one that was checked.
+#[allow(clippy::too_many_arguments)]
+pub fn idmap_mount_at(
+    src_fd: libc::c_int,
+    target: &Path,
+    on_disk_uid: u32,
+    on_disk_gid: u32,
+    vault_uid: u32,
+    vault_gid: u32,
+    extra_attr: u64,
+) -> io::Result<()> {
+    let ns = make_userns(on_disk_uid, vault_uid, on_disk_gid, vault_gid)?;
     let tgt = CString::new(target.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "target path has NUL"))?;
     let empty = CString::new("").unwrap();
@@ -122,9 +156,12 @@ pub fn idmap_mount(
     let mnt_fd = unsafe {
         libc::syscall(
             SYS_OPEN_TREE,
-            libc::AT_FDCWD as libc::c_long,
-            src.as_ptr(),
-            OPEN_TREE_CLONE | (libc::O_CLOEXEC as libc::c_long) | AT_RECURSIVE,
+            src_fd as libc::c_long,
+            empty.as_ptr(),
+            OPEN_TREE_CLONE
+                | (libc::O_CLOEXEC as libc::c_long)
+                | AT_RECURSIVE
+                | (libc::AT_EMPTY_PATH as libc::c_long),
         )
     };
     if mnt_fd < 0 {

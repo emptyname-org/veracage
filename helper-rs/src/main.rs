@@ -23,6 +23,7 @@
 
 use std::env;
 use std::ffi::CString;
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
@@ -65,6 +66,12 @@ const EXIT_CRYPT_FAILED: i32 = 4;
 /// volume was opened, checked, and left dismounted. Distinct so the GUI can say
 /// what happened instead of showing a bare exit code.
 const EXIT_FSCK_FAILED: i32 = 5;
+
+/// Exit code for "the volume was detached but an app still holds it open, so its
+/// dm device (and its key) are still there". Distinct because it is the one
+/// dismount outcome the human MUST be told about: the menu entry is gone, yet
+/// the volume stays decrypted until that app lets go.
+const EXIT_VOLUME_BUSY: i32 = 6;
 
 /// Shared-workspace model (docs/shared-workspace.md): the ONE
 /// session's private mount NS holds every open volume under this tmpfs, each at
@@ -334,6 +341,20 @@ fn vault_hash(p: &Path) -> String {
     h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
+/// `<dev>:<ino>` of the source: what the container IS, rather than one of the
+/// names it answers to. The duplicate-open guard keys on this because a hash of
+/// the canonical path is defeated by a hard link, or by the same filesystem
+/// reachable at two canonical paths - and a second open of a container that is
+/// already open means two dm devices over one filesystem, both mounted
+/// read-write, which is corruption rather than a leak.
+fn source_key(source: &Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(source) {
+        Ok(md) => format!("{}:{}", md.dev(), md.ino()),
+        Err(_) => String::new(),
+    }
+}
+
 fn random_hex(bytes: usize) -> String {
     use std::io::Read;
     let mut buf = vec![0u8; bytes];
@@ -416,7 +437,6 @@ fn write_pidfile(path: &Path, uid: u32, gid: u32) {
         .open(path)
     {
         Ok(mut f) => {
-            use std::io::Write;
             let _ = f.write_all(format!("{}\n", std::process::id()).as_bytes());
             try_chown(path, uid, gid);
         }
@@ -516,7 +536,6 @@ fn lock_generation(body: &str) -> Option<&str> {
 /// flock and has already recovered/removed any stale predecessor lock.
 fn create_session_lock(sid: &str, uid: u32, gen: &str) {
     let path = format!("/run/veracage/session-{sid}.lock");
-    use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -528,15 +547,15 @@ fn create_session_lock(sid: &str, uid: u32, gen: &str) {
         .unwrap_or_else(|e| fail(&format!("write session lock {path}: {e}"), 1));
 }
 
-/// Append a volume to the session lock: a `volume=<dm_name>\t<label>\t<vault_hash>`
-/// line per open volume. cleanup.py `cleanup_session` walks these to close every
+/// Append a volume to the session lock: a
+/// `volume=<dm_name>\t<label>\t<vault_hash>\t<dev>:<ino>` line per open volume. cleanup.py `cleanup_session` walks these to close every
 /// dm on teardown; the vault hash is what lets a later open detect "this source
 /// is already open" (the duplicate-open guard in `run_session_add`). Written
 /// BEFORE the mount (with the dm_name we pre-generated) so an early crash still
 /// leaves the ExecStopPost a device to close.
-fn append_session_volume(sid: &str, human_uid: u32, dm_name: &str, label: &str, vhash: &str) {
+fn append_session_volume(sid: &str, human_uid: u32, dm_name: &str, label: &str,
+                        vhash: &str, skey: &str) {
     let path = format!("/run/veracage/session-{sid}.lock");
-    use std::io::Write;
     // create(true): if the lock somehow vanished under a live leader, a recreated
     // lock still tracks the dm for the ExecStopPost cleanup.
     let mut f = std::fs::OpenOptions::new()
@@ -554,7 +573,7 @@ fn append_session_volume(sid: &str, human_uid: u32, dm_name: &str, label: &str, 
         f.write_all(format!("user_uid={human_uid}\n").as_bytes())
             .unwrap_or_else(|e| fail(&format!("write session lock {path}: {e}"), 1));
     }
-    f.write_all(format!("volume={dm_name}\t{label}\t{vhash}\n").as_bytes())
+    f.write_all(format!("volume={dm_name}\t{label}\t{vhash}\t{skey}\n").as_bytes())
         .unwrap_or_else(|e| fail(&format!("write session lock {path}: {e}"), 1));
 }
 
@@ -573,6 +592,60 @@ fn lock_dms_for_vhash(body: &str, vhash: &str) -> Vec<String> {
         .collect()
 }
 
+/// dm names a session-lock body records for `skey` (the FOURTH tab field, the
+/// source's dev:ino). Pure, for unit tests. A line written before this field
+/// existed simply does not match, which is the same answer as "not open".
+fn lock_dms_for_source(body: &str, skey: &str) -> Vec<String> {
+    if skey.is_empty() {
+        return Vec::new();
+    }
+    body.lines()
+        .filter_map(|l| l.strip_prefix("volume="))
+        .filter_map(|v| {
+            let mut f = v.split('\t');
+            let dm = f.next().unwrap_or("").trim().to_string();
+            let _label = f.next();
+            let _vhash = f.next();
+            (f.next().map(str::trim) == Some(skey) && !dm.is_empty()).then_some(dm)
+        })
+        .collect()
+}
+
+/// The `volume=` lines of a stale lock whose dm device is STILL there, verbatim.
+/// A recovery that could not close a device must keep its line: that line is the
+/// only record any teardown has (cleanup.py and the sleep hook both walk it), so
+/// dropping it orphans a decrypted device, with its key in RAM, for good.
+fn lock_survivors(body: &str, still_open: impl Fn(&str) -> bool) -> Vec<String> {
+    body.lines()
+        .filter(|l| match l.strip_prefix("volume=") {
+            // No `let...else`: this crate builds on Debian 12's rustc 1.63.
+            Some(v) => {
+                let dm = v.split('\t').next().unwrap_or("").trim();
+                is_veracage_dm(dm) && still_open(dm)
+            }
+            None => false,
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Append raw `volume=` lines to the session lock, for a bootstrap carrying a
+/// stale session's still-open devices into its own lock.
+fn append_session_lines(sid: &str, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let path = format!("/run/veracage/session-{sid}.lock");
+    match std::fs::OpenOptions::new().append(true).open(&path) {
+        Ok(mut f) => {
+            for l in lines {
+                let _ = f.write_all(format!("{l}\n").as_bytes());
+            }
+        }
+        Err(e) => eprintln!("veracage-helper: carrying stale volumes into {path}: {e}"),
+    }
+}
+
 /// Record the session leader's pid + start-time (`session-<sid>.pid`, root 0600):
 /// the add-volume path reads it to find the workspace NS holder, and the
 /// start-time pins it against pid reuse. Root-only (consumed by another pkexec
@@ -589,7 +662,6 @@ fn write_session_pidfile(sid: &str, pid: i32) {
         .open(&path)
     {
         Ok(mut f) => {
-            use std::io::Write;
             let _ = f.write_all(format!("{pid}\n{st}\n").as_bytes());
         }
         Err(e) => eprintln!("veracage-helper: session pidfile {path}: {e}"),
@@ -655,6 +727,34 @@ fn close_all_session_dms(sid: &str) -> bool {
     all_ok
 }
 
+/// How long to keep retrying a `cryptsetup close` the kernel reports busy, and
+/// how long to wait between tries. Mirrors cleanup.py's CLOSE_RETRY_FOR: a
+/// namespace whose last process just died is torn down asynchronously, so a
+/// single attempt can lose a race it only has to wait out, and losing it leaves
+/// the volume unmounted with its key still in RAM.
+const CLOSE_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+const CLOSE_RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// `cryptsetup close` a dm device, retrying while the kernel reports it busy.
+/// True once the device is gone (including "it was never there").
+fn close_dm_retrying(dm: &str) -> bool {
+    let dm_path = format!("/dev/mapper/{dm}");
+    let deadline = std::time::Instant::now() + CLOSE_RETRY_FOR;
+    loop {
+        if !Path::new(&dm_path).exists() {
+            return true;
+        }
+        let _ = Command::new(tool("cryptsetup")).args(["close", dm]).status();
+        if !Path::new(&dm_path).exists() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(CLOSE_RETRY_EVERY);
+    }
+}
+
 /// A safe volume label = a single path component (non-empty, no '/', not '.'/'..').
 fn label_ok(s: &str) -> bool {
     !s.is_empty() && s.len() <= 128 && !s.contains('/') && s != "." && s != ".."
@@ -700,11 +800,165 @@ fn session_lock_remove(sid: &str, dm_name: &str) {
     }
 }
 
-/// Close JUST one volume of a running session: join the leader's NS,
-/// dismount `<WORKSPACE>/<label>` (lazy: a running app keeps its own copy), then
-/// `cryptsetup close --deferred` the dm (so a volume still held by an app closes
-/// when released) and drop it from the session lock. The rest of the session runs
-/// on. No --source, no leader, no compositor.
+/// Which processes hold `dm` mounted from OUTSIDE this mount namespace, as their
+/// command names, deduplicated and sorted. EVERY holder is listed, sandbox
+/// plumbing included: this is the close decision, not the message. Formatting
+/// (which drops the plumbing) is `holder_names`.
+///
+/// This is what decides whether a volume can really be closed. `cryptsetup close`
+/// fails with "Device is still in use" while any other mount namespace has the
+/// filesystem, and every sandboxed app has one: bubblewrap binds the workspace
+/// recursively, so the volume's mount is in the app's namespace whether or not it
+/// has a file open. Measured: this count predicted the close outcome exactly
+/// (0 -> closes, non-zero -> "still in use"), while `umount`
+/// succeeded in every case - so VeraCrypt's own busy test (run `umount`, report
+/// its failure) would detect nothing here.
+///
+/// Must be called AFTER setns into the leader's namespace, so `/proc/self/ns/mnt`
+/// is the namespace to exclude. Best-effort: an unreadable `/proc` entry is a
+/// process that is exiting, not a holder.
+fn foreign_holders(dm: &str) -> Vec<String> {
+    let needle = format!(" /dev/mapper/{dm} ");
+    let own_ns = match std::fs::read_link("/proc/self/ns/mnt") {
+        Ok(ns) => ns,
+        Err(_) => return Vec::new(),
+    };
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let pid = entry.file_name();
+        let pid = pid.to_string_lossy();
+        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        match std::fs::read_to_string(format!("/proc/{pid}/mountinfo")) {
+            Ok(mountinfo) if mountinfo.contains(&needle) => {}
+            _ => continue, // not a holder, or a process that just exited
+        }
+        match std::fs::read_link(format!("/proc/{pid}/ns/mnt")) {
+            Ok(ns) if ns != own_ns => {}
+            _ => continue, // our own namespace, or gone
+        }
+        // `/proc/<pid>/comm` is set by the process itself and may contain any
+        // byte, tabs and newlines included, and it goes out on a line-oriented
+        // protocol the broker parses. Sanitize it the way volume labels are.
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .and_then(|c| sanitized(&c));
+        names.push(comm.unwrap_or_else(|| "a process".to_string()));
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The holders worth naming to the human: Veracage's own sandbox plumbing is
+/// dropped so a message says Dolphin, not bwrap. Presentation ONLY. The decision
+/// to close is made on the full `foreign_holders` list, because a volume held by
+/// nothing but a still-exiting `bwrap` is just as unclosable, and umounting it
+/// first would leave the volume detached and still decrypted.
+fn holder_names(holders: &[String]) -> String {
+    let named: Vec<&str> = holders
+        .iter()
+        .map(String::as_str)
+        .filter(|c| !is_sandbox_wrapper(c))
+        .collect();
+    if named.is_empty() {
+        "Apps inside Veracage".to_string()
+    } else {
+        named.join(", ")
+    }
+}
+
+/// Process names that are Veracage's own sandbox plumbing rather than an app the
+/// human would recognise, so a "still in use" message names Dolphin, not bwrap.
+const SANDBOX_WRAPPERS: &[&str] = &["bwrap", "dbus-run-session", "dbus-daemon", "sh", "bash"];
+
+/// True if `comm` is sandbox plumbing. `/proc/<pid>/comm` is capped at 15
+/// characters, so "dbus-run-session" arrives as "dbus-run-sessio" and an equality
+/// test silently misses it - which is how the human got told a dismount was
+/// blocked by "dbus-run-sessio". Match the truncation instead.
+fn is_sandbox_wrapper(comm: &str) -> bool {
+    SANDBOX_WRAPPERS.iter().any(|w| *w == comm || w.starts_with(comm) && comm.len() >= 15)
+}
+
+/// How long the helper waits, after reporting holders, for the caller to say
+/// whether to go on. This is a ROOT process parked in the session's mount
+/// namespace, so the wait is bounded: the human side drives it (see the broker's
+/// APPS_CLOSED_WAIT) and this is only the backstop for a caller that dies.
+const HOLDERS_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Longest single poll slice while parked, so the leader-liveness check below
+/// runs about once a second rather than only when the caller says something.
+const HOLDERS_POLL_SLICE_MS: i32 = 1000;
+
+/// Wait for the caller's answer to a `holders` report: `go` (the apps are gone,
+/// try again) or EOF/anything else (leave the volume exactly as it is). Times out
+/// at HOLDERS_WAIT, and gives up at once if `leader_pid` dies.
+///
+/// The answer grants nothing: on `go` the holders are checked again in here, so
+/// the caller can only ask for a re-check it could have got by running us again.
+/// Waiting instead of exiting is what keeps ONE dismount to ONE authentication:
+/// polkit's auth_self_keep is bound to the calling process, so a second attempt
+/// from a second process would ask for the password again.
+///
+/// The leader check is what keeps this wait from outliving the thing it is
+/// waiting on. We are a ROOT process inside the session's mount namespace and we
+/// hold the session flock, so parking on after the leader has gone would keep
+/// that namespace (and every volume mount in it) alive AND block the teardown
+/// paths that take the same flock: the unit's ExecStopPost cleanup, which
+/// systemd kills at its stop timeout, and the root suspend hook, which the
+/// sleep transition waits on.
+fn wait_for_go(leader_pid: i32) -> bool {
+    let deadline = std::time::Instant::now() + HOLDERS_WAIT;
+    let mut line = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        if !Path::new(&format!("/proc/{leader_pid}")).exists() {
+            return false; // the session went away under us
+        }
+        let slice = (left.as_millis() as i32).min(HOLDERS_POLL_SLICE_MS);
+        let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        match unsafe { libc::poll(&mut pfd, 1, slice) } {
+            0 => continue,      // slice elapsed: re-check the leader, then wait on
+            n if n < 0 => return false, // poll failed: treat as gone
+            _ => {}
+        }
+        let mut buf = [0u8; 32];
+        let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n <= 0 {
+            return false; // EOF: cancelled
+        }
+        line.extend_from_slice(&buf[..n as usize]);
+        if let Some(end) = line.iter().position(|b| *b == b'\n') {
+            return &line[..end] == b"go";
+        }
+        if line.len() >= buf.len() {
+            return false; // not our protocol
+        }
+    }
+}
+
+/// Close JUST one volume of a running session: join the leader's NS, check that
+/// nothing outside it still holds the volume, then really dismount it and really
+/// `cryptsetup close` its dm before returning - the key is out of RAM by the time
+/// this exits, not "later, when an app lets go". The rest of the session runs on.
+/// The volume is either closed or untouched, never half-dismounted.
+///
+/// A volume an app still holds cannot be closed, and this is the ONE process the
+/// human authenticated for, so it does not hand the problem back and exit: it
+/// reports the holders on stdout (`holders\t<names>`) and waits for the caller to
+/// close them and answer `go` on stdin. Cancelling (EOF) leaves everything as it
+/// is. Refusals - a cancel, a re-check that still finds holders, a lost race -
+/// exit EXIT_VOLUME_BUSY with a `busy\t<reason>` line.
+///
+/// No --source, no leader, no compositor.
 fn run_close_volume(args: &Args, human_uid: u32, vault_uid: u32) -> ! {
     let sid = args.session.as_deref().unwrap_or_else(|| fail("--close-volume needs --session", 2));
     check_session_caller(sid, human_uid);
@@ -734,27 +988,54 @@ fn run_close_volume(args: &Args, human_uid: u32, vault_uid: u32) -> ! {
         unsafe { libc::close(fd) };
         let mp = format!("{WORKSPACE}/{label}");
         let dm = dm_at_mountpoint(&mp).unwrap_or_else(|| fail(&format!("volume {label} not mounted"), 1));
-        let cmp = CString::new(mp.clone()).unwrap();
-        unsafe { libc::umount2(cmp.as_ptr(), libc::MNT_DETACH) };
-        let _ = Command::new(tool("cryptsetup")).args(["close", "--deferred", &dm]).status();
-        // A deferred close completes only once the last holder (a running app's
-        // own NS copy of the mount) lets go. Drop the lock line only when the
-        // device is really gone: the line is what the duplicate-open guard reads,
-        // and while an app still holds the fs a reopen MUST keep being refused.
-        // If it stays busy, the line remains and teardown retries the close.
-        let dm_path = format!("/dev/mapper/{dm}");
-        for _ in 0..40 {
-            if !Path::new(&dm_path).exists() {
-                break;
+
+        // Check BEFORE touching anything, so a volume that cannot be closed is
+        // left exactly as it was rather than detached-but-decrypted. The names go
+        // to stdout for the caller to put in front of the human, who is the only
+        // one who can close those apps - so wait here for the answer rather than
+        // making them authenticate a second attempt.
+        let holders = foreign_holders(&dm);
+        if !holders.is_empty() {
+            println!("holders\t{}", holder_names(&holders));
+            let _ = std::io::stdout().flush();
+            if !wait_for_go(leader_pid) {
+                println!("busy\tcancelled");
+                std::process::exit(EXIT_VOLUME_BUSY);
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            if !foreign_holders(&dm).is_empty() {
+                println!("busy\tan app is still running");
+                std::process::exit(EXIT_VOLUME_BUSY);
+            }
         }
-        if !Path::new(&dm_path).exists() {
-            session_lock_remove(sid, &dm);
+
+        // A real dismount and a real close: no MNT_DETACH, no --deferred. If
+        // either is refused the volume stays as it was and so does the lock line,
+        // which is what the duplicate-open guard reads.
+        let cmp = CString::new(mp.clone()).unwrap();
+        if unsafe { libc::umount2(cmp.as_ptr(), 0) } != 0 {
+            eprintln!("veracage-helper: umount {mp}: {}", std::io::Error::last_os_error());
+            println!("busy\tthe volume is still in use");
+            std::process::exit(EXIT_VOLUME_BUSY);
         }
+        if !close_dm_retrying(&dm) {
+            // Unmounted but not closed. Nothing held it a moment ago and the
+            // retries above waited out the usual cause (a namespace the kernel
+            // had not finished tearing down), so this is a holder that appeared
+            // between the check and the umount. Say so: the volume is gone from
+            // the workspace but its key is not gone from RAM, and only the
+            // session teardown will close it now. The lock line stays, so a
+            // reopen keeps being refused and the teardown still knows the device.
+            println!("busy\tits device is still in use, so it is still decrypted");
+            std::process::exit(EXIT_VOLUME_BUSY);
+        }
+        session_lock_remove(sid, &dm);
         let _ = std::fs::remove_dir(&mp);
         std::process::exit(0);
     }
+    // Forward a SIGTERM/SIGINT to the child: it is a root process parked inside
+    // the session's namespace holding the session flock, so it must not outlive
+    // the helper it belongs to.
+    install_signal_forwarding(pid);
     std::process::exit(wait_for(pid));
 }
 
@@ -803,7 +1084,7 @@ fn spawn_compositor(
         fail(&format!("WAYLAND_DISPLAY must be a bare name, got {disp:?}"), 2);
     }
     let wl_path = Path::new(&runtime).join(disp);
-    let wl_fd = ipc::connect_host_wayland(&wl_path)
+    let wl_fd = ipc::connect_host_wayland(&wl_path, human_uid)
         .unwrap_or_else(|e| fail(&format!("host wayland connect ({}): {e}", wl_path.display()), 1));
 
     // Clear any stale socket left by a crashed compositor, then record our pid
@@ -865,6 +1146,53 @@ fn install_signal_forwarding(pid: i32) {
             // first, then convert that: keep the `*const ()` hop.
             libc::signal(sig, forward_signal as *const () as libc::sighandler_t);
         }
+    }
+}
+
+/// Refuse a source the CALLER could not open themselves.
+///
+/// Everything past this point runs as root, so without the check the helper is a
+/// way to have root open - and `fsck -p` WRITE to - a container or block device
+/// the caller has no permission for: file modes and the `disk` group stop
+/// mattering for anyone who knows the passphrase. The check is read-write because
+/// that is how Veracage mounts a volume and what the filesystem check needs.
+///
+/// Done in a child, so the uid drop is thrown away with it. There is a residual
+/// TOCTOU (we check a path and root opens it again later); closing that means
+/// passing the descriptor through to cryptsetup, which is a bigger change.
+fn check_caller_can_open(source: &Path, human_uid: u32, human_gid: u32) {
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        fail_errno("fork(access check)");
+    }
+    if pid == 0 {
+        let path = match CString::new(source.as_os_str().as_bytes()) {
+            Ok(p) => p,
+            Err(_) => unsafe { libc::_exit(1) },
+        };
+        unsafe {
+            // Supplementary groups first, while still root: otherwise the caller
+            // would keep root's group memberships and the check would be laxer
+            // than the caller really is.
+            if libc::setgroups(0, std::ptr::null()) != 0
+                || libc::setresgid(human_gid, human_gid, human_gid) != 0
+                || libc::setresuid(human_uid, human_uid, human_uid) != 0
+            {
+                libc::_exit(1);
+            }
+            let fd = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+            libc::_exit(if fd < 0 { 1 } else { 0 });
+        }
+    }
+    if wait_for(pid) != 0 {
+        fail(
+            &format!(
+                "{} is not yours to open: the account that authenticated cannot \
+                 open it read-write",
+                source.display()
+            ),
+            2,
+        );
     }
 }
 
@@ -931,7 +1259,7 @@ fn sanitized(raw: &str) -> Option<String> {
 /// the owner check rejects anything resolving to a root/other-owned dir (e.g.
 /// `--exchange /etc`); a symlink to another of the human's OWN dirs is harmless
 /// (their own data, and a same-uid attacker already has it).
-fn validated_exchange(path: &str, human_uid: u32) -> Option<PathBuf> {
+fn validated_exchange(path: &str, human_uid: u32) -> Option<std::fs::File> {
     use std::os::unix::fs::MetadataExt;   // OpenOptionsExt is imported at the top
     let f = std::fs::OpenOptions::new()
         .read(true)
@@ -939,7 +1267,11 @@ fn validated_exchange(path: &str, human_uid: u32) -> Option<PathBuf> {
         .open(path)
         .ok()?;
     let md = f.metadata().ok()?;
-    (md.is_dir() && md.uid() == human_uid).then(|| PathBuf::from(path))
+    // The FILE is returned, not the path: what was checked is what gets mounted
+    // (see idmap::idmap_mount_at). Handing the path back let the caller, who owns
+    // the parent directory, swap the final component between this check and the
+    // mount and have root clone a different tree into the sandbox.
+    (md.is_dir() && md.uid() == human_uid).then_some(f)
 }
 
 /// cryptsetup-open `source` and idmap-mount it at `<WORKSPACE>/<label>` in the
@@ -1155,8 +1487,8 @@ fn session_child(
                 let xmp = PathBuf::from(format!("/run/veracage/session-{sid}.x"));
                 let _ = std::fs::create_dir_all(&xmp);
                 set_mode(&xmp, 0o700);
-                match idmap::idmap_mount(
-                    &x, &xmp, human_uid, human_gid, vault_uid, vault_gid,
+                match idmap::idmap_mount_at(
+                    x.as_raw_fd(), &xmp, human_uid, human_gid, vault_uid, vault_gid,
                     idmap::ATTR_NOSUID_NODEV_NOEXEC,
                 ) {
                     Ok(()) => env::set_var("VERACAGE_EXCHANGE", &xmp),
@@ -1193,6 +1525,8 @@ fn session_child(
     rest.push("--mountpoint".to_string());
     rest.push(mountpoint.display().to_string());
     check_continuation_argv(&rest);
+    // The exec below also closes our inherited copy of the session flock (Rust
+    // opens files O_CLOEXEC), which is what releases it. See the fork site.
     let err = Command::new(cont).args(&rest).exec();
     fail(&format!("exec continuation {}: {err}", cont.display()), 127);
 }
@@ -1244,9 +1578,24 @@ fn run_session_bootstrap(
     // flock before the bootstrap-vs-add decision and passed it down). A stale
     // lock here (crashed predecessor whose ExecStopPost failed) is recovered
     // first: close its orphan dms and start from a clean slate.
+    // Devices a recovery could not close, carried into the new lock below.
+    let mut carried: Vec<String> = Vec::new();
     if Path::new(&lock_path).exists() {
         eprintln!("veracage-helper: recovering a stale session lock for sid {sid}");
-        let _ = close_all_session_dms(sid);
+        if !close_all_session_dms(sid) {
+            // A device that would not close is still decrypted. Its line is the
+            // only thing that will ever close it (the ExecStopPost cleanup and
+            // the sleep hook both read the lock), so carry it rather than start
+            // "from a clean slate" and lose the key in RAM.
+            carried = std::fs::read_to_string(&lock_path)
+                .map(|b| lock_survivors(&b, |dm| Path::new(&format!("/dev/mapper/{dm}")).exists()))
+                .unwrap_or_default();
+            eprintln!(
+                "veracage-helper: {} volume(s) of the stale session are still open; \
+                 carrying them into the new session lock",
+                carried.len()
+            );
+        }
         let _ = std::fs::remove_file(&lock_path);
     }
 
@@ -1256,13 +1605,14 @@ fn run_session_bootstrap(
     // tearing down must not have its lock/pidfile/dms clobbered.
     let gen = random_hex(8);
     create_session_lock(sid, human_uid, &gen);
+    append_session_lines(sid, &carried);
     // Only a VOLUME bootstrap records a dm in the lock pre-fork; an empty session
     // starts with no volume (they join later via the add-volume path, which
     // appends their own lines). Pre-fork volume line uses an empty label; the
     // dm_name is what teardown needs to close the device.
     let dm_name = source.map(|_| random_dm_name());
     if let (Some(s), Some(dm)) = (source, dm_name.as_deref()) {
-        append_session_volume(sid, human_uid, dm, "", &vault_hash(s));
+        append_session_volume(sid, human_uid, dm, "", &vault_hash(s), &source_key(s));
     }
 
     // The persistent compositor is brought up by the CLI (`veracage _up`, its own
@@ -1282,14 +1632,26 @@ fn run_session_bootstrap(
     // Parent (root, original NS): the session leader's pid (+ start-time) lets the
     // add-volume path find + verify the workspace NS holder.
     write_session_pidfile(sid, pid);
-    // Release the session flock for the leader's lifetime: add-volume and
-    // close-volume operations must be able to take it while we block in waitpid.
+    // Release OUR reference to the session flock. The lock itself stays held until
+    // the CHILD's inherited copy closes, which happens when it execs the leader -
+    // i.e. exactly when `verify_session_leader` starts recognising the session.
+    //
+    // That is load-bearing and easy to miss: an flock lives on the open file
+    // description, which fork shares, so dropping it here does NOT release it.
+    // Between the fork and the exec the child is still root, so a concurrent
+    // `veracage open` would see no live session and take the bootstrap path over
+    // this one - and it is this inherited reference that stops it, by making that
+    // second helper block in `session_flock` until we are established. Measured
+    // by taking `flock -n` on the sidecar one second into a deliberately slow
+    // open, with no leader up yet: the lock is HELD, and the holder is this
+    // helper. Anything that changes the fd handling around this fork has to keep
+    // that property.
     drop(flock);
     install_signal_forwarding(pid);
     let rc = wait_for(pid);
 
     // TEST-ONLY fault injection (debug builds only; compiled out of `make install`
-    // release binaries): widen the teardown window so a spike can deterministically
+    // release binaries): widen the teardown window so a test can deterministically
     // interleave a successor bootstrap for the SAME sid between the leader's death
     // and this teardown, proving the generation guard below protects the successor.
     #[cfg(debug_assertions)]
@@ -1364,9 +1726,15 @@ fn run_session_add(
     // genuinely open (a per-volume close drops the line once its dm is gone, so a
     // closed volume can be reopened).
     let vhash = vault_hash(source);
+    let skey = source_key(source);
     let lock_body = std::fs::read_to_string(format!("/run/veracage/session-{sid}.lock"))
         .unwrap_or_default();
-    for dm in lock_dms_for_vhash(&lock_body, &vhash) {
+    // Both keys: dev:ino catches the same container under another name (a hard
+    // link, a second mount of the same filesystem), and the path hash still
+    // catches lines written before dev:ino was recorded.
+    let mut open_dms = lock_dms_for_source(&lock_body, &skey);
+    open_dms.extend(lock_dms_for_vhash(&lock_body, &vhash));
+    for dm in open_dms {
         if Path::new(&format!("/dev/mapper/{dm}")).exists() {
             fail(&format!(
                 "{} is already open in the running workspace; close that volume \
@@ -1378,7 +1746,7 @@ fn run_session_add(
     let dm_name = random_dm_name();
     // Append to the session lock BEFORE the mount (crash safety): the dm_name is
     // pre-generated, so even an early kill leaves teardown a device to close.
-    append_session_volume(sid, human_uid, &dm_name, "", &vhash);
+    append_session_volume(sid, human_uid, &dm_name, "", &vhash, &skey);
 
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -1465,7 +1833,6 @@ fn write_launch_request(sid: &str, spec: &str, vault_uid: u32, vault_gid: u32) {
             return;
         }
     };
-    use std::io::Write;
     if file.write_all(spec.as_bytes()).is_err() {
         let _ = std::fs::remove_file(&path);
         return;
@@ -1550,6 +1917,7 @@ fn main() {
     if !(ft.is_file() || ft.is_block_device()) {
         fail(&format!("source must be a file or block device: {}", source.display()), 2);
     }
+    check_caller_can_open(&source, human_uid, human_gid);
 
     // Shared-workspace open (the only mount mode). The helper picks bootstrap
     // vs. add-volume by whether a LIVE, verified session leader already holds
@@ -1778,6 +2146,48 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_plumbing_is_filtered_from_the_message_only() {
+        // The close decision is made on the full holder list. Filtering the
+        // plumbing out of DETECTION was the bug: with only a still-exiting bwrap
+        // holding the volume, the helper saw "no holders", unmounted, and then
+        // could not close the device - leaving it detached and still decrypted.
+        let holders = vec!["bwrap".to_string(), "dbus-run-sessio".to_string()];
+        assert!(!holders.is_empty(), "detection must still see them");
+        assert_eq!(holder_names(&holders), "Apps inside Veracage");
+
+        let mixed = vec!["bwrap".to_string(), "dolphin".to_string()];
+        assert_eq!(holder_names(&mixed), "dolphin");
+    }
+
+    #[test]
+    fn is_sandbox_wrapper_matches_the_15_char_comm_truncation() {
+        // /proc/<pid>/comm is capped at 15 characters, so "dbus-run-session"
+        // arrives truncated and an equality test misses it.
+        assert!(is_sandbox_wrapper("bwrap"));
+        assert!(is_sandbox_wrapper("dbus-run-sessio"));
+        assert!(is_sandbox_wrapper("dbus-daemon"));
+        assert!(!is_sandbox_wrapper("dolphin"));
+        assert!(!is_sandbox_wrapper("dbus"));   // a prefix, but not truncated at 15
+    }
+
+    #[test]
+    fn lock_survivors_keeps_only_the_lines_whose_device_is_still_open() {
+        // A recovery that could not close a device must carry its line forward:
+        // the line is the only record any teardown has of that device.
+        let body = "user_uid=1000\n\
+                    generation=00aabbccddeeff11\n\
+                    volume=veracage-aaaaaaaaaaaa\tWork\t0631c55cceb0614f\n\
+                    volume=veracage-bbbbbbbbbbbb\tGone\tdeadbeefdeadbeef\n";
+        let live = |dm: &str| dm == "veracage-aaaaaaaaaaaa";
+        assert_eq!(
+            lock_survivors(body, live),
+            vec!["volume=veracage-aaaaaaaaaaaa\tWork\t0631c55cceb0614f".to_string()]
+        );
+        // Nothing still open -> nothing carried, and a header is never carried.
+        assert!(lock_survivors(body, |_| false).is_empty());
+    }
+
+    #[test]
     fn lock_generation_parses_header() {
         assert_eq!(
             lock_generation("user_uid=1000\ngeneration=00aabbccddeeff11\nvolume=x\ty\tz\n"),
@@ -1797,6 +2207,43 @@ mod tests {
         suppress_core_dumps();
         let filter = std::fs::read_to_string("/proc/self/coredump_filter").unwrap();
         assert_eq!(u32::from_str_radix(filter.trim(), 16).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_hard_link_does_not_get_past_the_duplicate_open_guard() {
+        // The guard's whole job is to stop one container being opened twice: two
+        // dm devices over one filesystem, both mounted read-write. Keyed on the
+        // canonical PATH it was defeated by a second name for the same file.
+        let dir = std::env::temp_dir().join(format!("vc-dup-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let a = dir.join("volume.vc");
+        let b = dir.join("same-volume.vc");
+        std::fs::write(&a, b"x").unwrap();
+        let _ = std::fs::remove_file(&b);
+        std::fs::hard_link(&a, &b).unwrap();
+
+        let key = source_key(&a);
+        assert!(!key.is_empty());
+        assert_eq!(key, source_key(&b), "a hard link is the same container");
+        assert_ne!(vault_hash(&a), vault_hash(&b), "but not the same path");
+
+        let body = format!("user_uid=1000\nvolume=veracage-aaaaaaaaaaaa\tWork\t{}\t{}\n",
+                           vault_hash(&a), key);
+        assert_eq!(lock_dms_for_source(&body, &key),
+                   vec!["veracage-aaaaaaaaaaaa".to_string()]);
+        // And the old path-keyed lookup still answers for the line it wrote.
+        assert_eq!(lock_dms_for_vhash(&body, &vault_hash(&a)),
+                   vec!["veracage-aaaaaaaaaaaa".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lock_dms_for_source_ignores_lines_without_the_field() {
+        // Written before dev:ino was recorded: no match, i.e. the same answer as
+        // "not open", so an upgrade mid-session cannot produce a false refusal.
+        let body = "user_uid=1000\nvolume=veracage-aaaaaaaaaaaa\tWork\t0631c55cceb0614f\n";
+        assert!(lock_dms_for_source(body, "66306:1234").is_empty());
+        assert!(lock_dms_for_source(body, "").is_empty());
     }
 
     #[test]

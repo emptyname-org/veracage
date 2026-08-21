@@ -97,11 +97,78 @@ fn open_dir_created(dir: &Path) -> io::Result<RawFd> {
 /// Connect to the host compositor's Wayland socket; return an inheritable
 /// connected fd (the leader passes it to the compositor as WAYLAND_SOCKET). Done
 /// as root because the vault uid can't enter the human's 0700 runtime dir.
-pub fn connect_host_wayland(path: &Path) -> io::Result<RawFd> {
+pub fn connect_host_wayland(path: &Path, human_uid: u32) -> io::Result<RawFd> {
+    // The NAME comes from the caller and the DIRECTORY belongs to the caller, so
+    // check the thing we are about to connect to without following a symlink:
+    // `ln -s /run/systemd/private ~/.../wayland-evil` plus
+    // `--setenv WAYLAND_DISPLAY=wayland-evil` otherwise has root open a connected
+    // socket to a root-only service and hand the descriptor to the veracage uid.
+    // No race is needed for that, which is why the plain name check was not enough.
+    let dir = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "wayland path has no parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "wayland path has no name"))?;
+    let cdir = CString::new(dir.as_os_str().as_bytes())?;
+    let cname = CString::new(name.as_bytes())?;
+    let dfd = unsafe {
+        libc::open(cdir.as_ptr(), libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+    };
+    if dfd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::fstatat(dfd, cname.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+    };
+    unsafe { libc::close(dfd) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFSOCK || st.st_uid != human_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the host Wayland display is not a socket owned by the caller",
+        ));
+    }
+
     let s = UnixStream::connect(path)?;
+
+    // And check WHAT we reached, not just what the name pointed at a moment ago:
+    // the peer of the host compositor is the human, so anything else means the
+    // name was swapped between the check above and this connect.
+    let peer = peer_uid(&s)?;
+    if peer != human_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("the host Wayland socket is served by uid {peer}, not the caller"),
+        ));
+    }
+
     let fd = s.into_raw_fd();
     clear_cloexec(fd)?;
     Ok(fd)
+}
+
+/// uid on the other end of a connected unix socket (SO_PEERCRED).
+fn peer_uid(s: &UnixStream) -> io::Result<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(cred.uid)
 }
 
 /// Create the control listening socket at `path` (under the human's runtime
@@ -183,4 +250,67 @@ pub fn create_control_socket(path: &Path, human_uid: u32, human_gid: u32) -> io:
     let fd = listener.into_raw_fd();
     clear_cloexec(fd)?;
     Ok(fd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("vc-ipc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn me() -> u32 {
+        unsafe { libc::getuid() }
+    }
+
+    #[test]
+    fn connects_to_a_real_socket_owned_by_the_caller() {
+        let d = tmpdir("ok");
+        let sock = d.join("wayland-0");
+        let _l = UnixListener::bind(&sock).unwrap();
+        let fd = connect_host_wayland(&sock, me()).expect("should connect");
+        assert!(fd >= 0);
+        unsafe { libc::close(fd) };
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn refuses_a_name_that_is_a_symlink() {
+        // The attack this closes: the caller owns their runtime dir, so
+        // `WAYLAND_DISPLAY=wayland-evil` with a symlink behind it had root open a
+        // connected socket to something else entirely and hand the descriptor to
+        // the veracage uid. No race needed, which is why the "no slash in the
+        // name" check was not enough on its own.
+        let d = tmpdir("link");
+        let real = d.join("real.sock");
+        let _l = UnixListener::bind(&real).unwrap();
+        let link = d.join("wayland-evil");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(connect_host_wayland(&link, me()).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn refuses_a_name_that_is_not_a_socket() {
+        let d = tmpdir("file");
+        let f = d.join("wayland-0");
+        std::fs::write(&f, b"not a socket").unwrap();
+        assert!(connect_host_wayland(&f, me()).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn refuses_a_socket_that_is_not_the_callers() {
+        let d = tmpdir("owner");
+        let sock = d.join("wayland-0");
+        let _l = UnixListener::bind(&sock).unwrap();
+        // Same socket, a caller it does not belong to.
+        assert!(connect_host_wayland(&sock, me() + 1).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
