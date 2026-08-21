@@ -134,6 +134,20 @@ build rather than advice:
   rustup toolchain (clippy ships there). The gate runs it as its own component
   and CI runs the same command.
 - Python: `make lint` (ruff + mypy).
+- Dependencies: `make audit` (cargo-audit against the RustSec database) and
+  `make deps` (what each binary actually pulls in). Both are gate components too.
+
+An advisory that needs an upstream release is not a reason to leave the gate red
+or to stop running the check. Record it in `tests/audit-reviewed.txt` with the
+reason it is accepted, which both the gate and `make audit` read, so a NEW
+advisory fails and a reviewed one does not. Delete the line when the tree stops
+carrying the crate.
+
+Dependencies are a security surface, not just a build detail. The privileged
+helper runs as root, so every crate in its tree runs as root: it is 11 crates and
+the gate holds it under a budget of 15, deliberately, while the GUI crates carry
+275 and 142. Adding a dependency to the helper is a decision to make on purpose
+and to raise the budget for, not something to discover later.
 
 A lint you decide not to follow is a decision to record, not one to leave
 failing: allow it at the narrowest scope that works, with a comment saying why.

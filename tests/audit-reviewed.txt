@@ -1,0 +1,30 @@
+# Advisories that have been looked at and accepted, one per line, with the reason.
+# `make audit` and the gate's advisory component ignore these, so a NEW advisory
+# turns the gate red while a reviewed one does not. Read by both, so the list
+# lives in exactly one place.
+#
+# Re-check an entry when its upstream releases: the fix for most of these is a
+# dependency bump we do not control, not a change here. Delete the line when the
+# tree no longer carries the crate.
+#
+# The privileged helper (11 crates) has NO advisories and no entries here. Every
+# line below is in the GUI crates, which is where eframe/egui/smithay/winit pull
+# in ~275 and ~142 crates respectively (see `make deps`).
+
+RUSTSEC-2026-0194   # quick-xml, quadratic parse on duplicate attributes.
+                    # Two copies, neither reachable with attacker data: 0.39.4 is a
+                    # BUILD-TIME proc-macro (wayland-scanner reading the protocol XML
+                    # that ships with the crate), and 0.30.0 is under accesskit's
+                    # AT-SPI stack, which parses the desktop's own D-Bus
+                    # introspection. Fixed upstream in 0.41; both parents pin <0.41.
+RUSTSEC-2026-0195   # quick-xml, unbounded namespace allocation. Same two copies,
+                    # same reasoning, same upstream fix.
+RUSTSEC-2024-0436   # paste, unmaintained proc-macro. Build-time only.
+RUSTSEC-2026-0192   # ttf-parser, unmaintained. Font parsing under egui. The
+                    # compositor already refuses a font file whose signature is not
+                    # sfnt/WOFF before epaint sees it (fonts::is_scalable_font).
+RUSTSEC-2026-0196   # cgmath, unmaintained. Transitive under smithay.
+RUSTSEC-2026-0197   # cgmath, UB in Matrix::swap_columns with identical indices.
+                    # Neither crate calls swap_columns (grep: no hits).
+RUSTSEC-2026-0221   # event-listener, !Send tags across threads via StackSlot.
+                    # Transitive under the async stack of the file portal.

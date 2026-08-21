@@ -91,6 +91,25 @@ jobs:
       - name: build + test the compositor
         run: cargo test --manifest-path compositor-rs/Cargo.toml
 
+  audit:
+    name: dependency advisories (cargo-audit)
+    runs-on: ubuntu-latest
+    # Advisory, not blocking: a finding here is usually fixed by an UPSTREAM
+    # release, so failing the build would only teach people to ignore it. It
+    # still has to be visible, which is what this job is for. `make audit` runs
+    # the same check locally.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+      - name: helper (the tree that matters most, 11 crates)
+        run: cargo-audit audit --file helper-rs/Cargo.lock
+      - name: agent
+        run: cargo-audit audit --file agent-rs/Cargo.lock
+      - name: compositor
+        run: cargo-audit audit --file compositor-rs/Cargo.lock
+
   policy:
     name: polkit policy is well-formed
     runs-on: ubuntu-latest

@@ -51,6 +51,8 @@ help:
 	@echo '  test          Run the Python unit tests'
 	@echo '  test-rs       Run the Rust helper unit tests (cargo test)'
 	@echo '  lint          ruff + mypy (needs the .venv dev deps)'
+	@echo '  audit         cargo-audit the 3 dependency trees (needs network)'
+	@echo '  deps          what each binary pulls in (cargo tree)'
 	@echo '  uninstall / uninstall-dev / clean'
 	@echo '  test-vault    Create a throwaway VeraCrypt volume for manual testing'
 
@@ -119,6 +121,25 @@ veracage-user:
 	@if getent group render >/dev/null 2>&1 && ! id -nG veracage | grep -qw render; then \
 	  sudo usermod -aG render veracage; fi
 	@echo "veracage user uid: $$(id -u veracage)"
+
+# --- dependency review ---------------------------------------------------
+# Also a gate component. Findings that need an UPSTREAM release are recorded in
+# tests/audit-reviewed.txt with the reason, so the gate stays green on what has
+# been looked at and turns red on anything NEW. No network means SKIP, not fail.
+audit:
+	@command -v cargo-audit >/dev/null 2>&1 || { \
+	  echo 'cargo-audit not installed: cargo install cargo-audit --locked'; exit 2; }
+	@rc=0; ign=$$(awk '/^RUSTSEC-/ {printf " --ignore %s", $$1}' tests/audit-reviewed.txt); \
+	  for c in helper-rs agent-rs compositor-rs; do \
+	  echo "=== $$c ==="; cargo-audit audit --file $$c/Cargo.lock $$ign || rc=1; done; exit $$rc
+
+# What the three binaries actually pull in. Worth a look before a release: this
+# is a tool that runs next to decrypted data, and the helper's tree (11 crates)
+# is small on purpose while the GUI crates are not.
+deps:
+	@for c in helper-rs agent-rs compositor-rs; do \
+	  echo "=== $$c: $$($(AGENT_CARGO) tree --manifest-path $$c/Cargo.toml --prefix none --no-dedupe 2>/dev/null | sort -u | wc -l) unique crates ==="; \
+	  $(AGENT_CARGO) tree --manifest-path $$c/Cargo.toml --duplicates 2>/dev/null | head -40; done
 
 # --- polkit policy check -------------------------------------------------
 # polkitd drops a malformed policy file WHOLE and says nothing, so a broken one

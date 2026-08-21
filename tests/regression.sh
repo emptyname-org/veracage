@@ -86,6 +86,49 @@ c_clippy() { # every lint that is not the house style, on all three crates
   return $rc
 }
 
+# Advisories that have been reviewed and accepted (tests/audit-reviewed.txt), as
+# --ignore flags. A NEW advisory is therefore a red gate; a known one is not.
+audit_ignores() {
+  local f="$ROOT/tests/audit-reviewed.txt" out=""
+  [ -f "$f" ] || return 0
+  while read -r id _; do
+    case "$id" in RUSTSEC-*) out="$out --ignore $id";; esac
+  done < "$f"
+  echo "$out"
+}
+
+c_audit() { # known advisories in the three dependency trees
+  have cargo-audit || { echo "cargo-audit not installed (cargo install cargo-audit --locked)"; return 2; }
+  # It fetches the RustSec database; on a box with no network this is a SKIP, not
+  # a failure, or the gate would be unusable offline.
+  local rc=0
+  for c in helper-rs agent-rs compositor-rs; do
+    # shellcheck disable=SC2046
+    cargo-audit audit --file "$ROOT/$c/Cargo.lock" $(audit_ignores) >/tmp/vc-audit-$c.out 2>&1 || rc=1
+    grep -q 'error: couldn.t fetch\|Couldn.t fetch advisory database' /tmp/vc-audit-$c.out && { echo "no network for the advisory db"; return 2; }
+  done
+  [ "$rc" = 0 ] || { for c in helper-rs agent-rs compositor-rs; do
+      grep -E '^(Crate|Title|ID):' /tmp/vc-audit-$c.out | head -12; done; }
+  return $rc
+}
+
+# The privileged helper's dependency tree is small ON PURPOSE: it runs as root,
+# so every crate in it is code that runs as root. This is the budget, not a
+# style preference - if a change needs to exceed it, that is a decision to take
+# deliberately and to raise here.
+HELPER_DEP_BUDGET=15
+
+c_helper_deps() { # the root helper's dependency surface stays small
+  local cargo="$RUSTUP_CARGO"
+  [ -x "$cargo" ] || cargo="$(command -v cargo)"
+  [ -n "$cargo" ] || { echo "no cargo"; return 2; }
+  local n
+  n=$("$cargo" tree --manifest-path "$ROOT/helper-rs/Cargo.toml" --prefix none --no-dedupe 2>/dev/null \
+      | sed '/^$/d' | sort -u | wc -l)
+  echo "helper tree: $n crates (budget $HELPER_DEP_BUDGET)"
+  [ "$n" -le "$HELPER_DEP_BUDGET" ]
+}
+
 c_helper_contract() { # the privilege-boundary tests, against the BUILT helper
   local py="$PY"
   [ -x "$ROOT/.venv/bin/python" ] && py="$ROOT/.venv/bin/python"
@@ -195,13 +238,15 @@ component "rust: agent build"        c_agent_build
 component "python: unit tests"       c_py_tests
 component "helper argument contract" c_helper_contract
 component "rust: clippy (3 crates)"  c_clippy
+component "rust: dependency advisories" c_audit
+component "rust: helper dep budget"  c_helper_deps
 component "python: lint (ruff+mypy)" c_py_lint
 component "headless compositor smoke" c_headless_smoke
 
 # ------------------------------------------------------------- summary ------
 # A SKIP of a CORE component (a build or the unit tests) means the environment
 # can't actually run the gate - treat it as a failure, not a silent pass.
-CORE_RE='helper build|compositor build|agent build|unit tests|lint|argument contract|clippy'
+CORE_RE='helper build|compositor build|agent build|unit tests|lint|argument contract|clippy|dep budget'
 printf '\n'; bold "================ SUMMARY ================"
 fails=0
 for name in "${ORDER[@]}"; do
