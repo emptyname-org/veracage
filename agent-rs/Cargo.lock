@@ -3438,6 +3438,7 @@ dependencies = [
  "arboard",
  "eframe",
  "indexmap",
+ "libc",
  "resvg",
  "rfd",
  "serde",

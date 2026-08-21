@@ -87,7 +87,7 @@ const CLIP_TIMEOUTS: &[u32] = &[10, 30, 60, 120];
 /// them whatever font size the user picked.
 const LABELS: &[&str] = &[
     "Clear host clipboard:",
-    "Auto-dismount after:",
+    "Auto-close after:",
     "On system suspend:",
     "Shared directory",
 ];
@@ -95,7 +95,7 @@ const LABELS: &[&str] = &[
 /// The widest text a dropdown is expected to show. Every control is given the
 /// same width so their right edges line up, and anything longer than this is
 /// truncated rather than allowed to stretch its row.
-const CONTROL_SAMPLES: &[&str] = &["Dismount (recommended)", "After 120 seconds"];
+const CONTROL_SAMPLES: &[&str] = &["Close (recommended)", "After 120 seconds"];
 
 /// Width of the control column at the CURRENT font: the widest sample plus room
 /// for the dropdown's arrow.
@@ -229,7 +229,6 @@ impl eframe::App for Settings {
         });
 
         crate::theme::content_panel(ctx, |ui| {
-            ui.add_space(6.0);
             let col = label_column_width(ui);
             let ctrl = control_width(ui);
 
@@ -267,7 +266,7 @@ impl eframe::App for Settings {
 
             // Idle, not elapsed: the volume closes when Veracage has been left
             // alone, not while it is being used.
-            crate::theme::row(ui, col, "Auto-dismount after:", |ui| {
+            crate::theme::row(ui, col, "Auto-close after:", |ui| {
                 egui::ComboBox::from_id_salt("auto_dismount")
                     .width(ctrl)
                     .truncate()
@@ -288,19 +287,19 @@ impl eframe::App for Settings {
                     .width(ctrl)
                     .truncate()
                     .selected_text(match self.cfg.suspend_action.as_str() {
-                        "ignore" => "Leave mounted",
-                        _ => "Dismount (recommended)",
+                        "ignore" => "Leave open",
+                        _ => "Close (recommended)",
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
                             &mut self.cfg.suspend_action,
                             "dismount".into(),
-                            "Dismount (recommended)",
+                            "Close (recommended)",
                         );
                         ui.selectable_value(
                             &mut self.cfg.suspend_action,
                             "ignore".into(),
-                            "Leave mounted",
+                            "Leave open",
                         );
                     });
             });
@@ -365,10 +364,9 @@ impl eframe::App for Settings {
             self.cfg.exchange_dir = (!d.is_empty()).then(|| d.to_string());
             match config::save(&self.cfg) {
                 Ok(_) => {
-                    // Push the window size + font to the compositor so they take
-                    // effect now, not only on next launch (the broker also
-                    // republishes on the config change; this is immediate).
-                    crate::broker::publish_window_size(&self.cfg.window_size);
+                    // Push the font to the compositor so it takes effect now,
+                    // not only on next launch (the broker also republishes on
+                    // the config change, this is immediate).
                     crate::broker::publish_font(&self.cfg);
                     crate::broker::publish_clipclear(&self.cfg);
                     crate::broker::publish_theme(&self.cfg);

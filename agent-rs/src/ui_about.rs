@@ -55,7 +55,6 @@ struct About {
 impl eframe::App for About {
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         crate::theme::content_panel(ctx, |ui| {
-                ui.add_space(16.0);
                 ui.vertical_centered(|ui| {
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(ICON_PT, ICON_PT), egui::Sense::hover());

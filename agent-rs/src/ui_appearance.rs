@@ -24,6 +24,12 @@ const LABELS: &[&str] = &["Theme:", "Window size:", "Font:", "Font size:"];
 /// an app only reads it when it starts.
 const THEME_NOTE: &str = "Restart apps to apply";
 
+/// Shown beside the Window size dropdown. The size is applied when the Veracage
+/// window is CREATED, not to the running one: resizing the nested output mid
+/// session leaves the menu bar laid out for the old width, so the strip is drawn
+/// and hit-tested in different places (docs/known-problems.md).
+const SIZE_NOTE: &str = "Applies at next start";
+
 /// The widest text a dropdown is expected to show; longer selections truncate
 /// rather than stretch their row.
 const CONTROL_SAMPLES: &[&str] = &["Host system font (Noto Sans)", "Host system size (12 pt)"];
@@ -88,13 +94,12 @@ impl eframe::App for Appearance {
         });
 
         crate::theme::content_panel(ctx, |ui| {
-            ui.add_space(6.0);
             let col = crate::theme::text_width(ui, LABELS) + 24.0;
             // The Theme row carries a note to the right of its dropdown, so the
             // controls are only as wide as what is left after the label column
             // and that note. Long selections truncate rather than push it out of
             // the window.
-            let note = crate::theme::text_width(ui, &[THEME_NOTE]) + 16.0;
+            let note = crate::theme::text_width(ui, &[THEME_NOTE, SIZE_NOTE]) + 16.0;
             let natural = crate::theme::text_width(ui, CONTROL_SAMPLES) + 44.0;
             let ctrl = natural.min((ui.available_width() - col - note).max(140.0));
 
@@ -132,6 +137,7 @@ impl eframe::App for Appearance {
                                 );
                             }
                         });
+                    ui.label(egui::RichText::new(SIZE_NOTE).weak());
                 });
 
                 // The "Host system ..." entries show what the host actually uses, so
@@ -205,7 +211,6 @@ impl eframe::App for Appearance {
                     // Push to the compositor so the change lands now, not only on
                     // the next launch (the broker republishes on the config change
                     // too; this is immediate).
-                    crate::broker::publish_window_size(&self.cfg.window_size);
                     crate::broker::publish_font(&self.cfg);
                     crate::broker::publish_theme(&self.cfg);
                     crate::broker::publish_appfont(&self.cfg);

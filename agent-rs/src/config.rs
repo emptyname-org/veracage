@@ -200,6 +200,9 @@ pub struct Config {
     pub debug: bool,               // verbose timing logs (docs/debugging.md)
     pub shortcuts: BTreeMap<String, String>, // action -> keybind (copy_out/paste_in)
     volumes: BTreeMap<String, toml::Value>, // opaque pass-through
+    /// False when the file exists but did not parse, so this Config is a
+    /// fallback rather than the user's settings. `save` refuses on it.
+    pub loaded_ok: bool,
 }
 
 impl Config {
@@ -241,6 +244,7 @@ impl Config {
             debug: false,
             shortcuts: default_shortcuts(),
             volumes: BTreeMap::new(),
+            loaded_ok: true,
         }
     }
 }
@@ -266,7 +270,14 @@ pub fn load() -> Config {
         Ok(r) => r,
         Err(e) => {
             eprintln!("veracage: cannot parse {}: {e}; using empty config", p.display());
-            return Config::empty();
+            // Empty so the session still runs, but NOT saveable: serde aborts the
+            // whole document on one wrongly-typed key, so this "empty" config is a
+            // parse failure, not the user's settings. Writing it back (which every
+            // dialog does on Save) would delete their apps, theme, shortcuts and
+            // per-volume overrides because of a single bad line.
+            let mut c = Config::empty();
+            c.loaded_ok = false;
+            return c;
         }
     };
     // Dedupe by exec basename (first entry wins): older configs could hold the
@@ -361,6 +372,7 @@ pub fn load() -> Config {
         debug: raw.default.debug,
         shortcuts,
         volumes: raw.volumes,
+        loaded_ok: true,
     }
 }
 
@@ -380,6 +392,12 @@ pub fn window_size_valid(s: &str) -> bool {
 }
 
 pub fn save(cfg: &Config) -> io::Result<PathBuf> {
+    if !cfg.loaded_ok {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the config file could not be parsed; fix or move it before saving",
+        ));
+    }
     let p = config_path();
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;

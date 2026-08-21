@@ -8,16 +8,16 @@ use crate::config;
 /// (section title, lines) - rendered as heading + body paragraphs.
 const SECTIONS: &[(&str, &[&str])] = &[
     (
-        "Mount a volume",
+        "Open a volume",
         &[
-            "File > Mount volume. Pick the encrypted volume file and enter its \
+            "File > Open volume. Pick the encrypted volume file and enter its \
              passphrase.",
             "The system then asks for your account password. That prompt \
              authorizes Veracage's privileged helper to decrypt the volume and \
              mount it privately for Veracage, the only step that needs \
-             root. The authorization is kept for a few minutes, so mounting \
+             root. The authorization is kept for a few minutes, so opening \
              another volume right after usually does not ask again.",
-            "The volume mounts and the file manager opens on it. Mount more \
+            "The volume opens and the file manager shows it. Open more \
              volumes the same way and they appear side by side.",
         ],
     ),
@@ -26,10 +26,10 @@ const SECTIONS: &[(&str, &[&str])] = &[
         &[
             "The Apps menu lists the enabled apps. Click one to run it inside \
              Veracage.",
-            "Apps run isolated inside Veracage. They see the mounted volumes, a \
+            "Apps run isolated inside Veracage. They see the open volumes, a \
              temporary workspace and the shared directory, nothing else of your \
              system, and they have no network.",
-            "Apps also work before any volume is mounted, which makes an empty \
+            "Apps also work before any volume is open, which makes an empty \
              Veracage a private scratchpad.",
         ],
     ),
@@ -37,7 +37,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
         "Nothing is stored in Veracage",
         &[
             "Veracage has no storage of its own. A file is kept only if you save \
-             it into a mounted volume or into the shared directory.",
+             it into an open volume or into the shared directory.",
             "Everything else lives in memory: the home directory apps start in, \
              their settings, caches and downloads. It is discarded when Veracage \
              quits, without asking.",
@@ -75,12 +75,12 @@ const SECTIONS: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Idle dismount",
+        "Idle close",
         &[
-            "Settings > System Integration > Auto-dismount after closes the mounted volumes \
-             Veracage has been left alone for that long. Using the Veracage \
+            "Settings > System Integration > Auto-close after closes the open volumes \
+             once Veracage has been left alone for that long. Using the Veracage \
              window resets the timer.",
-            "The session stays open as an empty scratchpad, so mounting again \
+            "The session stays up as an empty scratchpad, so opening one again \
              is one click.",
         ],
     ),
@@ -121,11 +121,14 @@ const SECTIONS: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Dismount",
+        "Close volume",
         &[
-            "File > Dismount lists the mounted volumes. Dismounting one locks \
-             its data again and leaves the rest of the session running.",
-            "Closing the Veracage window (or File > Quit) dismounts everything.",
+            "File > Close volume lists the open volumes. Closing one locks its \
+             data again and leaves the rest of the session running. It refuses \
+             while an app is still running, and offers to close it for you.",
+            "Quitting Veracage closes every volume first. Apps are asked to close \
+             so unsaved work still prompts, and the window stays until the last \
+             volume is closed.",
         ],
     ),
 ];

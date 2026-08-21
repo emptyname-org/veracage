@@ -23,6 +23,8 @@ indexmap = { version = "2", features = ["serde"] }  # apps map that keeps
                       # insertion order (matches config.py's dict; a plain
                       # BTreeMap would re-sort the app list alphabetically on save)
 sha2 = "0.10"
+libc = "0.2"          # flock() for the single-instance claim (already in the
+                      # tree via eframe/rfd, and the other two crates use it)
 zeroize = "1"         # wipe the vault passphrase from launcher memory after use
 eframe = "0.29"       # egui control window - static-linked; runtime needs only
                       # what the desktop already has (Mesa GL, Wayland/X11).

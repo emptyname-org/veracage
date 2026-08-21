@@ -9,10 +9,10 @@
 //! process).
 //!
 //! It is driven by two signals:
-//!   * the compositor's `cmd.req` (verbs open/open-app:<key>/configure/settings/
+//!   * the compositor's `cmd.log` (verbs open/configure/settings/
 //!     exchange/help/about/close-volume:<label>): the in-session menu; the
 //!     authority lives in the compositor, whose menu clicks a same-uid attacker
-//!     can't forge, and whose `cmd.req` he can't write (`/run/veracage/rt` is
+//!     can't forge, and whose `cmd.log` he can't write (`/run/veracage/rt` is
 //!     0711 veracage);
 //!   * our own `open.req` in the human runtime dir, a second `veracage-agent`
 //!     launch (double-clicking the icon again) signals the running broker to open
@@ -29,13 +29,19 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use zeroize::{Zeroize, Zeroizing};
 
-const CMD_REQ: &str = "/run/veracage/rt/cmd.req"; // compositor -> broker (must match toolbar.rs)
+/// compositor -> broker command log, `<nonce>\t<verb>` per line, append-only
+/// (must match CMD_LOG in compositor-rs/src/toolbar.rs). We only ever read it:
+/// `rt` is 0711 veracage, so this uid can traverse but not write, and the
+/// compositor is the one that starts it empty each session.
+const CMD_LOG: &str = "/run/veracage/rt/cmd.log";
 const COMPOSITOR_PID: &str = "/run/veracage/rt/compositor.pid";
 /// Human-published dir (created by the helper, owned by us): the config-app
 /// list + menu icons for the compositor's Apps menu. Must match toolbar.rs.
@@ -51,20 +57,35 @@ const EXIT_CRYPT_FAILED: i32 = 4;
 /// The helper's "the filesystem needs repair" exit code (EXIT_FSCK_FAILED): the
 /// volume decrypted fine but was left dismounted, so say what to do about it.
 const EXIT_FSCK_FAILED: i32 = 5;
+/// The helper's "the volume stayed open" exit code (EXIT_VOLUME_BUSY): it
+/// refused, so the volume is untouched and still decrypted.
+const EXIT_VOLUME_BUSY: i32 = 6;
+/// The leader's "the apps are gone" signal (leader.py `_post_apps_closed`): the
+/// waiting helper is told to go on when this changes.
+const APPS_CLOSED: &str = "/run/veracage/rt/closeapps.done";
+/// How long that signal is waited for before the dismount is cancelled. Only
+/// reached when the human leaves an app's own save prompt unanswered, so the
+/// volume stays mounted and they already know why.
+const APPS_CLOSED_WAIT: Duration = Duration::from_secs(180);
 
 pub fn run_broker() -> ! {
-    let dir = human_runtime_dir();
+    let Some(dir) = human_runtime_dir() else {
+        eprintln!("veracage: XDG_RUNTIME_DIR is not set; refusing to run.");
+        std::process::exit(2);
+    };
     let _ = std::fs::create_dir_all(&dir);
 
-    // Single instance, but ONLY exit if a *live* broker already holds the pidfile
-    // (then ask it to open another volume). Any other outcome (no pidfile, or we
-    // can't write one) means we ARE the broker: proceed. Never silently exit on a
-    // dir/permission problem: that's how "run it, nothing happens" happened.
-    if another_broker_live(&dir) {
-        signal_open(&dir);
-        std::process::exit(0);
-    }
-    claim_pidfile(&dir); // best-effort; failure must not stop us
+    // Single instance. Only a live broker holding the lock makes us hand our
+    // request over and exit; anything else means we ARE the broker and proceed.
+    // `_instance` is bound for the whole function: dropping it would release the
+    // lock and let a second launch in.
+    let _instance = match claim_single_instance(&dir) {
+        Instance::Taken => {
+            signal_open(&dir);
+            std::process::exit(0);
+        }
+        other => other,
+    };
     // Any progress note here is ours from a previous run that did not get to clear
     // it (a crash, a kill). Left in place it turns the new session's spinner on with
     // nothing happening behind it.
@@ -72,9 +93,10 @@ pub fn run_broker() -> ! {
 
     let mut b = Broker {
         jobs: Vec::new(),
+        dismounts: Vec::new(),
         dialogs: Vec::new(),
         opens: Vec::new(),
-        cmd_seen: mtime(Path::new(CMD_REQ)),
+        cmd_seen: last_command_nonce(Path::new(CMD_LOG)),
         open_seen: mtime(&dir.join("open.req")),
         cfg_seen: mtime(&crate::config::config_path()),
         open_req: dir.join("open.req"),
@@ -83,7 +105,7 @@ pub fn run_broker() -> ! {
     };
 
     // Compositor-first: bring up the EMPTY compositor (the front door). No
-    // startup picker. File > Mount volume mounts one; Apps > Configure sets up
+    // startup picker. File > Open volume opens one; Apps > Configure sets up
     // apps. If the bring-up FAILED (e.g. the user cancelled or mistyped the
     // polkit password 3x), exit now rather than lingering: a lingering broker
     // would answer a second launch's open.req with a stray volume picker, and
@@ -96,14 +118,15 @@ pub fn run_broker() -> ! {
 
     loop {
         b.reap();
+        b.drive_dismounts();
 
-        // Compositor menu commands.
-        let now = mtime(Path::new(CMD_REQ));
-        if now.is_some() && now != b.cmd_seen {
-            b.cmd_seen = now;
-            if let Some(verb) = read_verb(Path::new(CMD_REQ)) {
-                b.dispatch(&verb);
-            }
+        // Compositor menu commands: everything appended since the last drain, in
+        // order. Reading the whole log each time (it is a few dozen bytes per
+        // click, cleared at compositor startup) is what makes a verb impossible to
+        // miss, however long a dialog kept us out of this loop.
+        for (nonce, verb) in read_commands(Path::new(CMD_LOG), b.cmd_seen) {
+            b.cmd_seen = Some(nonce);
+            b.dispatch(&verb);
         }
 
         // A second `veracage-agent` launch asking us to open another volume.
@@ -137,11 +160,16 @@ pub fn run_broker() -> ! {
             // The user quit Veracage: transient dialogs (Settings, Configure
             // apps, Help...) must not outlive the Veracage window. CLI jobs
             // (dismounts, opens) still finish on their own below.
-            for d in &mut b.dialogs {
+            for (_, d) in &mut b.dialogs {
                 let _ = d.kill();
             }
+            // Including a "Close <apps> to continue." nobody can act on any more.
+            for d in &mut b.dismounts {
+                d.abort_ask();
+            }
         }
-        if b.jobs.is_empty() && b.dialogs.is_empty() && b.opens.is_empty() {
+        if b.jobs.is_empty() && b.dismounts.is_empty() && b.dialogs.is_empty() && b.opens.is_empty()
+        {
             if b.comp_seen && !compositor_is_up() {
                 std::process::exit(0); // session fully over
             }
@@ -155,6 +183,14 @@ pub fn run_broker() -> ! {
     }
 }
 
+/// A question on screen that the broker is waiting on, without waiting for it.
+struct Asking {
+    child: Child,
+    /// Tools not tried yet, for when the running one fails for an environmental
+    /// reason instead of being answered.
+    rest: Vec<(PathBuf, Vec<String>)>,
+}
+
 /// A running `veracage open`, tracked with enough context to re-prompt on a
 /// wrong passphrase (helper exit code 4) instead of failing silently.
 struct OpenJob {
@@ -163,13 +199,54 @@ struct OpenJob {
     app: Option<String>, // the config-app key to auto-launch, if any
 }
 
+/// A running `veracage close-volume`, and how far its ONE privileged attempt has
+/// got. There is exactly one `pkexec` per dismount: when apps hold the volume the
+/// helper stays alive waiting for an answer on its stdin, so pushing the dismount
+/// through costs no second password (polkit's auth_self_keep is bound to the
+/// calling process, and a second attempt would be a second process).
+struct Dismount {
+    child: Child,
+    label: String,
+    /// What the helper has said, delivered by a reader thread so the broker never
+    /// blocks on the pipe.
+    lines: std::sync::mpsc::Receiver<String>,
+    /// The helper's stdin: `go` continues the attempt, EOF cancels it.
+    stdin: Option<std::process::ChildStdin>,
+    /// Set while the apps are being closed on the helper's behalf.
+    waiting: Option<AppsWait>,
+    /// The "Close <apps> to continue." question, while the human has not answered
+    /// it. A CHILD we poll, never a blocking wait: this loop is the only one the
+    /// broker has, and blocking it froze every other menu command, every other
+    /// dismount and the compositor-went-away check for as long as the dialog
+    /// stood there.
+    asking: Option<Asking>,
+    /// True only when the HUMAN cancelled the close (they answered Cancel to
+    /// "Close <apps> to continue"). Every other refusal is reported: they asked
+    /// for a close, it did not happen, and the volume is still decrypted.
+    cancelled: bool,
+    /// The last `busy` reason the helper gave, shown if it ends up refusing.
+    refusal: Option<String>,
+}
+
+/// Waiting for the apps that hold a volume to be gone.
+struct AppsWait {
+    /// The `closeapps.done` mtime when we asked, so only a NEW signal counts.
+    asked_at: Option<u128>,
+    deadline: std::time::Instant,
+}
+
 struct Broker {
-    /// Spawned CLI children (close-volume, _sync-apps), left to finish even
-    /// when the session ends.
+    /// Spawned CLI children (_sync-apps, xdg-open), left to finish even when the
+    /// session ends. Their exit codes carry nothing we act on.
     jobs: Vec<Child>,
-    /// One-shot GUI dialogs (Settings, Configure apps, Help...), killed when
+    /// Running `veracage close-volume` children: unlike `jobs`, each is a
+    /// conversation (see Dismount), not a fire-and-forget.
+    dismounts: Vec<Dismount>,
+    /// One-shot GUI dialogs (Settings, Configure apps, Help...) with the
+    /// subcommand that spawned each, so a second click cannot open a second copy.
+    /// Killed when
     /// the compositor goes away, so no window outlives the session.
-    dialogs: Vec<Child>,
+    dialogs: Vec<(String, Child)>,
     opens: Vec<OpenJob>,
     cmd_seen: Option<u128>,
     open_seen: Option<u128>,
@@ -182,12 +259,12 @@ struct Broker {
 }
 
 impl Broker {
-    /// Pick a volume file, then collect the passphrase and mount it. `app` is
-    /// the config-app key to auto-launch after the mount (an Apps-menu click
-    /// with nothing mounted yet).
+    /// Pick a volume file, then collect the passphrase and open it. `app` is
+    /// the config-app key to auto-launch after the open (an Apps-menu click
+    /// with no volume open yet).
     fn open_flow(&mut self, app: Option<String>) {
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Select an encrypted volume to mount")
+            .set_title("Select an encrypted volume to open")
             .pick_file()
         else {
             return; // cancelled
@@ -285,12 +362,19 @@ impl Broker {
         }
     }
 
-    /// Spawn a one-shot GUI subcommand of ourselves (configure / _settings / ...).
+    /// Spawn a one-shot GUI subcommand of ourselves (configure / _settings / ...),
+    /// at most ONE of each kind at a time. Each dialog loads the whole config when
+    /// it opens and writes the whole config on Save, so two of them (or the same
+    /// one twice) silently revert each other: change the theme in Appearance, save,
+    /// then save in System Integration, and the theme goes back.
     fn spawn_dialog(&mut self, sub: &str) {
+        if self.dialogs.iter().any(|(kind, _)| kind == sub) {
+            return; // already open; its window is the one to use
+        }
         let exe = std::env::current_exe()
             .unwrap_or_else(|_| PathBuf::from("veracage-agent"));
         match Command::new(exe).arg(sub).spawn() {
-            Ok(child) => self.dialogs.push(child),
+            Ok(child) => self.dialogs.push((sub.to_string(), child)),
             Err(e) => eprintln!("veracage: could not open {sub}: {e}"),
         }
     }
@@ -306,12 +390,44 @@ impl Broker {
         }
     }
 
-    /// Dismount ONE volume of the running session (compositor's Dismount menu).
+    /// Close ONE volume of the running session (the compositor's Close volume
+    /// menu). Both pipes are kept: the helper reports on stdout and waits on
+    /// stdin when apps hold the volume (see Dismount).
     fn close_volume(&mut self, label: &str) {
         let Some(bin) = veracage_bin() else { return };
-        match Command::new(bin).arg("close-volume").arg(label).spawn() {
-            Ok(child) => self.jobs.push(child),
-            Err(e) => eprintln!("veracage: could not dismount volume {label}: {e}"),
+        let child = Command::new(bin)
+            .arg("close-volume")
+            .arg(label)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn();
+        match child {
+            Ok(mut child) => {
+                let lines = read_lines_in_background(child.stdout.take());
+                self.dismounts.push(Dismount {
+                    stdin: child.stdin.take(),
+                    child,
+                    label: label.to_string(),
+                    lines,
+                    waiting: None,
+                    asking: None,
+                    cancelled: false,
+                    refusal: None,
+                });
+            }
+            Err(e) => eprintln!("veracage: could not close volume {label}: {e}"),
+        }
+    }
+
+    /// Carry every running dismount forward: read what its helper has said, and
+    /// answer it. Cheap: reads that never block, and one mtime per waiting one.
+    fn drive_dismounts(&mut self) {
+        for d in &mut self.dismounts {
+            while let Ok(line) = d.lines.try_recv() {
+                d.handle(&line);
+            }
+            d.drive_ask();
+            d.drive_apps_wait();
         }
     }
 
@@ -321,9 +437,28 @@ impl Broker {
     /// dialog instead of failing into the journal only.
     fn reap(&mut self) {
         self.jobs.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
-        self.dialogs.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
+        self.dialogs.retain_mut(|(_, c)| !matches!(c.try_wait(), Ok(Some(_))));
         let mut retries: Vec<(String, Option<String>)> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
+        // A finished dismount. A refusal the human caused is not news: they
+        // cancelled, or they were told an app is still running and it still is.
+        // Every OTHER refusal is: the volume they asked to close is still
+        // decrypted and nothing on screen says so. That includes the case where
+        // no dialog ever appeared, which is exactly when they have no way to
+        // know. A success speaks for itself: the menu entry goes.
+        self.dismounts.retain_mut(|d| match d.child.try_wait() {
+            Ok(Some(st)) => {
+                // The helper is gone, so an unanswered question about it is stale.
+                d.abort_ask();
+                d.drain_lines();
+                if st.code() == Some(EXIT_VOLUME_BUSY) && !d.cancelled {
+                    let why = d.refusal.as_deref().unwrap_or("it is still in use");
+                    errors.push(format!("{} was not closed: {why}.", d.label));
+                }
+                false
+            }
+            _ => true,
+        });
         self.opens.retain_mut(|j| match j.child.try_wait() {
             Ok(Some(st)) => {
                 debug_log(&format!("open {} finished: {st}", base(&j.volume)));
@@ -333,14 +468,12 @@ impl Broker {
                         retries.push((j.volume.clone(), j.app.take()));
                     }
                     Some(EXIT_FSCK_FAILED) => errors.push(format!(
-                        "The filesystem on {} needs repair, so it was not mounted.\n\
-                         Open the volume with your usual tool and run a full check \
-                         on it, then try again.",
+                        "{} was not opened: its filesystem needs a repair.",
                         base(&j.volume)
                     )),
                     Some(126) | Some(127) => {} // polkit auth cancelled / denied
                     Some(c) => errors.push(format!(
-                        "Could not mount {} (exit {c}).\nSee `journalctl --user` for details.",
+                        "Could not open {} (exit {c}).",
                         base(&j.volume)
                     )),
                 }
@@ -366,6 +499,127 @@ impl Broker {
     }
 }
 
+impl Dismount {
+    /// One line from the helper. Two shapes: `holders\t<names>`, meaning it is
+    /// waiting for us to clear them, and `busy\t<reason>`, meaning it gave up.
+    fn handle(&mut self, line: &str) {
+        if let Some(holders) = line.strip_prefix("holders\t") {
+            self.ask_to_close_apps(holders);
+        } else if let Some(reason) = line.strip_prefix("busy\t") {
+            self.refusal = Some(reason.to_string());
+        }
+    }
+
+    /// Apps hold the volume. One line, one action: closing them is the only way
+    /// through, their own unsaved-work prompts still come up in the Veracage
+    /// window, and cancelling leaves everything as it is. The question goes up as
+    /// a child process; `drive_ask` collects the answer on a later poll.
+    fn ask_to_close_apps(&mut self, holders: &str) {
+        let msg = format!("Close {} to continue.", holder_app_names(holders));
+        self.start_ask(ask_candidates(&msg, "Close", "Cancel"));
+    }
+
+    /// Put the question up with the first tool that runs. Nothing runnable means
+    /// nobody can answer, so leave the volume as it is.
+    fn start_ask(&mut self, mut candidates: Vec<(PathBuf, Vec<String>)>) {
+        while !candidates.is_empty() {
+            let (bin, args) = candidates.remove(0);
+            match Command::new(&bin).args(&args).spawn() {
+                Ok(child) => {
+                    self.asking = Some(Asking { child, rest: candidates });
+                    return;
+                }
+                Err(e) => eprintln!("veracage: {} did not run: {e}", bin.display()),
+            }
+        }
+        eprintln!("veracage: no dialog tool to ask with; leaving {} as it is.", self.label);
+        self.cancelled = true;
+        self.cancel();
+    }
+
+    /// Collect the answer if it has arrived. Never blocks.
+    fn drive_ask(&mut self) {
+        enum Answer {
+            Yes,
+            No,
+            ToolFailed(Vec<(PathBuf, Vec<String>)>),
+        }
+        let answer = match self.asking.as_mut() {
+            None => return,
+            Some(a) => match a.child.try_wait() {
+                Ok(None) => return, // still on screen
+                Ok(Some(st)) if st.success() => Answer::Yes,
+                // Both tools answer "no" with exit 1. Anything else is the tool
+                // failing (a missing Qt platform plugin, an unusable display, a
+                // signal), not the human answering, so try the next one.
+                Ok(Some(st)) if st.code() == Some(1) => Answer::No,
+                Ok(Some(_)) | Err(_) => Answer::ToolFailed(std::mem::take(&mut a.rest)),
+            },
+        };
+        self.asking = None;
+        match answer {
+            Answer::Yes => {
+                self.waiting = Some(AppsWait {
+                    asked_at: mtime(Path::new(APPS_CLOSED)),
+                    deadline: std::time::Instant::now() + APPS_CLOSED_WAIT,
+                });
+                request_close_apps();
+            }
+            Answer::No => {
+                self.cancelled = true;
+                self.cancel();
+            }
+            Answer::ToolFailed(rest) => self.start_ask(rest),
+        }
+    }
+
+    /// Take the question down: the helper it belonged to is gone.
+    fn abort_ask(&mut self) {
+        if let Some(mut a) = self.asking.take() {
+            let _ = a.child.kill();
+            let _ = a.child.wait();
+        }
+    }
+
+    /// Let the waiting helper go on as soon as the leader reports the apps gone,
+    /// and cancel it at the deadline (an app's own save prompt left unanswered).
+    fn drive_apps_wait(&mut self) {
+        let Some(wait) = &self.waiting else { return };
+        let now = mtime(Path::new(APPS_CLOSED));
+        if now.is_some() && now != wait.asked_at {
+            self.waiting = None;
+            self.say("go\n");
+        } else if std::time::Instant::now() >= wait.deadline {
+            eprintln!("veracage: {} stayed open (its apps were never closed).", self.label);
+            self.waiting = None;
+            self.cancel();
+        }
+    }
+
+    /// Drop the helper's stdin: the EOF is what tells it to leave the volume
+    /// exactly as it is and exit.
+    fn cancel(&mut self) {
+        self.stdin = None;
+    }
+
+    fn say(&mut self, answer: &str) {
+        if let Some(mut stdin) = self.stdin.take() {
+            let _ = stdin.write_all(answer.as_bytes()); // dropped after: EOF
+        }
+    }
+
+    /// Collect the helper's last word once it has exited: only a refusal reason
+    /// matters then, a `holders` question cannot be answered by a dead process.
+    /// The short wait covers a line still in flight from the reader thread.
+    fn drain_lines(&mut self) {
+        while let Ok(line) = self.lines.recv_timeout(Duration::from_millis(50)) {
+            if let Some(reason) = line.strip_prefix("busy\t") {
+                self.refusal = Some(reason.to_string());
+            }
+        }
+    }
+}
+
 // --------------------------------------------------------------- publish -----
 
 /// The publish dir. Debug builds honour VERACAGE_PUB_DIR so the publish path
@@ -376,22 +630,6 @@ fn pub_dir() -> PathBuf {
         return PathBuf::from(d);
     }
     PathBuf::from(PUB_DIR)
-}
-
-/// Write the desired compositor window size to `PUB_DIR/window.size` so the
-/// running compositor can pick it up on its next scan and resize live (Settings
-/// Save calls this; the compositor validates the value). Best-effort.
-pub fn publish_window_size(size: &str) {
-    let dir = pub_dir();
-    if !dir.is_dir() {
-        return;
-    }
-    let tmp = dir.join(format!("window.size.{}.tmp", std::process::id()));
-    if std::fs::write(&tmp, format!("{size}\n")).is_ok() {
-        let _ = std::fs::rename(&tmp, dir.join("window.size"));
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-    }
 }
 
 /// Write the Veracage keyboard shortcuts to `PUB_DIR/shortcuts` (`<action>\t<bind>`
@@ -565,7 +803,6 @@ pub fn publish_apps() {
         return;
     }
     let cfg = crate::config::load();
-    publish_window_size(&cfg.window_size);
     publish_font(&cfg);
     publish_shortcuts(&cfg);
     publish_clipclear(&cfg);
@@ -573,7 +810,7 @@ pub fn publish_apps() {
     publish_theme(&cfg);
     publish_appfont(&cfg);
     publish_autodismount(&cfg);
-    // The key becomes a file name and a cmd.req verb suffix, keep it plain.
+    // The key becomes a file name and a command verb suffix, keep it plain.
     let sane = |k: &str| !k.is_empty() && k.len() <= 64 && !k.contains('/') && k != "..";
     // The name is written into the `<key>\t<name>` TSV: strip tab/newline/control
     // chars so a hostile config.toml name can't split or inject lines in the
@@ -676,22 +913,30 @@ fn prompt_passphrase(name: &str, wrong_pass: bool) -> Option<Zeroizing<Vec<u8>>>
     } else {
         format!("Enter the passphrase for {name}")
     };
-    match Command::new("kdialog").arg("--password").arg(&msg).output() {
-        Ok(o) if o.status.success() => {
-            let mut p = o.stdout;
-            while matches!(p.last(), Some(b'\n' | b'\r')) {
-                p.pop();
+    // Only a distro-owned kdialog, never one $PATH picked: this program is handed
+    // the volume passphrase on its stdout, and a desktop session normally has
+    // ~/.local/bin ahead of /usr/bin, so a bare name would let anything that can
+    // write there collect the passphrase directly. `veracage_bin` refuses $PATH
+    // for exactly this reason. No trusted kdialog means our own dialog, below.
+    if let Some(kdialog) = trusted_tool("kdialog") {
+        match Command::new(kdialog).arg("--password").arg(&msg).output() {
+            Ok(o) if o.status.success() => {
+                let mut p = Zeroizing::new(o.stdout);
+                while matches!(p.last(), Some(b'\n' | b'\r')) {
+                    p.pop();
+                }
+                return Some(p);
             }
-            return Some(Zeroizing::new(p));
+            // kdialog's documented cancel is exit code 1. ONLY that means "the user
+            // cancelled" → abort. Any OTHER failure (a missing Qt platform plugin,
+            // an unusable display, a killed-by-signal process, code() == None) is an
+            // ENVIRONMENTAL failure, not a cancel: fall through to our own egui dialog
+            // rather than silently aborting the open.
+            Ok(o) if o.status.code() == Some(1) => return None,
+            // kdialog printed something before failing: wipe it rather than drop it.
+            Ok(o) => drop(Zeroizing::new(o.stdout)),
+            Err(_) => {} // not runnable, fall through to egui
         }
-        // kdialog's documented cancel is exit code 1. ONLY that means "the user
-        // cancelled" → abort. Any OTHER failure (a missing Qt platform plugin,
-        // an unusable display, a killed-by-signal process, code() == None) is an
-        // ENVIRONMENTAL failure, not a cancel: fall through to our own egui dialog
-        // rather than silently aborting the open.
-        Ok(o) if o.status.code() == Some(1) => return None,
-        Ok(_) => {} // kdialog present but failed for another reason, try egui
-        Err(_) => {} // kdialog not installed, fall through to egui
     }
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("veracage-agent"));
     let mut cmd = Command::new(exe);
@@ -706,12 +951,116 @@ fn prompt_passphrase(name: &str, wrong_pass: bool) -> Option<Zeroizing<Vec<u8>>>
 /// Show a (non-blocking) error dialog: kdialog, else zenity, else the journal.
 /// Returns the spawned dialog Child (for the caller to reap) or None if it fell
 /// back to stderr.
+/// Ask the human a yes/no question and BLOCK for the answer, with captioned
+/// buttons so neither reads as "OK". True only on an explicit yes: a dialog that
+/// cannot be shown answers no, because the yes branch closes their apps.
+/// The yes/no dialogs to try, in order, as (program, argv). Both answer "no"
+/// with exit 1, which is what lets a failure be told from an answer.
+fn ask_candidates(msg: &str, yes: &str, no: &str) -> Vec<(PathBuf, Vec<String>)> {
+    let mut out = Vec::new();
+    for (bin, args) in [
+        ("kdialog", vec!["--yesno", msg, "--yes-label", yes, "--no-label", no]),
+        ("zenity", vec!["--question", "--text", msg, "--ok-label", yes, "--cancel-label", no]),
+    ] {
+        if let Some(path) = trusted_tool(bin) {
+            out.push((path, args.into_iter().map(str::to_string).collect()));
+        }
+    }
+    out
+}
+
+/// A GUI helper resolved to an absolute path in a distro-owned directory, never
+/// through `$PATH`. `/usr/local/bin` is deliberately absent: it is root-owned on
+/// a normal system but is exactly where a hand-installed shim would sit.
+fn trusted_tool(name: &str) -> Option<PathBuf> {
+    ["/usr/bin", "/bin"]
+        .iter()
+        .map(|d| PathBuf::from(d).join(name))
+        .find(|p| p.is_file())
+}
+
+/// Ask the compositor to clear the apps out of the way of a dismount: it asks
+/// every app window to close (so unsaved work still gets its prompt) and then
+/// has the sessions stop whatever is left. Best-effort file touch, read by the
+/// compositor's discovery scan.
+fn request_close_apps() {
+    let dir = pub_dir();
+    if !dir.is_dir() {
+        return;
+    }
+    let tmp = dir.join(format!("closeapps.{}.tmp", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        std::fs::write(&tmp, b"1\n")?;
+        std::fs::rename(&tmp, dir.join("closeapps"))
+    };
+    if let Err(e) = write() {
+        eprintln!("veracage: could not ask the compositor to close the apps: {e}");
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// The apps the human would recognise, from the helper's raw list of process
+/// names. Everything a KDE app starts for itself - kioslave5, kglobalaccel5,
+/// kactivitymanagerd - holds the volume just as hard, but the human never opened
+/// those and cannot close them: the thing to close is Dolphin. So the list is
+/// matched against the CONFIGURED apps and reported under their own names.
+///
+/// Falls back to a generic phrase rather than the raw names, which are noise.
+fn holder_app_names(raw: &str) -> String {
+    let cfg = crate::config::load();
+    let mut names: Vec<String> = Vec::new();
+    for comm in raw.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+        let app = cfg
+            .apps
+            .iter()
+            .find(|a| comm_matches(comm, &crate::config::exec_basename(&a.exec)));
+        if let Some(app) = app {
+            if !names.contains(&app.name) {
+                names.push(app.name.clone());
+            }
+        }
+    }
+    if names.is_empty() {
+        "Apps inside Veracage".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
+/// Whether a `/proc/<pid>/comm` names the binary `full`. comm is capped at 15
+/// characters, so a longer name arrives truncated and only a prefix test finds
+/// it ("kactivitymanagerd" appears as "kactivitymanage").
+fn comm_matches(comm: &str, full: &str) -> bool {
+    full == comm || (comm.len() == 15 && full.starts_with(comm))
+}
+
+/// Read a child's stdout line by line on a thread, so the broker's loop picks
+/// lines up with `try_recv` instead of blocking on a pipe that stays open for as
+/// long as the child lives. Ends at EOF.
+fn read_lines_in_background(
+    stdout: Option<std::process::ChildStdout>,
+) -> std::sync::mpsc::Receiver<String> {
+    use std::io::BufRead;
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(stdout) = stdout {
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    rx
+}
+
 fn show_error(msg: &str) -> Option<Child> {
     for (bin, args) in [
         ("kdialog", vec!["--error", msg]),
         ("zenity", vec!["--error", "--text", msg]),
     ] {
-        if let Ok(child) = Command::new(bin).args(&args).spawn() {
+        let Some(path) = trusted_tool(bin) else { continue };
+        if let Ok(child) = Command::new(path).args(&args).spawn() {
             return Some(child);
         }
     }
@@ -719,11 +1068,19 @@ fn show_error(msg: &str) -> Option<Child> {
     None
 }
 
-fn human_runtime_dir() -> PathBuf {
-    // A dir WE own: deliberately NOT `.../veracage`, which the root helper creates
-    // (root-owned 0711) for the control socket; we couldn't write our pidfile there.
-    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(base).join("veracage-agent")
+/// Our own dir under the caller's runtime dir: deliberately NOT `.../veracage`,
+/// which the root helper creates (root-owned 0711) for the control socket, where
+/// we could not write our pidfile.
+///
+/// No `/tmp` fallback. `/tmp` is shared and sticky, so another user can
+/// pre-create `veracage-agent` and own everything in it: the pidfile we write,
+/// and `open.req`, which is how a second launch asks us to raise a passphrase
+/// prompt. A desktop session always sets XDG_RUNTIME_DIR, and the root helper
+/// already refuses to run without it, so an unset one means something is wrong
+/// enough to stop for.
+fn human_runtime_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")?;
+    Some(PathBuf::from(base).join("veracage-agent"))
 }
 
 fn mtime(p: &Path) -> Option<u128> {
@@ -731,10 +1088,39 @@ fn mtime(p: &Path) -> Option<u128> {
     Some(mt.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos())
 }
 
-fn read_verb(p: &Path) -> Option<String> {
+/// Parse one `<nonce>\t<verb>` line of the command log.
+fn parse_command(line: &str) -> Option<(u128, String)> {
+    let (nonce, verb) = line.split_once('\t')?;
+    let nonce: u128 = nonce.trim().parse().ok()?;
+    let verb = verb.trim();
+    (!verb.is_empty()).then(|| (nonce, verb.to_string()))
+}
+
+/// Every command appended after `after`, oldest first. A trailing line without a
+/// newline is a write still in flight, so it is left for the next poll rather
+/// than dispatched half-read.
+fn read_commands(p: &Path, after: Option<u128>) -> Vec<(u128, String)> {
+    let Ok(s) = std::fs::read_to_string(p) else {
+        return Vec::new();
+    };
+    let complete = match s.rfind('\n') {
+        Some(i) => &s[..=i],
+        None => return Vec::new(),
+    };
+    let mut out: Vec<(u128, String)> = complete
+        .lines()
+        .filter_map(parse_command)
+        .filter(|(nonce, _)| after.is_none_or(|seen| *nonce > seen))
+        .collect();
+    out.sort_by_key(|(nonce, _)| *nonce);
+    out
+}
+
+/// The newest nonce already in the log, so a broker starting up steps over the
+/// backlog instead of replaying a previous session's menu clicks.
+fn last_command_nonce(p: &Path) -> Option<u128> {
     let s = std::fs::read_to_string(p).ok()?;
-    let v = s.trim();
-    (!v.is_empty()).then(|| v.to_string())
+    s.lines().filter_map(parse_command).map(|(n, _)| n).max()
 }
 
 fn pid_alive(pid: i32) -> bool {
@@ -749,30 +1135,110 @@ fn compositor_is_up() -> bool {
     }
 }
 
-/// True only if the pidfile names a **live** process: the one case where a second
-/// launch should defer to a running broker. A missing/unreadable pidfile returns
-/// false (we proceed), so a permission problem never causes a silent no-op.
-fn another_broker_live(dir: &Path) -> bool {
-    match std::fs::read_to_string(dir.join("broker.pid")) {
-        Ok(s) => s.trim().parse::<i32>().map(pid_alive).unwrap_or(false),
-        Err(_) => false,
-    }
+/// The outcome of trying to become THE broker for this session.
+enum Instance {
+    /// We hold the lock. The file is never read, only HELD: the flock is
+    /// released when it drops, so keeping it alive is the whole point.
+    Claimed(#[allow(dead_code)] std::fs::File),
+    /// Another live broker holds it: the caller should hand the request over.
+    Taken,
+    /// We could not even try (unwritable dir). Run anyway: a permission problem
+    /// must never turn into a silent no-op, which is how "run it, nothing
+    /// happens" happened.
+    Unknown,
 }
 
-/// Best-effort: record our pid so a later launch can defer to us. Any failure
-/// (e.g. an unwritable dir) is logged, not fatal. We still run.
-fn claim_pidfile(dir: &Path) {
+/// Become the single broker, atomically. An `flock` on `broker.pid` held for our
+/// whole lifetime, then our pid written into it for anything that wants to look.
+///
+/// The lock IS the claim, rather than "read the pidfile, then unlink and rewrite
+/// it": that sequence is a plain race, and two launches milliseconds apart (a
+/// double-clicked launcher) both became brokers, after which every menu verb was
+/// dispatched twice - two volume pickers, two `pkexec close-volume` for one
+/// label. A crashed broker releases its lock in the kernel, so there is no stale
+/// state to clean up and no pid-liveness guess to get wrong.
+fn claim_single_instance(dir: &Path) -> Instance {
     let pidfile = dir.join("broker.pid");
-    let _ = std::fs::remove_file(&pidfile); // clear any stale one
-    match OpenOptions::new().write(true).create(true).truncate(true).open(&pidfile) {
-        Ok(mut f) => {
-            let _ = write!(f, "{}", std::process::id());
+    let opened = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&pidfile);
+    let mut f = match opened {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("veracage-agent: can't open {}: {e} (continuing)", pidfile.display());
+            return Instance::Unknown;
         }
-        Err(e) => eprintln!("veracage-agent: can't write {}: {e} (continuing)", pidfile.display()),
+    };
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Instance::Taken;
     }
+    let _ = f.set_len(0);
+    let _ = write!(f, "{}", std::process::id());
+    let _ = f.flush();
+    Instance::Claimed(f)
 }
 
 /// Ask the already-running broker to open another volume (bumps a file it polls).
 fn signal_open(dir: &Path) {
     let _ = std::fs::write(dir.join("open.req"), b"1");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log(dir: &Path, body: &str) -> PathBuf {
+        let p = dir.join("cmd.log");
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn every_verb_survives_a_drain_however_late_it_happens() {
+        // The point of the log: two batches written between two polls (or while a
+        // dialog kept the loop busy) must BOTH arrive. The old single-slot file
+        // kept only the last one, and the earlier verbs vanished with no error.
+        let dir = std::env::temp_dir().join(format!("vc-cmd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = log(&dir, "10\tclose-volume:work\n11\tclose-volume:private\n12\thelp\n");
+
+        let cmds = read_commands(&p, None);
+        assert_eq!(
+            cmds.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
+            ["close-volume:work", "close-volume:private", "help"]
+        );
+
+        // Resume: only what came after the last one we handled.
+        let cmds = read_commands(&p, Some(11));
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].1, "help");
+        assert!(read_commands(&p, Some(12)).is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_line_still_being_written_waits_for_the_next_poll() {
+        let dir = std::env::temp_dir().join(format!("vc-cmd-partial-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // No trailing newline on the last line: the append is in flight.
+        let p = log(&dir, "10\thelp\n11\tclose-vol");
+        let cmds = read_commands(&p, None);
+        assert_eq!(cmds.len(), 1, "the partial line must not be dispatched");
+        assert_eq!(cmds[0].1, "help");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_broker_steps_over_the_backlog() {
+        let dir = std::env::temp_dir().join(format!("vc-cmd-backlog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = log(&dir, "10\thelp\n99\tabout\ngarbage\n\n");
+        assert_eq!(last_command_nonce(&p), Some(99));
+        assert!(read_commands(&p, last_command_nonce(&p)).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

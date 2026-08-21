@@ -112,12 +112,17 @@ fn host_clipboard_has_text() -> bool {
     }
 }
 
-/// Remove the sentinel this dialog put on the host clipboard. Best-effort, so a
-/// headless/odd clipboard can't break the configurator. Only ever called when we
-/// seeded it: the user's own clipboard contents are left untouched.
+/// Remove the sentinel this dialog put on the host clipboard, and ONLY that.
+/// "We seeded it" is not enough on its own: the human can copy something else
+/// (a passphrase out of a password manager, say) between the seed and the exit,
+/// and an unconditional clear would destroy it. So compare first and clear only
+/// while our own sentinel is still what the clipboard holds. Best-effort, so a
+/// headless or odd clipboard cannot break the configurator.
 fn clear_clipboard() {
     if let Ok(mut cb) = arboard::Clipboard::new() {
-        let _ = cb.clear();
+        if cb.get_text().is_ok_and(|t| t == SENTINEL) {
+            let _ = cb.clear();
+        }
     }
 }
 

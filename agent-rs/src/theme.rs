@@ -221,27 +221,39 @@ pub fn labelled_row(
     ui.add_space(ROW_GAP);
 }
 
-/// The house style for a dialog's panels: wide left/right margins.
+/// The house margin between a dialog's content and the window edge, used on the
+/// left, the right AND the top, so every window sits in an even frame.
+const SIDE_MARGIN: f32 = 36.0;
+
+/// The margin between two stacked panels (the content panel's bottom and the
+/// action bar's own edges): half the side margin, because the two add up.
+const PANEL_GAP: f32 = SIDE_MARGIN / 2.0;
+
+/// How far the scroll bar sits from the right window edge. The content keeps the
+/// full side margin: this much on the panel, the rest inside the scroll area.
+const SCROLLBAR_INSET: f32 = 20.0;
+
+/// The house style for a dialog's action bar: the side margins, and the panel
+/// gap above and below the buttons.
 pub fn content_frame(ctx: &egui::Context) -> egui::Frame {
     egui::Frame::central_panel(&ctx.style())
-        .inner_margin(egui::Margin::symmetric(36.0, 18.0))
+        .inner_margin(egui::Margin::symmetric(SIDE_MARGIN, PANEL_GAP))
 }
 
 /// A dialog's scrollable content panel: the house frame plus a vertical scroll
 /// area, so a window shorter than its content never hides the bottom rows (the
 /// Save/Cancel buttons live in `action_bar`, a separate pinned panel). Route
 /// every dialog body through this, so no dialog - present or future - can overflow
-/// off-screen. The scroll bar sits 20px from the window edge; the content keeps
-/// the house 36px side margins (16px inside the scroll area + the panel's 20).
+/// off-screen, and so the margins below are the ONE place they are set.
 pub fn content_panel(ctx: &egui::Context, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::CentralPanel::default()
         .frame(
             egui::Frame::central_panel(&ctx.style())
                 .inner_margin(egui::Margin {
-                    left: 36.0,
-                    right: 20.0,
-                    top: 18.0,
-                    bottom: 18.0,
+                    left: SIDE_MARGIN,
+                    right: SCROLLBAR_INSET,
+                    top: SIDE_MARGIN,
+                    bottom: PANEL_GAP,
                 }),
         )
         .show(ctx, |ui| {
@@ -251,7 +263,7 @@ pub fn content_panel(ctx: &egui::Context, add_contents: impl FnOnce(&mut egui::U
                     egui::Frame::none()
                         .inner_margin(egui::Margin {
                             left: 0.0,
-                            right: 16.0,
+                            right: SIDE_MARGIN - SCROLLBAR_INSET,
                             top: 0.0,
                             bottom: 0.0,
                         })
