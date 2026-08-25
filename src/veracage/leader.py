@@ -46,13 +46,38 @@ _MAX_REQUEST_BYTES = 64 * 1024  # control requests are tiny; cap to bound memory
 _STARTED = time.monotonic()
 
 
+def _log_path() -> Path | None:
+    """`<VERACAGE_LOG_DIR>/leader.log` when the human side configured a log
+    directory (config `log_dir`), else None for stderr."""
+    log_dir = os.environ.get("VERACAGE_LOG_DIR")
+    return Path(log_dir) / "leader.log" if log_dir else None
+
+
 def _debug(state, msg: str) -> None:
-    """One timing line to stderr (the session unit's journal) when debug logging
-    is on: `veracage[+12.34s] <msg>`. Read it with
-    `journalctl --user -u 'veracage-*' -f`. See docs/debugging.md."""
-    if state.debug:
-        print(f"veracage[+{time.monotonic() - _STARTED:6.2f}s] {msg}",
-              file=sys.stderr, flush=True)
+    """One timing line when debug logging is on: `veracage[+12.34s] <msg>`.
+
+    It goes to `<log_dir>/leader.log` when one is configured, else to stderr.
+    Mind where that stderr ends up: this process runs as the veracage uid, so
+    journald files its output under the SYSTEM journal, not the user journal
+    the session unit lives in (`journalctl _UID=$(id -u veracage) -f`). See
+    docs/debugging.md."""
+    if not state.debug:
+        return
+    line = f"veracage[+{time.monotonic() - _STARTED:6.2f}s] {msg}"
+    path = _log_path()
+    if path is None:
+        print(line, file=sys.stderr, flush=True)
+        return
+    try:
+        # O_NOFOLLOW: the directory is named by the human side, and a symlink
+        # planted in it would redirect a veracage-uid append into a file of the
+        # planter's choosing. Opened per line, so no fd is held across the fork
+        # that launches an app.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        print(line, file=sys.stderr, flush=True)
 
 # The shared-workspace root (must match WORKSPACE in helper-rs/src/main.rs): the
 # leader's private-NS tmpfs holding every open volume at <WORKSPACE>/<label>. The

@@ -542,3 +542,17 @@ def test_publish_apps_drops_a_key_that_would_break_the_menu_file(tmp_path, monke
     body = (tmp_path / "config.apps").read_text()
     assert "kate\tKate" in body
     assert "evil" not in body and "a/b" not in body
+
+
+def test_log_dir_roundtrip_and_validation(tmp_xdg_config, capsys):
+    config.save(config.Config(apps={}, log_dir="/var/log/veracage"))
+    assert config.load().log_dir == "/var/log/veracage"
+    # Unset by default, and only an absolute path is taken: everything else
+    # means "the runtime dir", loudly for the values that look like a mistake.
+    assert config.Config(apps={}).log_dir is None
+    assert config._coerce_log_dir(None) is None
+    assert config._coerce_log_dir("") is None
+    assert config._coerce_log_dir("logs") is None
+    assert config._coerce_log_dir(7) is None
+    err = capsys.readouterr().err
+    assert err.count("invalid log_dir") == 2

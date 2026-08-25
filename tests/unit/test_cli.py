@@ -421,3 +421,67 @@ def test_no_unlisted_environment_variable_reaches_the_helper(
     joined = " ".join(argv)
     assert "LD_PRELOAD" not in joined
     assert "LD_LIBRARY_PATH" not in joined
+
+
+# The autouse fixture above stubs `ensure_compositor_up` for the argv tests;
+# the test below is about that function itself, so it keeps the real one.
+_REAL_ENSURE_COMPOSITOR_UP = cli.ensure_compositor_up
+
+
+def test_log_dir_reaches_the_compositor_only_when_it_is_a_directory(
+        monkeypatch, tmp_xdg_config, tmp_path, capsys):
+    """`log_dir` is forwarded as VERACAGE_LOG_DIR, but a path that is not a
+    directory is refused here: the compositor has no stdio, so it could not
+    report a log file it failed to open."""
+    monkeypatch.setenv("VERACAGE_LOG_DIR", "")   # so monkeypatch owns the key
+    monkeypatch.setattr("veracage.wayland.compositor_is_up", lambda: False)
+
+    def spawn_argv(**cfg_kwargs) -> str:
+        os.environ.pop("VERACAGE_LOG_DIR", None)
+        config.save(config.Config(apps={}, **cfg_kwargs))
+        with mock.patch("subprocess.run") as run:
+            run.return_value.returncode = 1      # stop before the socket wait
+            _REAL_ENSURE_COMPOSITOR_UP()
+        return " ".join(run.call_args.args[0])
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    assert f"VERACAGE_LOG_DIR={logs}" in spawn_argv(debug=True, log_dir=str(logs))
+    assert "VERACAGE_LOG_DIR" not in spawn_argv(debug=True,
+                                                log_dir=str(tmp_path / "gone"))
+    assert "not a directory" in capsys.readouterr().err
+    # No debug logging, nothing to place: the variable stays out of the env.
+    assert "VERACAGE_LOG_DIR" not in spawn_argv(debug=False, log_dir=str(logs))
+
+
+def _pkaction_result(stdout: str, rc: int = 0):
+    r = mock.Mock()
+    r.returncode = rc
+    r.stdout = stdout
+    return r
+
+
+def test_a_polkit_policy_naming_another_helper_is_reported():
+    """Two installs (a .deb over a `make install`) share one policy file, so the
+    one that lost names the other's helper and every pkexec asks for a password.
+    The complaint has to name both paths: that is what tells them apart."""
+    other = "/usr/libexec/veracage/veracage-helper"
+    annotation = "  annotation:  org.freedesktop.policykit.exec.path -> {}\n"
+
+    with mock.patch("subprocess.run",
+                    return_value=_pkaction_result(annotation.format(cli.HELPER_PATH))):
+        assert cli._polkit_helper_complaint() is None
+
+    with mock.patch("subprocess.run",
+                    return_value=_pkaction_result(annotation.format(other))):
+        complaint = cli._polkit_helper_complaint()
+    assert complaint is not None
+    assert other in complaint and cli.HELPER_PATH in complaint
+
+    # polkitd drops a malformed policy file whole, so the action goes missing.
+    with mock.patch("subprocess.run", return_value=_pkaction_result("", rc=1)):
+        assert "policy file" in (cli._polkit_helper_complaint() or "")
+
+    # No pkaction on the host: nothing to check against, so say nothing.
+    with mock.patch("subprocess.run", side_effect=FileNotFoundError):
+        assert cli._polkit_helper_complaint() is None

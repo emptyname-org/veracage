@@ -359,6 +359,20 @@ def _coerce_auto_dismount(val: object) -> int:
     return max(0, min(val, _AUTO_DISMOUNT_MAX))
 
 
+def _coerce_log_dir(val: object) -> str | None:
+    """The debug log directory: an absolute path, or None for the runtime dir.
+    It is forwarded to the compositor, which runs as the veracage uid, so a
+    relative path (resolved against a working directory that is not the human's)
+    would put the log somewhere nobody looks."""
+    if val is None or val == "":
+        return None
+    if not isinstance(val, str) or not val.startswith("/"):
+        print(f"veracage: invalid log_dir {val!r}, using the runtime directory",
+              file=sys.stderr)
+        return None
+    return val
+
+
 @dataclass
 class Config:
     apps: dict[str, App]
@@ -375,6 +389,7 @@ class Config:
     clip_clear_timeout: int = DEFAULT_CLIP_CLEAR_TIMEOUT   # seconds before it fires
     auto_dismount: int = 0                # idle minutes before a dismount (0 = off)
     debug: bool = False                   # verbose timing logs (see docs/debugging.md)
+    log_dir: str | None = None            # where those logs go (default: the runtime dir)
     shortcuts: dict[str, str] = field(default_factory=_default_shortcuts)
     volumes: dict[str, VolumeConfig] = field(default_factory=dict)
 
@@ -460,6 +475,7 @@ def load() -> Config:
         exchange_dir = None
     clip_clear = _coerce_bool(default.get("clip_clear", True), "default.clip_clear")
     debug = _coerce_bool(default.get("debug", False), "default.debug")
+    log_dir = _coerce_log_dir(default.get("log_dir"))
     clip_clear_timeout = _coerce_clip_timeout(
         default.get("clip_clear_timeout", DEFAULT_CLIP_CLEAR_TIMEOUT))
     auto_dismount = _coerce_auto_dismount(default.get("auto_dismount", 0))
@@ -530,7 +546,8 @@ def load() -> Config:
                   exchange=exchange, exchange_dir=exchange_dir,
                   clip_clear=clip_clear, clip_clear_timeout=clip_clear_timeout,
                   auto_dismount=auto_dismount,
-                  debug=debug, shortcuts=shortcuts, volumes=volumes)
+                  debug=debug, log_dir=log_dir,
+                  shortcuts=shortcuts, volumes=volumes)
 
 
 def save(cfg: Config) -> Path:
@@ -551,6 +568,8 @@ def save(cfg: Config) -> Path:
               f"clip_clear_timeout = {int(cfg.clip_clear_timeout)}",
               f"auto_dismount  = {int(cfg.auto_dismount)}",
               f"debug          = {_toml_bool(cfg.debug)}"]
+    if cfg.log_dir:
+        lines += [f'log_dir        = "{_esc(cfg.log_dir)}"']
     if cfg.exchange_dir:
         lines += [f'exchange_dir   = "{_esc(cfg.exchange_dir)}"']
     lines += [

@@ -670,3 +670,35 @@ def test_terminate_children_really_ends_them_and_reaps(monkeypatch):
         with pytest.raises(ProcessLookupError):
             os.kill(proc.pid, 0)               # and really gone
         proc.returncode = 0                    # already reaped by the leader
+
+
+def test_debug_lines_go_to_the_log_directory_when_there_is_one(tmp_path, monkeypatch, capsys):
+    """With a log directory configured the leader writes beside the compositor's
+    log. Without one it falls back to stderr, which journald files under the
+    SYSTEM journal because this process runs as the veracage uid."""
+    monkeypatch.setenv("VERACAGE_LOG_DIR", str(tmp_path))
+    leader._debug(_state(debug=True), "launch 'Kate': pid=1 spawned in 1ms")
+    written = (tmp_path / "leader.log").read_text()
+    assert "launch 'Kate': pid=1 spawned in 1ms" in written
+    assert capsys.readouterr().err == ""
+
+    monkeypatch.delenv("VERACAGE_LOG_DIR")
+    leader._debug(_state(debug=True), "exit 'Kate'")
+    assert "exit 'Kate'" in capsys.readouterr().err
+
+    # debug off writes nothing, either way
+    monkeypatch.setenv("VERACAGE_LOG_DIR", str(tmp_path))
+    leader._debug(_state(debug=False), "silent")
+    assert "silent" not in (tmp_path / "leader.log").read_text()
+    assert capsys.readouterr().err == ""
+
+
+def test_a_symlink_in_the_log_directory_is_refused(tmp_path, monkeypatch, capsys):
+    """The directory is named by the human side and the leader runs as the
+    veracage uid: a symlink planted there must not redirect the append."""
+    monkeypatch.setenv("VERACAGE_LOG_DIR", str(tmp_path))
+    target = tmp_path / "elsewhere"
+    (tmp_path / "leader.log").symlink_to(target)
+    leader._debug(_state(debug=True), "launch 'Kate'")
+    assert not target.exists()
+    assert "launch 'Kate'" in capsys.readouterr().err   # fell back to stderr

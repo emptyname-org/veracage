@@ -164,7 +164,13 @@ stays out of the repository.
 The polkit policy, the udev rule and the `system-sleep` hook live at fixed
 system paths, not under `PREFIX`. A `make install` to `/usr/local` and the
 package therefore write the same three files, and whichever ran last owns
-them. Pick one, or run `make uninstall` before installing the package.
+them. Pick one, or run `make uninstall` before installing the package. Both
+installs then run, but only one is authorised: polkit keys its action to the
+pkexec'd program path, so the other matches no action, falls back to
+`org.freedesktop.policykit.exec`, and asks for a password at every privileged
+step - the teardown that should be silent included. `veracage` says so on
+stderr when it sees the mismatch, and `make uninstall` removes those three
+shared files only when they are this install's own.
 
 ## Usage
 

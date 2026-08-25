@@ -82,6 +82,7 @@ _FORWARD_ENV = (
     "VERACAGE_FONT_SIZE",    # compositor UI base point size (config ui_font_size)
     "VERACAGE_WINDOW_SIZE",  # compositor default window size (config window_size)
     "VERACAGE_DEBUG",        # verbose timing logs (config debug); see docs/debugging.md
+    "VERACAGE_LOG_DIR",      # where those logs are written (config log_dir)
 )
 
 
@@ -162,6 +163,38 @@ def _unit_active_state(unit: str) -> str:
         return ""
 
 
+_POLKIT_HELPER_ACTION = "org.veracage.helper"
+
+
+def _polkit_helper_complaint() -> str | None:
+    """What is wrong with the polkit authorisation of the helper, if anything.
+
+    polkit keys an action to the pkexec'd program PATH, and a host has ONE
+    policy file for Veracage: a second install under another prefix (a .deb's
+    /usr over a `make install` /usr/local, or the reverse) rewrites it to name
+    the OTHER helper, and a malformed one is dropped by polkitd whole. Either
+    way pkexec matches no action, falls back to org.freedesktop.policykit.exec,
+    and asks for a password on every privileged call - the compositor, each
+    session, and the teardown that is meant to be silent."""
+    try:
+        r = subprocess.run(
+            ["pkaction", "--action-id", _POLKIT_HELPER_ACTION, "--verbose"],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None    # no pkaction on this host: nothing to check against
+    if r.returncode != 0:
+        return (f"polkit does not know {_POLKIT_HELPER_ACTION}: the policy file "
+                f"is missing, or malformed and dropped")
+    for line in r.stdout.splitlines():
+        key, arrow, value = line.partition("->")
+        if arrow and "policykit.exec.path" in key:
+            authorised = value.strip()
+            if authorised != HELPER_PATH:
+                return f"polkit authorises {authorised}, not {HELPER_PATH}"
+            break
+    return None
+
+
 def ensure_compositor_up() -> int:
     """Bring up the ONE persistent compositor as its OWN systemd --user transient
     unit (so it outlives any single vault session: a compositor forked inside a
@@ -174,6 +207,10 @@ def ensure_compositor_up() -> int:
     # Forward the compositor's look (theme/font/window size) from config through
     # the allowlisted env pkexec passes on. Set here so BOTH the GUI (`veracage
     # _up`) and a cold CLI `veracage open` get it, without the broker having to.
+    complaint = _polkit_helper_complaint()
+    if complaint:
+        print(f"veracage: {complaint}; every privileged step will ask for a "
+              "password.", file=sys.stderr)
     cfg = config.load()
     os.environ["VERACAGE_THEME"] = cfg.theme
     os.environ["VERACAGE_FONT_FILE"] = config.font_file(cfg.ui_font)
@@ -181,6 +218,14 @@ def ensure_compositor_up() -> int:
     os.environ["VERACAGE_WINDOW_SIZE"] = cfg.window_size
     if cfg.debug:
         os.environ["VERACAGE_DEBUG"] = "1"
+        if cfg.log_dir:
+            # Checked here, where the human can see the complaint: the compositor
+            # has no stdio, so a log directory it cannot open loses every line.
+            if os.path.isdir(cfg.log_dir):
+                os.environ["VERACAGE_LOG_DIR"] = cfg.log_dir
+            else:
+                print(f"veracage: log_dir {cfg.log_dir} is not a directory, "
+                      "using the runtime directory", file=sys.stderr)
     unit = f"veracage-compositor-{secrets.token_hex(3)}.service"
     cmd = [
         "systemd-run", "--user", "--collect", "--quiet",

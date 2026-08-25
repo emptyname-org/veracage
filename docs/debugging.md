@@ -21,14 +21,53 @@ env allowlist) and the session leader as `--debug`.
 
 | Component | Where | Read it with |
 | --- | --- | --- |
-| Session leader (app launches, volumes) | its systemd unit's journal | `journalctl --user -u 'veracage-*' -f` |
-| Sandboxed apps' own output | same journal, only while `debug = true` | as above |
-| Broker (`veracage-agent`: mount flow) | its journal entry | `journalctl --user -f` |
+| Session leader (app launches, volumes) | the SYSTEM journal | `journalctl _UID=$(id -u veracage) -f` |
+| Sandboxed apps' own output | same, only while `debug = true` | as above |
+| Broker (`veracage-agent`: mount flow) | the user journal | `journalctl --user -f` |
 | Compositor (rendering) | `/run/veracage/rt/compositor.log` | `tail -f /run/veracage/rt/compositor.log` |
 
-The compositor cannot use the journal: it runs as the `veracage` uid with its
-stdio swallowed by the privilege drop, so it writes its own file (mode 0644,
+The compositor cannot use the journal at all: it runs as the `veracage` uid with
+its stdio swallowed by the privilege drop, so it writes its own file (mode 0644,
 inside the 0711 runtime dir, so only the human can read it).
+
+The leader keeps its stderr, but that stderr does not go where its unit is:
+journald splits the journal by the uid of the sender, and the leader is the
+`veracage` uid, so its lines land in the SYSTEM journal even though the unit is
+a `--user` one. `journalctl --user -u 'veracage-*'` shows the unit's start and
+stop and none of its output. Reading the system journal needs the `adm` or
+`systemd-journal` group.
+
+## Putting the compositor log somewhere else
+
+`/run` is a tmpfs, so that log dies with the machine, and the 0711 runtime dir
+cannot be listed - only opened by name. To keep it somewhere readable instead:
+
+```toml
+# ~/.config/veracage/config.toml
+[default]
+debug   = true
+log_dir = "/home/you/logs"    # absolute; must exist and be writable by uid veracage
+```
+
+With a log directory configured, the session leader writes its own lines to
+`<log_dir>/leader.log` instead of that journal, so both logs sit side by side.
+The sandboxed apps' output stays in the journal deliberately: putting it in the
+file would mean handing a sandboxed app a writable fd into a host directory.
+
+The directory is NOT created for you, and Veracage does not widen its
+permissions: the compositor runs as the `veracage` uid, so the directory has to
+be one that uid can write (`chmod 1777`, or owned by it). The file is opened
+with `O_NOFOLLOW`, so a symlink planted in that directory is refused rather than
+followed. With `log_dir` unset, or naming something that is not a directory (the
+CLI says so on stderr and ignores it), the log stays at
+`/run/veracage/rt/compositor.log`. A directory that exists but the `veracage`
+uid cannot write is the one case that loses lines silently, because the
+compositor has no stdio to complain on.
+
+A log outside the runtime dir is readable by whoever can reach that directory.
+The lines are render counters and cursor decisions, not volume contents, but the
+sandboxed apps' own output (which does name paths inside the volume) goes to the
+journal whenever `debug = true` - see the trade below.
 
 ## What each line means
 
@@ -47,12 +86,15 @@ is where the sandboxed app's output helps.
 Compositor, one line per second while anything is happening:
 
 ```
-[+  12.0s] frames=4 submits=4 windows=1 dirty=false status=None
+[+  12.0s] frames=4 submits=4 windows=1 dirty=false mods=none status=None
 ```
 
 `frames` counted renders, `submits` the ones that produced damage and reached
 the host: `frames` high with `submits` low means work thrown away, and both at
-~60 means something is repainting continuously.
+~60 means something is repainting continuously. `mods` is what the seat believes
+is held: anything but `none` on a line where nothing is being typed is a latched
+modifier, which the sandboxed app sees as a wheel that zooms or letters that run
+commands.
 
 ## The trade
 

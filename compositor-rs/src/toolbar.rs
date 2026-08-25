@@ -812,7 +812,7 @@ fn app_button(icon: Option<&egui::TextureHandle>, name: &str) -> egui::Button<'s
 // --------------------------------------------------------- discovery -------
 
 /// The shared compositor runtime dir (must match COMPOSITOR_RUNTIME in wayland.py).
-const RUNTIME_DIR: &str = "/run/veracage/rt";
+pub const RUNTIME_DIR: &str = "/run/veracage/rt";
 
 /// The human-published dir (created by the helper, owned by the human uid):
 /// `config.apps` (the configured app list) + `icons/<key>.rgba` (menu icons).

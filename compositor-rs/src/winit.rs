@@ -1065,6 +1065,11 @@ pub fn init_winit(
                     state.wake();
                 }
             }
+            WinitEvent::Focus(false) => {
+                // The host took the keyboard away mid-keystroke; no release for
+                // whatever is held will ever arrive. See release_pressed_keys.
+                state.release_pressed_keys();
+            }
             WinitEvent::CloseRequested => {
                 begin_quit(state);
             }
@@ -1111,12 +1116,14 @@ pub fn init_winit(
                     if now.saturating_sub(state.debug_logged_at) >= Duration::from_secs(1) {
                         state.debug_logged_at = now;
                         crate::vcdebug(&format!(
-                            "[+{:6.1}s] frames={} submits={} windows={} dirty={} status={:?}",
+                            "[+{:6.1}s] frames={} submits={} windows={} dirty={} \
+                             mods={} status={:?}",
                             now.as_secs_f32(),
                             state.frames,
                             state.submits,
                             state.space.elements().count(),
                             state.dirty,
+                            crate::input::held_modifiers(state),
                             state.toolbar.as_ref().and_then(|t| t.status_text()),
                         ));
                         state.frames = 0;

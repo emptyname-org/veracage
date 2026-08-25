@@ -164,16 +164,37 @@ pub fn debug_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("VERACAGE_DEBUG").as_deref() == Ok("1"))
 }
 
-/// Append a debug line to `/run/veracage/rt/compositor.log` (0644, so the human
-/// uid can read it through the 0711 rt dir). The compositor's stdio is swallowed
-/// by pkexec/privilege-drop, so the journal never sees its tracing - this is the
+/// Where `vcdebug` appends: `$VERACAGE_LOG_DIR/compositor.log` when the human
+/// side configured a log directory (config `log_dir`, forwarded through the
+/// helper's env allowlist), else `compositor.log` in the runtime dir. Read once.
+fn log_path() -> &'static std::path::Path {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = std::env::var("VERACAGE_LOG_DIR")
+            .unwrap_or_else(|_| crate::toolbar::RUNTIME_DIR.to_string());
+        std::path::PathBuf::from(dir).join("compositor.log")
+    })
+}
+
+/// Append a debug line to the log file (0644, so the human uid can read it
+/// through the 0711 rt dir). The compositor's stdio is swallowed by
+/// pkexec/privilege-drop, so the journal never sees its tracing - this is the
 /// reliable channel for live debugging. See docs/debugging.md.
 pub fn vcdebug(msg: &str) {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    let path = "/run/veracage/rt/compositor.log";
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    // O_NOFOLLOW: the log directory can be configured by the human uid, so a
+    // symlink planted in it would redirect a veracage-uid append into a file of
+    // the planter's choosing. Permissions are set through the fd for the same
+    // reason - the name may be a different file by the time we chmod it.
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(log_path())
+    {
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o644));
         let _ = writeln!(f, "{msg}");
         return;
     }

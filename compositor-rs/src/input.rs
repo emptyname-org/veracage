@@ -13,7 +13,50 @@ use smithay::{
 
 use crate::state::State;
 
+/// The modifiers the seat currently reports as held, `Ctrl+Shift` style, or
+/// "none". Logged once a second because a latched modifier is otherwise
+/// invisible from outside: what the human sees is a sandboxed app whose wheel
+/// zooms and whose letters run commands.
+pub fn held_modifiers(state: &State) -> String {
+    let Some(keyboard) = state.seat.get_keyboard() else {
+        return "none".into();
+    };
+    let m = keyboard.modifier_state();
+    let held: Vec<&str> = [(m.ctrl, "Ctrl"), (m.alt, "Alt"), (m.shift, "Shift"), (m.logo, "Super")]
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, name)| *name)
+        .collect();
+    if held.is_empty() { "none".into() } else { held.join("+") }
+}
+
 impl State {
+    /// Release every key the seat still believes is held, telling the focused
+    /// client about each one.
+    ///
+    /// The host window can lose the keyboard with a key down: a host global
+    /// shortcut (Ctrl+Alt+arrow), an Alt+Tab, a password dialog taking over.
+    /// winit delivers nothing while unfocused, so that key's release never
+    /// arrives and the seat keeps reporting it held - a latched Ctrl turns the
+    /// sandboxed app's wheel into zoom and its letters into shortcuts, and only
+    /// a compositor restart clears it.
+    pub fn release_pressed_keys(&mut self) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        let time = self.start_time.elapsed().as_millis() as u32;
+        for key in keyboard.pressed_keys() {
+            keyboard.input::<(), _>(
+                self,
+                key,
+                KeyState::Released,
+                SERIAL_COUNTER.next_serial(),
+                time,
+                |_, _, _| FilterResult::Forward,
+            );
+        }
+    }
+
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         // Any input is activity: it is what the idle dismount times out on.
         self.last_input = std::time::Instant::now();

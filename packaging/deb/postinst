@@ -26,5 +26,14 @@ configure)
 	# /dev/disk/by-label symlinks. Drop the old file if this host still has it.
 	rm -f "$UDEVDIR/99-veracage.rules"
 	udevadm control --reload >/dev/null 2>&1 || true
+
+	# A `make install` under /usr/local leaves a second helper AND comes first
+	# on PATH, while this package has just taken over the one polkit policy
+	# file (polkit keys the action to the pkexec'd path). The /usr/local copy
+	# would then match no action and ask for a password at every step.
+	if [ -e /usr/local/bin/veracage ]; then
+		echo "veracage: /usr/local/bin/veracage is installed too and comes first on PATH." >&2
+		echo "veracage: remove it (make uninstall in the checkout) or it will ask for a password at every step." >&2
+	fi
 	;;
 esac

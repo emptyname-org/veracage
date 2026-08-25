@@ -167,6 +167,38 @@ define install-policy
 	@rm -f "$(POLICY_TMP)"
 endef
 
+# remove-policy <helper-path this install authorised>: the host has ONE policy
+# file and polkit keys the action to the pkexec'd program path, so removing it
+# blindly disarms whatever OTHER install wrote it last (a .deb under /usr, a dev
+# install pointed at a checkout). That install then matches no action, and asks
+# for a password on every privileged call - teardown included.
+define remove-policy
+	@if [ ! -e "$(POLKIT_DIR)/org.veracage.policy" ]; then \
+	  echo "no polkit policy to remove"; \
+	elif grep -q "$(1)" "$(POLKIT_DIR)/org.veracage.policy"; then \
+	  sudo rm -f "$(POLKIT_DIR)/org.veracage.policy"; \
+	  echo "removed $(POLKIT_DIR)/org.veracage.policy"; \
+	else \
+	  echo "kept $(POLKIT_DIR)/org.veracage.policy: it authorises another install"; \
+	fi
+endef
+
+# remove-host-hooks: the udev rule and the system-sleep hook are host-global
+# paths, not $(PREFIX)-scoped, so they belong to whichever install is still
+# here - drop them only when none is left. A stale udev rule is harmless (it
+# only keeps the decrypted volume out of /dev/disk), but a sleep hook whose
+# $(LIBDIR) is gone runs and fails on every suspend.
+define remove-host-hooks
+	@if [ -d /usr/lib/veracage/veracage ] || [ -d /usr/local/lib/veracage/veracage ]; then \
+	  echo "kept the udev rule + sleep hook: another Veracage is still installed"; \
+	else \
+	  sudo rm -f "$(UDEVDIR)/57-veracage.rules" "$(UDEVDIR)/99-veracage.rules"; \
+	  sudo udevadm control --reload 2>/dev/null || true; \
+	  sudo rm -f "$(SLEEPDIR)/veracage"; \
+	  echo "removed the udev rule and the system-sleep hook"; \
+	fi
+endef
+
 # --- real install --------------------------------------------------------
 install: CONT := $(BINDIR)/veracage
 install: check-policy build build-agent build-compositor
@@ -225,6 +257,8 @@ install: check-policy build build-agent build-compositor
 	@[ -n "$(DESTDIR)" ] || { command -v gtk-update-icon-cache >/dev/null 2>&1 && sudo gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor" 2>/dev/null; } || true
 	# Both skipped for a staged DESTDIR build: nothing was installed there, it
 	# is the package being built, and `deb` prints its own line at the end.
+	@[ -n "$(DESTDIR)" ] || ! dpkg -s veracage >/dev/null 2>&1 \
+	  || echo 'note: the veracage .deb is installed under /usr as well. This install now owns the one polkit policy, so /usr/bin/veracage would ask for a password at every step: remove one of the two.'
 	@[ -n "$(DESTDIR)" ] || echo 'Installed to $(PREFIX). Launch "Veracage" from your app menu, or run: veracage configure'
 	@[ -n "$(DESTDIR)" ] || echo 'To build a .deb instead: make deb, or make install-deb to install it too.'
 
@@ -258,28 +292,17 @@ install-dev: check-policy veracage-user build
 	@echo '*** install` (root-owned /usr/local) for anything real.'
 
 uninstall:
-	sudo rm -f "$(POLKIT_DIR)/org.veracage.policy"
+	$(call remove-policy,$(LIBEXEC)/veracage-helper)
 	sudo rm -f "$(APPDIR)/veracage.desktop" "$(ICONDIR)/veracage.png" "$(PIXMAPDIR)/veracage.png"
-	sudo rm -f "$(UDEVDIR)/57-veracage.rules" "$(UDEVDIR)/99-veracage.rules"; sudo udevadm control --reload 2>/dev/null || true
-	sudo rm -f "$(SLEEPDIR)/veracage"
 	sudo rm -rf "$(LIBDIR)" "$(LIBEXEC)" "$(BINDIR)/veracage" \
 	    "$(BINDIR)/veracage-agent" "$(BINDIR)/veracage-compositor"
+	$(call remove-host-hooks)
 
-# Removes what install-dev put on the HOST. The udev rule and the sleep hook are
-# global paths a real `make install` writes too, so this only touches them when
-# there is no real install left behind them (a stale rule would keep the
-# decrypted volume out of /dev/disk, which is harmless, but a sleep hook whose
-# $(LIBDIR) is gone would run and fail on every suspend).
+# Removes what install-dev put on the HOST. The policy and the host-global hooks
+# are shared with a real install, so both are removed only when they are ours.
 uninstall-dev:
-	sudo rm -f "$(POLKIT_DIR)/org.veracage.policy"
-	@if [ -d "$(LIBDIR)/veracage" ]; then \
-	  echo "keeping the udev rule + sleep hook: $(LIBDIR)/veracage is still installed"; \
-	else \
-	  sudo rm -f "$(UDEVDIR)/57-veracage.rules"; \
-	  sudo udevadm control --reload 2>/dev/null || true; \
-	  sudo rm -f "$(SLEEPDIR)/veracage"; \
-	  echo "removed the udev rule and the system-sleep hook"; \
-	fi
+	$(call remove-policy,$(DEV_ROOT)/$(HELPER_BIN))
+	$(call remove-host-hooks)
 
 # --- Debian package ------------------------------------------------------
 # `make deb` stages a real install into dist/stage - `install` honours DESTDIR

@@ -406,3 +406,56 @@ ls /dev/mapper/ | grep veracage    # expect: NO output
 Repeat with Leave open: the volume is still open on resume. Test 11 covers the
 basic case, this one covers the hook's rewritten grace period and the setting
 it now reads without following a symlink.
+
+## Input
+
+### Test 30: A modifier held when the host takes the keyboard
+
+With an app open in Veracage, hold Ctrl down and, while still holding it, make
+the host take the keyboard away: a host global shortcut that switches desktop
+(Ctrl+Alt+Right on KDE), or Alt+Tab. Let go of Ctrl outside the Veracage
+window, click back into it, and roll the mouse wheel in the app.
+
+Expect: the wheel scrolls. Before the compositor released held keys on focus
+loss it zoomed instead, letters ran shortcuts, and only a restart cleared it,
+because the release for that Ctrl was delivered to the host and never to the
+nested seat. With `debug = true`, the log line for a quiet second reads
+`mods=none`, and a latched modifier reads `mods=Ctrl`.
+
+## Install
+
+### Test 31: One password prompt per start, none at quit
+
+```bash
+command -v veracage                                       # which install runs
+pkaction --action-id org.veracage.helper --verbose | grep exec.path
+```
+
+Expect: the annotated path is the helper of THAT install
+(`<prefix>/libexec/veracage/veracage-helper`). polkit keys an action to the
+pkexec'd program path and the host has one policy file, so a second install
+under another prefix (a .deb over a `make install`) silently takes it over.
+
+Then start Veracage and quit it.
+
+Expect: ONE password prompt (the compositor's, which `auth_self_keep` reuses
+for the session moments later), and NO prompt at all when quitting - the
+teardown runs the cleanup action, which is passwordless by policy. A prompt per
+step, or a prompt at quit, means pkexec matched no action and fell back to
+`org.freedesktop.policykit.exec`. `veracage open` says so on stderr when it
+sees the mismatch.
+
+### Test 32: The debug logs are where the configuration says
+
+With `debug = true` and `log_dir = "<some dir the veracage uid can write>"`:
+
+```bash
+ls "$LOG_DIR"                       # expect: compositor.log and leader.log
+journalctl _UID=$(id -u veracage) -f   # expect: the sandboxed apps' own output
+```
+
+Expect: `compositor.log` gets a line a second, `leader.log` a line per app
+launch and exit. Point `log_dir` at a path that is not a directory: `veracage`
+says so on stderr and logs to `/run/veracage/rt/compositor.log` instead. Plant
+a symlink at `<log_dir>/compositor.log`: it is refused (O_NOFOLLOW), not
+followed.
