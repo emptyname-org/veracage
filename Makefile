@@ -314,7 +314,7 @@ uninstall-dev:
 #
 # The version carries the build timestamp, so every rebuild is newer than the
 # package already installed and `make install-deb` just replaces it. Pass
-# DEB_VERSION=0.6.0-1 to stamp a fixed release version instead.
+# DEB_VERSION=0.7.0-1 to stamp a fixed release version instead.
 VERSION        := $(shell sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
 DEB_ARCH       := $(shell dpkg --print-architecture 2>/dev/null)
 DEB_MAINTAINER := emptyname <noreply@emptyname.org>

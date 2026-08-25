@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "veracage"
-version = "0.6.0"
+version = "0.7.0"
 description = "VeraCrypt sandboxing wrapper: mount a vault into a private namespace and run viewer apps in a bubblewrap sandbox with explicit, user-driven host transfer."
 requires-python = ">=3.11"
 authors = [{ name = "emptyname", email = "noreply@emptyname.org" }]
