@@ -7,8 +7,9 @@ around *who a process runs as*.
 
 Three uids are in play:
 
-- **root** (uid 0) - used for **seconds only**, by the helper, to do the
-  privileged setup. Never runs apps.
+- **root** (uid 0) - the helper's privileged setup takes **seconds**, but one
+  root process (the helper's parent) **stays for the whole session** to close
+  the volumes when the leader exits. Never runs apps.
 - **human** / **human uid** - the real logged-in user (e.g. uid 1000). Has
   **no access to the decrypted volume** in this design. That is the whole
   point.
@@ -26,9 +27,11 @@ apps). Settings that touch both live under Settings > System Integration.
 
 - **launcher** - what `veracage open` runs as, in the human's shell. Resolves
   the app, then kicks off the privileged setup. (`cmd_open` in `cli.py`.)
-- **helper** - the small **Rust** binary (`helper-rs`) that runs as **root**
-  via pkexec for a few seconds: opens the encrypted volume, sets up the idmap
-  mount, then **drops to the veracage uid** and hands off.
+- **helper** - the small **Rust** binary (`helper-rs`) that pkexec runs as
+  **root**. It **forks**: the child takes seconds (opens the encrypted volume,
+  sets up the idmap mount, then **drops to the veracage uid** and hands off),
+  while the parent **stays root for the whole session**, blocked in `waitpid` on
+  the leader with no socket and no input, to close every volume when it exits.
 - **continuation** - the program the helper `exec`s *after* dropping
   privileges (it continues into it). It **is** the leader. **Pinned** at
   build time (baked into the helper binary) so a malicious direct pkexec call

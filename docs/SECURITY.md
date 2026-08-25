@@ -44,9 +44,15 @@ portals. The GPU exception: `/dev/dri` plus `/sys/dev/char` and `/sys/devices` r
 
 ## Privilege model
 
-No setuid, no long-lived root daemon. The only root steps (mount/dismount and
-the compositor spawn) run in a small polkit-authorised Rust helper
-(`helper-rs/`) that exits in seconds.
+No setuid. The only root steps (mount/dismount and the compositor spawn) run in
+a small polkit-authorised Rust helper (`helper-rs/`). The compositor spawn
+`exec`s and is gone. A mount **forks**: the child mounts and execs the leader in
+seconds, and the parent **stays root as long as the session does**, blocked in
+`waitpid`. It listens on nothing and reads no input, so after the fork nothing
+can ask it to act. It is there to close every volume in the session lock when
+the leader exits, which is what tears a session down when the leader is
+SIGKILLed (the `ExecStopPost` below covers the case where the helper is gone
+too).
 
 **The helper does not trust its caller.** It is reachable by any active local
 user via pkexec (`auth_self_keep`), so:

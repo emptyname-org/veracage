@@ -64,14 +64,16 @@ Full topology in `uid-isolation.md`. In brief:
 - **Human-uid broker** (`veracage-agent`, egui): mounts volumes (`pkexec`),
   runs the config picker, edits settings. The one human-side process: it does
   what a `veracage`-uid process can't (`pkexec`, host-file dialogs).
-- **Root helper** (`helper-rs`, runs for seconds, via pkexec):
+- **Root helper** (`helper-rs`, via pkexec), in the forked child, in seconds:
   `cryptsetup open` -> check the filesystem -> idmap-mount into the workspace
-  namespace -> drop to `veracage` -> exec the session leader. Does not trust its
-  caller (§6). The check is `fsck -p` on the decrypted device, before anything
-  mounts it: a volume that was not dismounted cleanly is repaired where preen mode
-  can do it unambiguously, and is otherwise left closed and dismounted with a
-  message, rather than mounted dirty. ext2/3/4, FAT and exFAT are checked; a
-  filesystem with no preen-capable checker installed is mounted as before.
+  namespace -> drop to `veracage` -> exec the session leader. Its parent stays
+  root for the life of the session and closes the volumes when the leader exits
+  (§6, §7). Does not trust its caller (§6). The check is `fsck -p` on the
+  decrypted device, before anything mounts it: a volume that was not dismounted
+  cleanly is repaired where preen mode can do it unambiguously, and is otherwise
+  left closed and dismounted with a message, rather than mounted dirty.
+  ext2/3/4, FAT and exFAT are checked; a filesystem with no preen-capable
+  checker installed is mounted as before.
 - **`veracage`-uid compositor** (`veracage-compositor`, Rust/smithay): ONE
   persistent instance. Renders every volume's apps into one host window, owns
   the clipboard, hosts the egui menu bar. First-party (not weston/cage), so
@@ -136,9 +138,12 @@ bwrap --unshare-pid --unshare-uts --unshare-ipc --unshare-cgroup --unshare-net \
 
 ## 6. Privilege model
 
-No setuid, no long-lived root daemon. The only root steps (mount/dismount and
-the compositor spawn) are done by the small polkit-authorised `helper-rs`,
-which exits in seconds. **The helper does not trust its caller:**
+No setuid. The only root steps (mount/dismount and the compositor spawn) are
+done by the small polkit-authorised `helper-rs`. The compositor spawn execs and
+is gone, and a mount forks: the child execs the leader in seconds, while the
+parent stays root for the life of the session, blocked in `waitpid` with no
+socket and no input, and closes every volume in the session lock when the leader
+exits (§7). **The helper does not trust its caller:**
 
 - target uid/gid come from **`PKEXEC_UID`** (never argv). It refuses if unset
   or 0.
