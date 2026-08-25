@@ -1359,6 +1359,29 @@ fn fsck_volume(dm_path: &str, fstype: Option<&str>) -> Result<(), String> {
     ))
 }
 
+/// Overwrite the passphrase this process still holds, and drop the buffer.
+///
+/// It reached cryptsetup on its stdin and is never read again, but the process
+/// holding it is not short-lived: the parent waits for the leader and closes the
+/// volume on the way out, so an unwiped copy would sit in root-owned heap for as
+/// long as the volume is open. `write_volatile` because a plain store to memory
+/// nothing reads again is dead code the compiler is free to drop, and a fence so
+/// the wipe is not sunk past what follows.
+fn wipe_passphrase(passphrase: &mut Option<Vec<u8>>) {
+    if let Some(p) = passphrase.as_mut() {
+        wipe(p);
+    }
+    *passphrase = None;
+}
+
+/// Overwrite a buffer with zeroes, for real.
+fn wipe(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        unsafe { ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn mount_volume_at_workspace(
     source: &Path,
@@ -1452,7 +1475,7 @@ fn session_child(
     dm_name: Option<&str>,
     ctl_path: &Path,
     cont: &Path,
-    args: &Args,
+    args: &mut Args,
 ) -> ! {
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
         fail_errno("unshare(CLONE_NEWNS)");
@@ -1486,6 +1509,9 @@ fn session_child(
         ),
         _ => (PathBuf::from(WORKSPACE), String::new()),
     };
+    // cryptsetup has it; this copy has no further use. The exec below would drop
+    // it anyway, but there is mount work in between and this is root.
+    wipe_passphrase(&mut args.passphrase);
     let vault_run = PathBuf::from(format!("/run/veracage/session-{sid}.run"));
 
     // Shared directory (idmap a human-owned host dir), bound at /exchange,
@@ -1551,7 +1577,7 @@ fn session_child(
 /// volume's dm + drops the session lock/pid/socket. The vault mounts died with
 /// the leader's NS, so there is no mountpoint tidy here.
 fn run_session_bootstrap(
-    args: &Args,
+    args: &mut Args,
     human_uid: u32,
     human_gid: u32,
     vault_uid: u32,
@@ -1559,7 +1585,10 @@ fn run_session_bootstrap(
     source: Option<&Path>,
     flock: std::fs::File,
 ) -> ! {
-    let sid = args.session.as_deref().unwrap();
+    // Owned: the passphrase is wiped through `args` further down, and a `sid`
+    // still borrowed from it would keep the whole struct borrowed until then.
+    let sid_owned = args.session.clone().unwrap();
+    let sid = sid_owned.as_str();
     check_session_caller(sid, human_uid);
     let runtime_dir = setenv_value(args, "XDG_RUNTIME_DIR")
         .unwrap_or_else(|| fail("XDG_RUNTIME_DIR not forwarded; need it for the control socket", 2));
@@ -1643,6 +1672,10 @@ fn run_session_bootstrap(
                       sid, dm_name.as_deref(), &ctl_path, &cont, args);
     }
 
+    // Parent: the child has the passphrase and does the cryptsetup open. This
+    // copy is never read again, and this process outlives the whole session.
+    wipe_passphrase(&mut args.passphrase);
+
     // Parent (root, original NS): the session leader's pid (+ start-time) lets the
     // add-volume path find + verify the workspace NS holder.
     write_session_pidfile(sid, pid);
@@ -1720,7 +1753,7 @@ fn run_session_bootstrap(
 /// `cleanup --session` no-ops while the leader is alive).
 #[allow(clippy::too_many_arguments)]
 fn run_session_add(
-    args: &Args,
+    args: &mut Args,
     human_uid: u32,
     human_gid: u32,
     vault_uid: u32,
@@ -1786,8 +1819,10 @@ fn run_session_add(
             source, args.backend, args.passphrase.as_deref(),
             human_uid, human_gid, vault_uid, vault_gid, &dm_name,
         );
+        wipe_passphrase(&mut args.passphrase);
         std::process::exit(0);
     }
+    wipe_passphrase(&mut args.passphrase);
 
     // Parent: wait for the add-child. On failure, close this volume's dm (the child
     // may have opened it before erroring) so it doesn't leak; the stale lock line
@@ -1865,7 +1900,7 @@ fn write_launch_request(sid: &str, spec: &str, vault_uid: u32, vault_gid: u32) {
 
 fn main() {
     suppress_core_dumps();
-    let args = parse_args();
+    let mut args = parse_args();
 
     if unsafe { libc::geteuid() } != 0 {
         fail("must be invoked as root (via pkexec)", 2);
@@ -1917,7 +1952,7 @@ fn main() {
         if verify_session_leader(sid, vault_uid).is_some() {
             std::process::exit(0); // a session already exists
         }
-        run_session_bootstrap(&args, human_uid, human_gid, vault_uid, vault_gid, None, flock);
+        run_session_bootstrap(&mut args, human_uid, human_gid, vault_uid, vault_gid, None, flock);
     }
 
     let source_arg = args
@@ -1952,11 +1987,11 @@ fn main() {
     let flock = session_flock(sid);
     match verify_session_leader(sid, vault_uid) {
         Some(leader_pid) => {
-            run_session_add(&args, human_uid, human_gid, vault_uid, vault_gid, &source,
+            run_session_add(&mut args, human_uid, human_gid, vault_uid, vault_gid, &source,
                             leader_pid, flock)
         }
         None => {
-            run_session_bootstrap(&args, human_uid, human_gid, vault_uid, vault_gid,
+            run_session_bootstrap(&mut args, human_uid, human_gid, vault_uid, vault_gid,
                                   Some(&source), flock)
         }
     }
@@ -1965,6 +2000,23 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wiped_buffer_keeps_none_of_the_passphrase() {
+        let mut secret = b"correct horse battery staple".to_vec();
+        wipe(&mut secret);
+        assert!(secret.iter().all(|b| *b == 0), "{secret:?}");
+    }
+
+    #[test]
+    fn wiping_the_passphrase_also_drops_it() {
+        // Both halves matter: the bytes are overwritten before the buffer is
+        // freed, and nothing is left holding it afterwards.
+        let mut passphrase = Some(b"hunter2".to_vec());
+        wipe_passphrase(&mut passphrase);
+        assert!(passphrase.is_none());
+        wipe_passphrase(&mut passphrase);   // idempotent: teardown may run twice
+    }
 
     #[test]
     fn fsck_lets_a_clean_or_repaired_filesystem_through_and_nothing_else() {

@@ -25,12 +25,6 @@ inputs rather than forwarding `args.rest`.
 `obsolete-if:` the human-uid launcher becomes the only caller AND the helper's
 CLI contract is locked to a fixed subcommand set.
 
-## Passphrase not zeroized in the root helper - [TRACK]
-The passphrase lives unwiped in the *root* helper's heap (COW-inherited by the
-forked children). Only root can read that, and root already wins, so it's low
-priority. *Fix:* `zeroize` the bytes after `crypt::open`. `obsolete-if:` the
-mount stops handling a plaintext passphrase (TPM/FIDO2 or keyring unlock).
-
 ## M2 - [TRACK/document] Config-tamper confused-deputy
 `config.toml` (human-owned, no integrity check) -> `leader.py` runs its
 `exec`/`args` **verbatim** (type-checked, not content-checked) ->
