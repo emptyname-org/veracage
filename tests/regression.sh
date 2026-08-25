@@ -228,6 +228,38 @@ c_headless_smoke() {
   return $?
 }
 
+# ------------------------------------------------------------- package ------
+# The .deb is what actually gets installed, so a broken control template or a
+# mis-staged tree should fail here rather than at `apt install`. Runs LAST:
+# `make deb` rebuilds the helper with PREFIX=/usr, and c_helper_contract wants
+# the tree's own release helper.
+c_deb() {
+  have make || { echo "no make"; return 2; }
+  have dpkg-deb && have dpkg-shlibdeps || { echo "dpkg-dev absent"; return 2; }
+  have strings || { echo "binutils absent"; return 2; }
+  make deb >/dev/null || return 1
+  local deb tmp rc=0
+  deb=$(ls -t "$ROOT"/dist/*.deb 2>/dev/null | head -1)
+  [ -n "$deb" ] || { echo "make deb produced no .deb"; return 1; }
+  echo "built $(basename "$deb")"
+  tmp=$(mktemp -d) || return 1
+  dpkg-deb -x "$deb" "$tmp" || { rm -rf "$tmp"; return 1; }
+  # The two paths a mis-staged package gets wrong, neither of which shows up
+  # before someone installs it: the continuation baked into the helper at build
+  # time, and the exec.path polkit will accept (a mismatch drops both Veracage
+  # actions and sends every privileged step back to a password prompt).
+  local helper="$tmp/usr/libexec/veracage/veracage-helper"
+  strings "$helper" | grep -q '/usr/bin/veracage' \
+    || { echo "packaged helper: continuation is not /usr/bin/veracage"; rc=1; }
+  strings "$helper" | grep -q '/usr/local/bin/veracage' \
+    && { echo "packaged helper: still carries the /usr/local continuation"; rc=1; }
+  grep -q '>/usr/libexec/veracage/veracage-helper<' \
+    "$tmp/usr/share/polkit-1/actions/org.veracage.policy" \
+    || { echo "packaged polkit policy does not point at /usr/libexec/veracage"; rc=1; }
+  rm -rf "$tmp"
+  return $rc
+}
+
 # ------------------------------------------------------------- run ----------
 bold "Veracage regression suite  (root: $ROOT)"
 echo "toolchain: $(cargo --version 2>/dev/null || echo 'no cargo') / $($PY --version 2>&1)"
@@ -242,6 +274,7 @@ component "rust: dependency advisories" c_audit
 component "rust: helper dep budget"  c_helper_deps
 component "python: lint (ruff+mypy)" c_py_lint
 component "headless compositor smoke" c_headless_smoke
+component "debian package"           c_deb
 
 # ------------------------------------------------------------- summary ------
 # A SKIP of a CORE component (a build or the unit tests) means the environment

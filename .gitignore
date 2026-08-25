@@ -40,3 +40,10 @@ target/
 
 # Claude Code local settings (machine-specific; the rules/ dir is checked in)
 /.claude/settings.local.json
+
+# Staged tree and the .deb built by `make deb`
+/dist/
+
+# Optional post-install hook for `make install-deb` (machine-local: the path
+# it copies to must not reach the repository)
+/post-install.sh

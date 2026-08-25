@@ -1,0 +1,30 @@
+#!/bin/sh
+# Everything `make install` does to the running system, which the staged
+# DESTDIR build deliberately skips. Idempotent: dpkg runs it on every upgrade.
+set -e
+
+USER_NAME=veracage
+UDEVDIR=/usr/lib/udev/rules.d
+
+case "$1" in
+configure)
+	# The uid the volume is idmapped to and the sandboxed apps run as. Same
+	# account, same flags as the Makefile's veracage-user target: keep the two
+	# in step, the helper resolves the account by name.
+	id "$USER_NAME" >/dev/null 2>&1 \
+	  || useradd -r -M -s /usr/sbin/nologin "$USER_NAME"
+
+	# render group -> hardware GL for the compositor and the sandboxed apps
+	# (the helper applies it via initgroups). Without it Mesa silently falls
+	# back to llvmpipe software rendering.
+	if getent group render >/dev/null 2>&1 \
+	   && ! id -nG "$USER_NAME" | grep -qw render; then
+		usermod -aG render "$USER_NAME"
+	fi
+
+	# The rule was numbered 99 before v0.6.0, which ran too late to stop the
+	# /dev/disk/by-label symlinks. Drop the old file if this host still has it.
+	rm -f "$UDEVDIR/99-veracage.rules"
+	udevadm control --reload >/dev/null 2>&1 || true
+	;;
+esac

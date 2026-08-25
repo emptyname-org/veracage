@@ -1,0 +1,18 @@
+#!/bin/sh
+# The veracage system user is deliberately NOT removed here: a uid that is
+# recycled hands every file still owned by it to the next account that gets it.
+set -e
+
+LIBDIR=/usr/lib/veracage
+
+case "$1" in
+remove|purge)
+	# The privileged continuation runs the launcher as root, so CPython writes
+	# __pycache__ next to the installed sources. dpkg does not own those files
+	# and would leave the directory behind.
+	[ ! -d "$LIBDIR" ] \
+	  || find "$LIBDIR" -name __pycache__ -type d -prune -exec rm -rf {} +
+	rmdir "$LIBDIR" 2>/dev/null || true
+	udevadm control --reload >/dev/null 2>&1 || true
+	;;
+esac

@@ -1,0 +1,57 @@
+# Binary control template for `make deb`. The Makefile substitutes @...@ and
+# strips these comment lines (dpkg-deb rejects them in a real control file).
+Package: veracage
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: @MAINTAINER@
+Installed-Size: @INSTALLED_SIZE@
+Section: utils
+Priority: optional
+Homepage: https://github.com/emptyname-org/veracage
+# @SHLIBS@ is dpkg-shlibdeps' output for the three binaries: libc6, libgcc-s1
+# and libxkbcommon0, with the version each was actually built against. It sees
+# only DT_NEEDED, so everything opened with dlopen is listed by hand below.
+# util-linux (blkid, setpriv) is Essential, so policy says not to depend on it.
+Depends: @SHLIBS@,
+ python3 (>= 3.11),
+ cryptsetup-bin,
+ bubblewrap,
+ pkexec | policykit-1,
+ systemd,
+ dbus-daemon | dbus-bin | dbus,
+ passwd,
+ mount,
+# dlopened by the agent and the compositor: rendering, and the Wayland client
+# side the nested compositor needs to appear on the Host session.
+ libegl1,
+ libgl1,
+ libwayland-client0,
+ libwayland-egl1
+# fontconfig (fc-match) resolves the UI font, gsettings and xdg-utils read the
+# Host desktop's font and mime settings: all three fall back if absent.
+# The fsck helpers are looked up per filesystem type and skipped if missing.
+# The X11 stack is dlopened only when the Host session is X11.
+Recommends: fontconfig,
+ libglib2.0-bin,
+ xdg-utils,
+ e2fsprogs,
+ dosfstools,
+ exfatprogs,
+ libx11-6,
+ libx11-xcb1,
+ libxcb1,
+ libxkbcommon-x11-0,
+ libxcursor1,
+ libxi6,
+ libxrender1
+Description: opens encrypted volumes into an isolated workspace
+ Veracage opens VeraCrypt and LUKS volumes and keeps their decrypted contents
+ out of reach of the rest of the Host. A small root helper opens the volume
+ with cryptsetup and idmap-mounts it so its contents are owned by a dedicated
+ veracage system uid, inside a private mount namespace. Every other non-root
+ uid is denied by ownership, and the mount never appears in /proc/mounts.
+ .
+ Apps run as that uid under bubblewrap (no network, no host filesystem,
+ curated /etc, --clearenv), rendered by a nested Wayland compositor that owns
+ the clipboard and hosts the menu bar. Data reaches the Host only through the
+ Shared directory or an explicit clipboard copy.

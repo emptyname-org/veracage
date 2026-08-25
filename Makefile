@@ -1,4 +1,4 @@
-.PHONY: help build build-agent test-agent build-compositor test-compositor check-policy install install-dev uninstall uninstall-dev test test-rs test-rs-root lint clean test-vault smoke veracage-user
+.PHONY: help build build-agent test-agent build-compositor test-compositor check-policy install install-dev install-deb deb uninstall uninstall-dev test test-rs test-rs-root lint clean test-vault smoke veracage-user
 
 PREFIX     ?= /usr/local
 BINDIR     ?= $(PREFIX)/bin
@@ -48,6 +48,8 @@ help:
 	@echo '  build-compositor  Build the nested compositor (smithay; needs rustup)'
 	@echo '  install       Install to $$(PREFIX) [=$(PREFIX)] and wire polkit (uses sudo)'
 	@echo '  install-dev   Build helper + point a polkit policy at this checkout (uses sudo)'
+	@echo '  deb           Build a .deb into dist/ (PREFIX=/usr, staged via DESTDIR)'
+	@echo '  install-deb   Build the .deb and install it with apt (uses sudo)'
 	@echo '  test          Run the Python unit tests'
 	@echo '  test-rs       Run the Rust helper unit tests (cargo test)'
 	@echo '  lint          ruff + mypy (needs the .venv dev deps)'
@@ -221,7 +223,10 @@ install: check-policy build build-agent build-compositor
 	$(SUDO) chmod 0755 "$(DESTDIR)$(SLEEPDIR)/veracage"
 	@[ -n "$(DESTDIR)" ] || { command -v update-desktop-database >/dev/null 2>&1 && sudo update-desktop-database "$(APPDIR)" 2>/dev/null; } || true
 	@[ -n "$(DESTDIR)" ] || { command -v gtk-update-icon-cache >/dev/null 2>&1 && sudo gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor" 2>/dev/null; } || true
-	@echo 'Installed to $(PREFIX). Launch "Veracage" from your app menu, or run: veracage configure'
+	# Both skipped for a staged DESTDIR build: nothing was installed there, it
+	# is the package being built, and `deb` prints its own line at the end.
+	@[ -n "$(DESTDIR)" ] || echo 'Installed to $(PREFIX). Launch "Veracage" from your app menu, or run: veracage configure'
+	@[ -n "$(DESTDIR)" ] || echo 'To build a .deb instead: make deb, or make install-deb to install it too.'
 
 # --- dev install: polkit points at this checkout -------------------------
 install-dev: CONT := $(DEV_ROOT)/src/bin/veracage
@@ -276,6 +281,87 @@ uninstall-dev:
 	  echo "removed the udev rule and the system-sleep hook"; \
 	fi
 
+# --- Debian package ------------------------------------------------------
+# `make deb` stages a real install into dist/stage - `install` honours DESTDIR
+# and skips every step that touches the running system - and wraps it with
+# dpkg-deb. PREFIX=/usr, so the helper is rebuilt with /usr/bin/veracage as its
+# baked continuation and the polkit policy points at /usr/libexec/veracage.
+# Alternating `make deb` with a /usr/local `make install` therefore recompiles
+# the helper each time: only that crate, and only the final binary.
+#
+# The version carries the build timestamp, so every rebuild is newer than the
+# package already installed and `make install-deb` just replaces it. Pass
+# DEB_VERSION=0.6.0-1 to stamp a fixed release version instead.
+VERSION        := $(shell sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
+DEB_ARCH       := $(shell dpkg --print-architecture 2>/dev/null)
+DEB_MAINTAINER := emptyname <noreply@emptyname.org>
+DEB_COMMIT     := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)$(shell git status --porcelain 2>/dev/null | grep -q . && echo .dirty)
+DEB_STAMP      := $(shell date -u +%Y%m%d%H%M%S)
+DEB_VERSION    ?= $(VERSION)+$(DEB_STAMP).g$(DEB_COMMIT)-1
+DIST           := $(DEV_ROOT)/dist
+DEB_STAGE      := $(DIST)/stage
+DEB_SHLIB      := $(DIST)/shlibdeps
+DEB_DOC        := $(DEB_STAGE)/usr/share/doc/veracage
+DEB_FILE       := $(DIST)/veracage_$(DEB_VERSION)_$(DEB_ARCH).deb
+
+deb:
+	@command -v dpkg-shlibdeps >/dev/null 2>&1 || { \
+	  echo 'dpkg-shlibdeps not installed: sudo apt install dpkg-dev'; exit 2; }
+	rm -rf "$(DEB_STAGE)" "$(DEB_SHLIB)"
+	$(MAKE) install DESTDIR="$(DEB_STAGE)" PREFIX=/usr
+	# Both are required of every package and neither belongs in a plain
+	# $(PREFIX) install, so they are added here rather than in `install`.
+	install -d "$(DEB_DOC)"
+	install -m 0644 packaging/deb/copyright "$(DEB_DOC)/copyright"
+	{ printf 'veracage (%s) unstable; urgency=medium\n\n' '$(DEB_VERSION)'; \
+	  printf '  * Local build of %s.\n\n' '$(DEB_COMMIT)'; \
+	  printf ' -- %s  %s\n' '$(DEB_MAINTAINER)' "$$(date -uR)"; \
+	} | gzip -9n > "$(DEB_DOC)/changelog.Debian.gz"
+	chmod 0644 "$(DEB_DOC)/changelog.Debian.gz"
+	# Library dependencies read from the ELF headers, so a package built on a
+	# newer Debian carries the libc6 version it was actually built against.
+	# dpkg-shlibdeps reads the package name from a debian/control, hence the
+	# throwaway tree; the dlopened libraries it cannot see are in control.in.
+	mkdir -p "$(DEB_SHLIB)/debian"
+	printf 'Source: veracage\n\nPackage: veracage\nArchitecture: any\nDescription: x\n x\n' \
+	    > "$(DEB_SHLIB)/debian/control"
+	cd "$(DEB_SHLIB)" && dpkg-shlibdeps -O --ignore-missing-info \
+	    "$(DEB_STAGE)/usr/bin/veracage-agent" \
+	    "$(DEB_STAGE)/usr/bin/veracage-compositor" \
+	    "$(DEB_STAGE)/usr/libexec/veracage/veracage-helper" \
+	    2>shlibdeps.err >depends || { cat shlibdeps.err >&2; exit 1; }
+	@grep -v 'should already be installed' "$(DEB_SHLIB)/shlibdeps.err" >&2 || true
+	install -d "$(DEB_STAGE)/DEBIAN"
+	install -m 0755 packaging/deb/postinst packaging/deb/postrm "$(DEB_STAGE)/DEBIAN/"
+	sed -e '/^#/d' \
+	    -e 's|@VERSION@|$(DEB_VERSION)|' \
+	    -e 's|@ARCH@|$(DEB_ARCH)|' \
+	    -e 's|@MAINTAINER@|$(DEB_MAINTAINER)|' \
+	    -e "s|@INSTALLED_SIZE@|$$(du -ks --exclude=DEBIAN '$(DEB_STAGE)' | cut -f1)|" \
+	    -e "s|@SHLIBS@|$$(sed 's/^shlibs:Depends=//' '$(DEB_SHLIB)/depends')|" \
+	    packaging/deb/control.in > "$(DEB_STAGE)/DEBIAN/control"
+	# md5sums is what `dpkg -V veracage` and debsums check an install against.
+	cd "$(DEB_STAGE)" && find . -type f ! -path './DEBIAN/*' -printf '%P\n' \
+	    | LC_ALL=C sort | xargs -r -d '\n' md5sum > DEBIAN/md5sums
+	chmod 0644 "$(DEB_STAGE)/DEBIAN/md5sums"
+	# dist/ is a build directory and each package is 5 MB, so the previous
+	# snapshots go. A DEB_VERSION= release package does not match and stays.
+	rm -f "$(DIST)"/veracage_$(VERSION)+*_$(DEB_ARCH).deb
+	dpkg-deb --root-owner-group --build "$(DEB_STAGE)" "$(DEB_FILE)"
+	# Advisory, not a gate: lintian's tags for a package built without
+	# debhelper have not been triaged, so they are printed and not enforced.
+	@! command -v lintian >/dev/null 2>&1 || lintian "$(DEB_FILE)" || true
+	@echo 'Built $(DEB_FILE)'
+
+# Replaces whatever is installed, resolving the package dependencies. No -y:
+# apt prints what it is about to do and asks, which is the point of a package.
+# Then ./post-install.sh, if this checkout has one, with the package as $$1: an
+# optional hook for what one machine wants done with it, untracked so that stays
+# out of the repository.
+install-deb: deb
+	sudo apt-get install --reinstall "$(DEB_FILE)"
+	@[ ! -x ./post-install.sh ] || ./post-install.sh "$(DEB_FILE)"
+
 # --- dev workflow --------------------------------------------------------
 test:
 	$(PY) -m pytest
@@ -294,6 +380,7 @@ lint:
 	$(VENV)/bin/ruff check src/ tests/ && $(VENV)/bin/mypy
 
 clean:
+	rm -rf "$(DIST)"
 	$(CARGO) clean --manifest-path helper-rs/Cargo.toml 2>/dev/null || true
 	$(AGENT_CARGO) clean --manifest-path agent-rs/Cargo.toml 2>/dev/null || true
 	$(AGENT_CARGO) clean --manifest-path compositor-rs/Cargo.toml 2>/dev/null || true

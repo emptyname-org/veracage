@@ -135,6 +135,37 @@ polkit policy, a `.desktop` + icon, a udev rule (keeps the dm device out of
 UDisks and out of `/dev/disk`), and the `system-sleep` hook, and creates the
 `veracage` system user.
 
+### Debian package
+
+```
+make deb          # dist/veracage_<version>_<arch>.deb
+make install-deb  # build it and hand it to apt (asks before it acts)
+```
+
+`make deb` stages an ordinary `make install` into `dist/stage` with
+`DESTDIR` set, which skips every step that touches the running system, and
+wraps it with `dpkg-deb`. The package installs under `/usr`, so the helper is
+rebuilt with `/usr/bin/veracage` as its baked continuation. What `make
+install` does to the machine itself, `DEBIAN/postinst` does instead: create
+the `veracage` user, add it to `render`, reload the udev rules. The templates
+are in `packaging/deb/`.
+
+The version carries the build timestamp
+(`0.6.0+<utc>.g<commit>[.dirty]-1`), so a rebuild is always newer than what is
+installed and `make install-deb` simply replaces it. Pass `DEB_VERSION=0.6.0-1`
+to stamp a release version instead.
+
+`make install-deb` ends by running `./post-install.sh`, if the checkout has
+one, with the package it just installed as `$1`. That is an optional hook for
+whatever a particular machine wants done with the package, a copy onto a volume
+that is only sometimes open for instance, and it is not tracked, so what it does
+stays out of the repository.
+
+The polkit policy, the udev rule and the `system-sleep` hook live at fixed
+system paths, not under `PREFIX`. A `make install` to `/usr/local` and the
+package therefore write the same three files, and whichever ran last owns
+them. Pick one, or run `make uninstall` before installing the package.
+
 ## Usage
 
 ```
@@ -189,12 +220,21 @@ launch. Add one with `veracage configure --add <binary>`.
 make test        # Python unit suite (pytest)
 make lint        # ruff + mypy
 make test-rs     # Rust helper unit tests (cargo)
+make audit       # cargo-audit over all three lockfiles
+make deps        # how many crates each binary really pulls in
 ```
 
 `tests/integration/test_helper_security.py` runs against the built helper.
 Privileged/GUI integration steps are in `tests/integration/MANUAL.md`.
-`tests/regression.sh` runs the full gate (all three Rust crates + the Python
-suite + lint + the helper argument contract + a headless compositor smoke).
+`tests/regression.sh` runs the full gate, eleven components: the three Rust
+crates (the helper against the distro rustc that holds its MSRV), the Python
+suite, lint, the helper argument contract, clippy on all three crates,
+cargo-audit, a dependency budget for the privileged helper, a headless
+compositor smoke, and the `.deb` build (which also checks that the paths baked
+into the packaged helper and polkit policy are the packaged ones).
+`tests/audit-reviewed.txt` records the advisories that only an upstream release
+can fix, with the reason each was accepted, so a new one fails and a known one
+does not.
 
 `python3 tests/mutation_check.py` breaks one security or teardown guard at a
 time in a copy of the tree and checks the suite notices. Slower than the gate
