@@ -599,9 +599,23 @@ def cmd_close_volume(args: argparse.Namespace) -> int:
 
 # ----------------------------------------------------------- main --------
 
+def start_veracage() -> int:
+    """Start Veracage itself: exec the broker, which is what the `.desktop`
+    entry runs. It brings up the compositor and the front door, and owns the
+    dialogs a `veracage`-uid process cannot show (volume picker, passphrase).
+    Replaces this process, so a terminal run behaves like the menu entry."""
+    try:
+        os.execvp(AGENT_PATH, [AGENT_PATH])
+    except OSError as e:
+        print(f"veracage: cannot start {AGENT_PATH}: {e}", file=sys.stderr)
+    return 1
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="veracage")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    # Not required: bare `veracage` starts Veracage, the same way the desktop
+    # entry does. A subcommand is for doing one thing to a session instead.
+    sub = p.add_subparsers(dest="cmd")
 
     p_open = sub.add_parser("open", help="open a volume in the Veracage session")
     p_open.add_argument("volume")
@@ -643,5 +657,18 @@ def main() -> int:
 
     configure.add_subparser(sub)
 
+    # The internal subcommands (the ones the helper execs) are registered with
+    # help=SUPPRESS, but argparse honours that only for top-level actions: a
+    # subcommand's entry is printed anyway, with the literal "==SUPPRESS==" as
+    # its description. Drop them from the listing, so `veracage --help` shows
+    # the commands a person can actually type.
+    sub._choices_actions = [a for a in sub._choices_actions
+                            if not a.dest.startswith("_")]
+    # The usage line and the choices header come from `choices`, not from that
+    # listing, so name them from what is left rather than repeating the list.
+    sub.metavar = "{" + ",".join(a.dest for a in sub._choices_actions) + "}"
+
     args = p.parse_args()
+    if args.cmd is None:
+        return start_veracage()
     return args.func(args)

@@ -485,3 +485,35 @@ def test_a_polkit_policy_naming_another_helper_is_reported():
     # No pkaction on the host: nothing to check against, so say nothing.
     with mock.patch("subprocess.run", side_effect=FileNotFoundError):
         assert cli._polkit_helper_complaint() is None
+
+
+def test_a_bare_veracage_starts_veracage(monkeypatch):
+    """`veracage` with no subcommand is what a person types to start it. It has
+    to do what the desktop entry does, which is exec the broker, rather than
+    answer with an argparse usage error."""
+    execs: list[tuple] = []
+    monkeypatch.setattr(os, "execvp", lambda path, argv: execs.append((path, argv)))
+    monkeypatch.setattr("sys.argv", ["veracage"])
+    cli.main()
+    assert execs == [(cli.AGENT_PATH, [cli.AGENT_PATH])]
+
+
+def test_a_bare_veracage_says_so_when_the_broker_is_missing(monkeypatch, capsys):
+    monkeypatch.setattr(os, "execvp",
+                        lambda *_: (_ for _ in ()).throw(FileNotFoundError("no agent")))
+    monkeypatch.setattr("sys.argv", ["veracage"])
+    assert cli.main() == 1
+    assert "cannot start" in capsys.readouterr().err
+
+
+def test_help_lists_only_the_commands_a_person_can_type(monkeypatch, capsys):
+    """The internal subcommands are registered with help=SUPPRESS, which argparse
+    ignores for subcommands: they used to be listed as "==SUPPRESS=="."""
+    monkeypatch.setattr("sys.argv", ["veracage", "--help"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    out = capsys.readouterr().out
+    assert "SUPPRESS" not in out
+    assert "_leader" not in out and "_compositor" not in out
+    for public in ("open", "list", "close", "close-volume", "configure"):
+        assert public in out
