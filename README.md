@@ -1,300 +1,447 @@
 # Veracage
 
-Veracage is a secure container protecting open encrypted volumes from the Host.
+Veracage isolates opened LUKS and VeraCrypt volumes from the rest of the Host.
 
-`cryptsetup` opens a LUKS or VeraCrypt volume, a root helper idmap-mounts the
-decrypted filesystem to a dedicated system uid inside a private mount namespace,
-and apps run under that uid, inside bubblewrap, in a nested Wayland compositor.
-Non-root uids are denied by ownership. Root is not in the threat model.
+The encrypted container can live anywhere on the host, including an ordinary unencrypted filesystem, as long as you could open it yourself: the helper refuses a source you have no read-write access to, so it cannot be used to make root open a container you have no permission for. Once opened, its plaintext is accessible only inside a separate sandbox running as the dedicated `veracage` system user.
 
-Design in [`docs/veracage-design.md`](docs/veracage-design.md), security model
-in [`docs/SECURITY.md`](docs/SECURITY.md), isolation core in
-[`docs/uid-isolation.md`](docs/uid-isolation.md).
+Host applications running as your normal uid cannot read the mounted volume. This includes indexers, backup tools, cloud-sync clients, thumbnailers, clipboard managers, antivirus scanners, and applications that like to leave autosaves or temporary files behind.
 
-## The problem
+Root is outside the threat model.
 
-Encryption at rest ends the moment the volume is opened. From then on the
-plaintext is readable by everything running under the same uid, and the Host
-runs a lot of it: indexers, backup and cloud-sync daemons, thumbnailers,
-antivirus scanners, clipboard managers, and the apps' own autosave and temporary
-copies. What they write lands outside the volume, on storage that is not
-encrypted, and outlives the session. File permissions do not separate them from
-the work they are copying, because they run as the uid that owns it.
+Design: [`docs/veracage-design.md`](docs/veracage-design.md)  
+Security model: [`docs/SECURITY.md`](docs/SECURITY.md)  
+UID isolation: [`docs/uid-isolation.md`](docs/uid-isolation.md)
 
-Veracage gives the decrypted volume a different owner: the `veracage` system
-account. Only processes under that account can read the volume, and the only
-thing that starts them is Veracage.
+## How it works
 
-## Architecture
+Veracage uses three separate barriers:
 
-Three barriers, independent of each other:
+1. **Different uid**
 
-1. **Deny.** A small root helper (via `pkexec`) opens the volume with
-   `cryptsetup` and **idmap-mounts** the decrypted filesystem so its files are
-   presented as owned by the `veracage` uid, without rewriting anything on disk.
-   The human is denied through the mount, on-disk owner or not, and cannot
-   become that uid, which needs privilege. (An idmapped mount also strips root's
-   `CAP_DAC_OVERRIDE` for unmapped ids. That is not a defense against root,
-   which can mount the dm device somewhere else.)
-2. **Hide.** The mount is made inside a **private mount namespace**, so it never
-   appears in the Host's `/proc/mounts` and cannot be entered through
-   `/proc/<leader>/root`, which needs ptrace access over the `veracage` uid.
-3. **Sandbox.** Apps run under `veracage`, inside **bubblewrap** (no network, no host
-   filesystem, curated `/etc`, `--clearenv`, `HOME=/vaults`), rendered by a
-   persistent nested Wayland compositor (`veracage-compositor`) that owns the
-   clipboard and hosts the menu bar.
+   A small root helper opens the volume with `cryptsetup` and idmap-mounts it as the `veracage` system uid.
 
-The helper forks: the child does the setup in seconds and execs the leader as
-the `veracage` uid, while the parent stays root for as long as the session
-lives, waiting on the leader so it can close the volumes when it exits. That
-root process listens on nothing and reads no input, so after the fork nothing
-can ask it to act, and there is no setuid binary anywhere. It does
-not trust its caller: the target uid comes from `PKEXEC_UID` and never from
-argv, the continuation it `exec`s is pinned at build time, forwarded env is
-allowlisted, unknown arguments are rejected, and there is no caller-supplied
-mountpoint at all (the helper derives it from the volume's own label). Exact
-syscall recipe and threat model: [`docs/uid-isolation.md`](docs/uid-isolation.md).
+   Nothing is rewritten on disk. The mounted filesystem is simply presented with different ownership, so your normal Host uid cannot read it.
 
-## Features
+2. **Private mount namespace**
 
-- **Single window** - the compositor's, with a File / Clipboard / Apps /
-  Settings / Help menu bar. The human side (`veracage-agent`) is a windowless
-  broker: it does what a `veracage`-uid process cannot (`pkexec`, Host file
-  dialogs, `~/.config`) and shows only the volume picker and the passphrase
-  prompt. It has no volume access of its own. Design:
-  `docs/single-window-ux.md`.
-- **CLI** - `veracage open <volume> [app]`, `list`, `close`, `close-volume`.
-  One polkit prompt per open (`auth_self_keep` coalesces the compositor
-  bring-up and the mount), plus the volume passphrase. A wrong passphrase is
-  helper exit code 4, which re-opens the prompt rather than failing silently.
-  Apps launch from the compositor's Apps menu.
-- **Apps menu** - the enabled apps, with their icons from the Host icon theme.
-  The front door is an empty session, so apps are launchable before any volume
-  is open: a **scratchpad** with no network and no host filesystem, whose only
-  ways out are the clipboard and the Shared directory. Opening a volume joins
-  the same session, and apps launched after it see it. Double-clicking a file in
-  a sandboxed file manager opens it with an enabled app: the file-type defaults
-  come from what those apps declare, plus the Host's associations for the
-  remaining types. Only enabled apps are ever named, so nothing else can be
-  launched inside Veracage.
-- **Clipboard** - user-triggered only: Clipboard > Paste in (Host to sandbox)
-  and Clipboard > Copy out (sandbox to Host), with configurable shortcuts
-  (defaults Ctrl+Alt+V / Ctrl+Alt+C). Text-only, owned by the compositor, which
-  exposes no `data-control` global, so a clipboard manager started inside
-  Veracage cannot scrape it. After a Copy out, the Host clipboard is cleared
-  automatically after a delay (default 30 seconds) and again when Veracage
-  quits. Settings sets the delay, or turns it off.
-- **Keyboard** - the compositor builds its keymap from the Host's own XKB
-  configuration (layout, model, variant, options), so a Compose key or a
-  Ctrl/Win mapping set on the Host applies inside Veracage too. Settings >
-  Keyboard and Shortcuts overrides the Ctrl / Alt / Win part of it, and a
-  change applies to the running session.
-- **Theme and font** - Settings > Appearance applies to the Veracage window
-  live, and to the apps launched next: the session seeds the sandbox's
-  `kdeglobals` with the chosen font (in points) and the Host's own Breeze
-  colour scheme, so a dark Veracage runs dark apps. A running app keeps the look
-  it started with.
-- **Shared directory** - `~/Veracage/Exchange` on the Host is idmap-mounted into
-  the sandbox at `/exchange`, `nosuid,nodev,noexec`. Files dropped on either
-  side appear on the other, owned by the human. It is a different superblock
-  from every volume mount, so `link()` across it is `EXDEV` and symlinks dangle.
-  No dialogs, no copies. File > Shared directory opens it on the Host. Disable
-  with `exchange = false`.
-- **Multi-volume workspace** - open several volumes and they share one private
-  mount namespace, side by side at `/vaults/<label>`. One app set sees them
-  all, so a single file manager can drag-and-drop between volumes. The title
-  bar counts them ("2 volumes open (<label>, <label>)"). **File > Close volume**
-  closes one volume (or **All** of them), the rest keep running. Apps see the
-  volumes that were open when they launched, which is also why a close refuses
-  while an app that saw the volume is still running: it really closes it,
-  key out of RAM, so it offers to close that app rather than leave it decrypted.
-  Design: `docs/shared-workspace.md`.
-- **Quit closes the volumes first** - Veracage never disappears while a volume is
-  still decrypted, and never closes an app over its head. Quit (or the window's
-  close button) asks every app window to close, so an app with unsaved work
-  raises its own prompt and you answer it in the still-open Veracage window.
-  Only once they have all closed are the sessions torn down and the volumes
-  closed, and only once the last one is really closed does the window go.
-- **Any installed app** - `veracage configure` (GUI picker) or
-  `--add <binary>` / `--remove <key>` / `--list`. No fixed catalog.
-- **Idle close** - Settings > Auto-close after (off, 30 minutes, 1, 2 or
-  12 hours). The compositor is the only component that sees whether you are
-  using Veracage, so it runs the timer: after that long with no input to the
-  Veracage window, the open volumes close themselves and the session stays
-  up as an empty scratchpad.
-- **Crash-safe teardown** - the session is a `systemd --user` transient
-  service whose `ExecStopPost` closes the dm device on any exit
-  (SIGKILL, OOM, panic, logout).
-- **Suspend** - a root `system-sleep` hook closes every session before
-  sleep.
-- **Nothing left in a dump or in RAM** - the helper clears `coredump_filter`
-  before it `exec`s anything, and the setting is inherited, so a dump from the
-  compositor, the leader, `bwrap` or an app carries no memory at all. The
-  passphrase reaches the helper's stdin from the agent's `Zeroizing` buffer, and
-  the helper overwrites it with `write_volatile` as soon as `cryptsetup` has it.
-  The decrypted device is `root:disk 0660` with `UDISKS_IGNORE=1`, and its
-  filesystem label and UUID are kept out of `/dev/disk`. See
-  `docs/SECURITY.md`.
-- **Small root surface** - the privilege helper (Rust, `helper-rs/`) pulls in 11
-  crates in its whole dependency tree, and the gate holds it under 15: every
-  crate in that tree is code that runs as root.
+   The decrypted filesystem exists only inside Veracage's mount namespace. It is not mounted into the host namespace.
 
-Deferred: GlobalShortcuts-portal integration for the clipboard keybinds.
-`wp_security_context_v1` was evaluated and not adopted
-([`docs/mode-a-security-context.md`](docs/mode-a-security-context.md)).
+3. **Application sandbox**
 
-## Install
+   Applications run under `veracage` inside `bubblewrap`, with:
 
-Requirements: a Wayland session, Linux 5.12 or newer (idmapped mounts),
-`polkit`, `systemd` and `python3` >= 3.11. Developed and run on Debian 12 and 13
-under KDE Plasma. The rest, on Debian 12:
+   - no host filesystem
+   - no network
+   - curated `/etc`
+   - cleared environment
+   - `HOME=/vaults`
 
+   Their UI is displayed through a persistent nested Wayland compositor, `veracage-compositor`.
+
+The result is a separate workspace for decrypted files rather than another encrypted-volume mounter.
+
+## Privileged component
+
+The root helper has one job: create and tear down the isolated environment.
+
+It opens the volume, creates the idmapped mount and namespace, then starts the session leader as `veracage`. A parent process remains root only so it can close the volume when the session ends.
+
+After setup it accepts no commands and listens on nothing.
+
+There is no setuid binary.
+
+The helper also does not trust command-line input for security-sensitive values:
+
+- the calling uid comes from `PKEXEC_UID`
+- the continuation executable is fixed at build time
+- forwarded environment variables are allowlisted
+- unknown arguments are rejected
+- mountpoints are derived from the volume label rather than supplied by the caller
+
+The helper is written in Rust and deliberately has a small dependency tree.
+
+See [`docs/uid-isolation.md`](docs/uid-isolation.md) for the exact setup.
+
+## Workspace
+
+Veracage presents one window containing the sandboxed applications.
+
+The host-side `veracage-agent` is only a broker for operations that the sandbox cannot perform itself, such as:
+
+- `pkexec`
+- host file dialogs
+- reading/writing Veracage configuration
+- collecting the volume passphrase
+
+The agent never receives access to the decrypted filesystem.
+
+You can start Veracage without opening a volume. This gives you an empty sandbox with no network and no host filesystem. Opening a volume later adds it to the existing workspace.
+
+Multiple volumes can be open at once:
+
+```text
+/vaults/work
+/vaults/archive
+/vaults/private
 ```
+
+Applications launched after a volume is opened can see it. A volume cannot be closed while an application that has access to it is still running.
+
+## Applications
+
+Any installed application can be enabled:
+
+```bash
+veracage configure
+veracage configure --add dolphin
+veracage configure --add kate
+```
+
+Only enabled applications can be launched inside Veracage.
+
+File associations are built from those applications and, where needed, the host's existing associations.
+
+There is no fixed application catalog.
+
+## Clipboard
+
+Clipboard transfer is explicit.
+
+From the Veracage menu:
+
+```text
+Clipboard > Paste in
+Clipboard > Copy out
+```
+
+Default shortcuts:
+
+```text
+Ctrl+Alt+V    Host -> Veracage
+Ctrl+Alt+C    Veracage -> Host
+```
+
+Only text is transferred.
+
+The nested compositor owns the internal clipboard and does not expose the Wayland `data-control` protocol, so applications inside the sandbox cannot silently scrape clipboard contents.
+
+After **Copy out**, Veracage can automatically clear the host clipboard. The default delay is 30 seconds. It also attempts to clear copied text when Veracage exits.
+
+Both behaviours are configurable.
+
+## Shared directory
+
+For deliberate file exchange, Veracage exposes:
+
+```text
+~/Veracage/Exchange   <->   /exchange
+```
+
+The directory is idmap-mounted into the sandbox with:
+
+```text
+nosuid,nodev,noexec
+```
+
+On the Host the files are owned by your normal uid. Inside the sandbox the idmap presents them as `veracage`, like the volumes.
+
+The exchange directory is a different filesystem from the encrypted volume, so hard links across the boundary fail with `EXDEV`. Symlinks pointing outside the sandbox do not provide a route into the host filesystem.
+
+Disable it with:
+
+```toml
+exchange = false
+```
+
+## Closing volumes
+
+Closing a volume actually closes it. Veracage does not leave the decrypted mapping around after removing it from the UI.
+
+If an application still has access to the volume, Veracage asks to close that application first.
+
+Quitting Veracage follows the same order:
+
+1. ask application windows to close
+2. let applications handle unsaved work normally
+3. tear down the sandbox sessions
+4. close the encrypted volumes
+5. close the Veracage window
+
+### Idle close
+
+Veracage can automatically close open volumes after a period with no input to the Veracage window.
+
+Available settings include:
+
+```text
+off
+30 minutes
+1 hour
+2 hours
+12 hours
+```
+
+The empty sandbox can remain running after the volumes are closed.
+
+### Suspend
+
+By default, a `system-sleep` hook closes Veracage sessions before suspend.
+
+This can be disabled in configuration.
+
+### Crash teardown
+
+The root parent closes the volumes whenever the session leader exits, however it exits.
+
+The session also runs as a transient `systemd --user` service whose `ExecStopPost` repeats that teardown for the case where the helper is gone too. Between them this covers `SIGKILL`, OOM termination, logout, and compositor failure.
+
+## Memory and dumps
+
+Veracage clears `coredump_filter` before starting the session, and the setting is inherited by the compositor, session leader, `bubblewrap`, and sandboxed applications.
+
+The volume passphrase is passed to the helper through stdin from a zeroizing buffer and overwritten after `cryptsetup` consumes it.
+
+The decrypted device is created as:
+
+```text
+root:disk 0660
+```
+
+with `UDISKS_IGNORE=1`.
+
+Its filesystem label and UUID are also kept out of `/dev/disk`.
+
+See [`docs/SECURITY.md`](docs/SECURITY.md).
+
+## Keyboard and appearance
+
+The compositor starts from the host XKB configuration, read from KDE's `kxkbrc`: layout, model, variant, and options. Where none is detectable, libxkbcommon's own defaults apply.
+
+Compose keys and remapped Ctrl/Alt/Win keys therefore behave the same way inside Veracage unless overridden in:
+
+```text
+Settings > Keyboard and Shortcuts
+```
+
+Appearance settings control the Veracage window and applications launched afterward.
+
+The sandbox receives a generated `kdeglobals`: the selected font, and a look. Follow the Host, the default, copies the Host's own colour scheme, widget style and icon theme out of its `kdeglobals`, which is where KDE writes whatever scheme is applied, so apps match the rest of the screen whatever that scheme is. Light and Dark force Breeze light or dark instead. An icon theme installed only under your home is dropped, since the sandbox cannot see it, and with no host `kdeglobals` at all only the fonts are set.
+
+## Requirements
+
+From the machine:
+
+- Wayland session
+- Linux 5.12+ (idmapped mounts)
+
+From packages, which the Debian package pulls in itself:
+
+- `polkit`
+- `systemd`
+- Python 3.11+
+- `bubblewrap`
+- `cryptsetup`
+
+Developed and run on Debian 12 under KDE Plasma. Debian 13 is covered by the build and the headless tests.
+
+A source install needs those packages first:
+
+```bash
 sudo apt install bubblewrap cryptsetup python3
 ```
 
-`bubblewrap` and `cryptsetup` are required. cryptsetup opens both LUKS and
-VeraCrypt volumes (its `tcrypt` module, so the `veracrypt` binary is not
-needed). The agent and compositor are self-contained Rust binaries linking only
-what the Host session already has (Mesa GL, Wayland/X11, `libxkbcommon.so.0`).
+`cryptsetup` handles both LUKS and VeraCrypt volumes. VeraCrypt containers use cryptsetup's `tcrypt` support, so the VeraCrypt binary itself is not required.
 
-### Toolchain (build only)
+## Build
 
-- The privilege **helper** builds on Debian 12's stock `rustc` 1.63.
-- The **agent** and **compositor** need rustup + recent stable
-  (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`).
-  `make install` uses rustup's cargo for both. If `libxkbcommon-dev` is
-  absent, `make` synthesises a private linker symlink to `libxkbcommon.so.0`.
+The privileged helper builds with Debian 12's stock Rust 1.63.
 
-```
-make install-dev     # build the helper + point a polkit policy at this checkout
-make install         # system install to /usr/local (override with PREFIX=)
+The agent and compositor require a recent stable Rust toolchain through `rustup`.
+
+Development install:
+
+```bash
+make install-dev
 ```
 
-Run `make install` as yourself, NOT under `sudo`: it builds as you and sudoes
-only the steps that write outside your home. Under `sudo` the whole build runs
-as root, which makes cargo re-fetch the crate index into root's home.
+`make install-dev` points polkit at the binaries in the checkout, so anything that can write there gets root without a prompt. Single-user or disposable machines only.
 
-`make install` lays down the package under `PREFIX/lib/veracage`, with
-`veracage`, `veracage-agent`, and `veracage-compositor` in `PREFIX/bin` and
-the privileged helpers in `PREFIX/libexec/veracage`. It also installs a
-polkit policy, a `.desktop` + icon, a udev rule (keeps the dm device out of
-UDisks and out of `/dev/disk`), and the `system-sleep` hook, and creates the
-`veracage` system user.
+System install:
 
-### Debian package
-
-```
-make deb          # dist/veracage_<version>_<arch>.deb
-make install-deb  # build it and hand it to apt (asks before it acts)
+```bash
+make install
 ```
 
-`make deb` stages an ordinary `make install` into `dist/stage` with
-`DESTDIR` set, which skips every step that touches the running system, and
-wraps it with `dpkg-deb`. The package installs under `/usr`, so the helper is
-rebuilt with `/usr/bin/veracage` as its baked continuation. What `make
-install` does to the machine itself, `DEBIAN/postinst` does instead: create
-the `veracage` user, add it to `render`, reload the udev rules. The templates
-are in `packaging/deb/`.
+Run `make install` as your normal user, not through `sudo`. The Makefile elevates only the installation steps that need root.
 
-The version carries the build timestamp
-(`<version>+<utc>.g<commit>[.dirty]-1`), so a rebuild is always newer than what
-is installed and `make install-deb` simply replaces it. Pass
-`DEB_VERSION=0.7.0-1` to stamp a release version instead.
+The default prefix is `/usr/local`; override it with `PREFIX=`. The Debian package installs under `/usr`, and `make deb` only builds it.
 
-`make install-deb` ends by running `./post-install.sh`, if the checkout has
-one, with the package it just installed as `$1`. That is an optional hook for
-whatever a particular machine wants done with the package, a copy onto a volume
-that is only sometimes open for instance, and it is not tracked, so what it does
-stays out of the repository.
+A system install adds:
 
-The polkit policy, the udev rule and the `system-sleep` hook live at fixed
-system paths, not under `PREFIX`. A `make install` to `/usr/local` and the
-package therefore write the same three files, and whichever ran last owns
-them. Pick one, or run `make uninstall` before installing the package. Both
-installs then run, but only one is authorised: polkit keys its action to the
-pkexec'd program path, so the other matches no action, falls back to
-`org.freedesktop.policykit.exec`, and asks for a password at every privileged
-step - the teardown that should be silent included. `veracage` says so on
-stderr when it sees the mismatch, and `make uninstall` removes those three
-shared files only when they are this install's own.
+- `veracage`
+- `veracage-agent`
+- `veracage-compositor`
+- privileged helper
+- polkit policy
+- desktop file and icon
+- udev rule
+- suspend hook
+- `veracage` system user
+
+## Debian package
+
+Build:
+
+```bash
+make deb
+```
+
+The package is written to:
+
+```text
+dist/veracage_<version>_<arch>.deb
+```
+
+Package builds install under `/usr`.
+
+For a release build:
+
+```bash
+DEB_VERSION=0.7.0-1 make deb
+```
+
+`make deb` builds the package, it does not install it. Install it yourself with `sudo apt install ./dist/...deb`, and then do not keep a `make install` beside it unless you know which one owns the shared polkit, udev, and suspend-hook files. Only the install that wrote the polkit policy is authorised, and the other asks for a password at every step.
+
+Use:
+
+```bash
+make uninstall
+```
+
+before switching installation methods.
 
 ## Usage
 
+Configure applications:
+
+```bash
+veracage configure
+veracage configure --add dolphin
 ```
-veracage configure                    # enable apps (GUI picker)
-veracage configure --add dolphin      # or by binary name
-veracage open /path/to/volume.vc      # open into the shared workspace
-veracage open /path/to/volume.vc kate # auto-launch an app too
-veracage open /path/to/other.vc       # a 2nd volume joins the same workspace
+
+Open a volume:
+
+```bash
+veracage open /path/to/volume.vc
+```
+
+Open it and immediately launch an application:
+
+```bash
+veracage open /path/to/volume.vc kate
+```
+
+Add another volume to the same workspace:
+
+```bash
+veracage open /path/to/other.vc
+```
+
+List:
+
+```bash
 veracage list /path/to/volume.vc
-veracage close-volume <label>         # close one volume (File > Close volume)
-veracage close /path/to/volume.vc     # tear the whole session down
 ```
 
-`pkexec` prompts for the login password (the Host's own polkit agent, not
-`sudo` and not root's password), then the CLI prompts for the volume passphrase
-on the terminal. The GUI launcher (`veracage-agent`, or the "Veracage" app-menu
-entry) collects the passphrase in a window and asks again if it was wrong.
-Help > Help in the menu bar has the short usage notes.
+Close one volume:
 
-## Config
+```bash
+veracage close-volume <label>
+```
 
-`~/.config/veracage/config.toml` (auto-created):
+Close the whole session:
+
+```bash
+veracage close /path/to/volume.vc
+```
+
+`pkexec` uses the host's normal polkit agent. The CLI reads the volume passphrase from the terminal. The graphical launcher asks for it in a dialog and prompts again after a wrong passphrase.
+
+## Configuration
+
+Configuration lives in:
+
+```text
+~/.config/veracage/config.toml
+```
+
+Example:
 
 ```toml
 [default]
-last_used_app  = "kate"
-theme          = "light"        # light | dark
-ui_font        = "system"       # system (host font) | noto | liberation | dejavu | dejavu-mono
-ui_font_size   = "system"       # system (host size) | a point size, e.g. 12
-window_size    = "default"      # default | max | 1280x800 (WxH), at start
-modifier_keys  = "system"       # system (host mapping) | none | an XKB option,
-                                # e.g. altwin:ctrl_win | ctrl:nocaps
-suspend_action = "dismount"     # close on suspend, or "ignore" to leave open
-clip_clear     = true           # auto-clear the host clipboard after Copy out
-clip_clear_timeout = 30         # seconds before the auto-clear fires
-auto_dismount  = 0              # idle minutes before the volumes close (0 = off)
-debug          = false          # verbose timing logs (docs/debugging.md)
+last_used_app      = "kate"
 
-[apps.kate]                     # the enabled-app allowlist (any installed binary)
-name     = "Kate"
-exec     = "kate"
+theme              = "light"       # light | dark
+ui_font            = "system"
+ui_font_size       = "system"
+window_size        = "default"
 
-[volumes."/path/to/work.vc"]    # optional per-volume overrides
-default_app  = "okular"
+modifier_keys      = "system"
+
+suspend_action     = "dismount"    # dismount | ignore
+
+clip_clear         = true
+clip_clear_timeout = 30
+
+auto_dismount      = 0             # idle minutes, 0 = disabled
+debug               = false
+
+[apps.kate]
+name = "Kate"
+exec = "kate"
+
+[volumes."/path/to/work.vc"]
+default_app = "okular"
 ```
 
-Per-volume settings inherit from `[default]`. Only apps under `[apps.*]`
-launch. Add one with `veracage configure --add <binary>`.
+Per-volume settings inherit from `[default]`.
+
+Only applications listed under `[apps.*]` can be launched.
 
 ## Tests
 
-```
-make test        # Python unit suite (pytest)
+```bash
+make test        # Python tests
 make lint        # ruff + mypy
-make test-rs     # Rust helper unit tests (cargo)
-make audit       # cargo-audit over all three lockfiles
-make deps        # how many crates each binary really pulls in
+make test-rs     # Rust helper tests
+make audit       # cargo-audit
+make deps        # dependency counts
 ```
 
-`tests/integration/test_helper_security.py` runs against the built helper.
-Privileged/GUI integration steps are in `tests/integration/MANUAL.md`.
-`tests/regression.sh` runs the full gate, eleven components: the three Rust
-crates (the helper against the distro rustc that holds its MSRV), the Python
-suite, lint, the helper argument contract, clippy on all three crates,
-cargo-audit, a dependency budget for the privileged helper, a headless
-compositor smoke, and the `.deb` build (which also checks that the paths baked
-into the packaged helper and polkit policy are the packaged ones).
-`tests/audit-reviewed.txt` records the advisories that only an upstream release
-can fix, with the reason each was accepted, so a new one fails and a known one
-does not.
+Integration tests for the privileged helper:
 
-`python3 tests/mutation_check.py` breaks one security or teardown guard at a
-time in a copy of the tree and checks the suite notices. Slower than the gate
-(it re-runs the suite per mutation), so run it after touching the sandbox flags,
-the teardown paths, or the config validation, not on every commit.
+```text
+tests/integration/test_helper_security.py
+```
+
+Manual privileged/GUI tests:
+
+```text
+tests/integration/MANUAL.md
+```
+
+Full regression gate:
+
+```bash
+tests/regression.sh
+```
+
+For changes to sandbox flags, teardown paths, or configuration validation:
+
+```bash
+python3 tests/mutation_check.py
+```
 
 ## License
 
-[CC0 1.0 Universal](LICENSE) (public domain).
+[CC0 1.0 Universal](LICENSE)
