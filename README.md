@@ -322,6 +322,12 @@ before switching installation methods.
 
 ## Usage
 
+Start Veracage:
+
+```bash
+veracage
+```
+
 Configure applications:
 
 ```bash
@@ -381,7 +387,7 @@ Example:
 [default]
 last_used_app      = "kate"
 
-theme              = "light"       # light | dark
+theme              = "system"      # system (follow the Host) | light | dark
 ui_font            = "system"
 ui_font_size       = "system"
 window_size        = "default"
@@ -394,7 +400,8 @@ clip_clear         = true
 clip_clear_timeout = 30
 
 auto_dismount      = 0             # idle minutes, 0 = disabled
-debug               = false
+debug              = false         # verbose logs, see docs/debugging.md
+log_dir            = "/home/you/logs"      # optional, must be writable by uid veracage
 
 [apps.kate]
 name = "Kate"
