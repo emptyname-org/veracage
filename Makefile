@@ -1,5 +1,8 @@
-.PHONY: help build build-agent test-agent build-compositor test-compositor check-policy install install-dev install-deb deb uninstall uninstall-dev test test-rs test-rs-root lint clean test-vault smoke veracage-user
+.PHONY: help build build-agent test-agent build-compositor test-compositor check-policy install install-dev deb uninstall uninstall-dev test test-rs test-rs-root lint clean test-vault smoke veracage-user
 
+# /usr/local: a source install is local software, and dpkg owns /usr. `make deb`
+# overrides this with PREFIX=/usr for the staged package tree, which is the only
+# thing that installs there.
 PREFIX     ?= /usr/local
 BINDIR     ?= $(PREFIX)/bin
 LIBDIR     ?= $(PREFIX)/lib/veracage
@@ -49,7 +52,6 @@ help:
 	@echo '  install       Install to $$(PREFIX) [=$(PREFIX)] and wire polkit (uses sudo)'
 	@echo '  install-dev   Build helper + point a polkit policy at this checkout (uses sudo)'
 	@echo '  deb           Build a .deb into dist/ (PREFIX=/usr, staged via DESTDIR)'
-	@echo '  install-deb   Build the .deb and install it with apt (uses sudo)'
 	@echo '  test          Run the Python unit tests'
 	@echo '  test-rs       Run the Rust helper unit tests (cargo test)'
 	@echo '  lint          ruff + mypy (needs the .venv dev deps)'
@@ -257,10 +259,8 @@ install: check-policy build build-agent build-compositor
 	@[ -n "$(DESTDIR)" ] || { command -v gtk-update-icon-cache >/dev/null 2>&1 && sudo gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor" 2>/dev/null; } || true
 	# Both skipped for a staged DESTDIR build: nothing was installed there, it
 	# is the package being built, and `deb` prints its own line at the end.
-	@[ -n "$(DESTDIR)" ] || ! dpkg -s veracage >/dev/null 2>&1 \
-	  || echo 'note: the veracage .deb is installed under /usr as well. This install now owns the one polkit policy, so /usr/bin/veracage would ask for a password at every step: remove one of the two.'
 	@[ -n "$(DESTDIR)" ] || echo 'Installed to $(PREFIX). Launch "Veracage" from your app menu, or run: veracage configure'
-	@[ -n "$(DESTDIR)" ] || echo 'To build a .deb instead: make deb, or make install-deb to install it too.'
+	@[ -n "$(DESTDIR)" ] || echo 'To build a .deb instead: make deb (it builds the package, it does not install it).'
 
 # --- dev install: polkit points at this checkout -------------------------
 install-dev: CONT := $(DEV_ROOT)/src/bin/veracage
@@ -289,7 +289,7 @@ install-dev: check-policy veracage-user build
 	@echo '*** so anything that can write this checkout has root for the asking - no'
 	@echo '*** prompt, no `veracage open` needed. Use ONLY on a single-user or'
 	@echo '*** disposable box - NEVER on a shared/multi-user machine. Use `make'
-	@echo '*** install` (root-owned /usr/local) for anything real.'
+	@echo '*** install` (root-owned /usr) for anything real.'
 
 uninstall:
 	$(call remove-policy,$(LIBEXEC)/veracage-helper)
@@ -313,7 +313,7 @@ uninstall-dev:
 # the helper each time: only that crate, and only the final binary.
 #
 # The version carries the build timestamp, so every rebuild is newer than the
-# package already installed and `make install-deb` just replaces it. Pass
+# package already installed, so `apt install ./dist/<file>.deb` replaces it. Pass
 # DEB_VERSION=0.7.0-1 to stamp a fixed release version instead.
 VERSION        := $(shell sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
 DEB_ARCH       := $(shell dpkg --print-architecture 2>/dev/null)
@@ -375,14 +375,10 @@ deb:
 	# debhelper have not been triaged, so they are printed and not enforced.
 	@! command -v lintian >/dev/null 2>&1 || lintian "$(DEB_FILE)" || true
 	@echo 'Built $(DEB_FILE)'
-
-# Replaces whatever is installed, resolving the package dependencies. No -y:
-# apt prints what it is about to do and asks, which is the point of a package.
-# Then ./post-install.sh, if this checkout has one, with the package as $$1: an
-# optional hook for what one machine wants done with it, untracked so that stays
-# out of the repository.
-install-deb: deb
-	sudo apt-get install --reinstall "$(DEB_FILE)"
+	@echo 'Install it with: sudo apt install ./$(DEB_FILE)'
+	# ./post-install.sh, if this checkout has one, with the package as $$1: an
+	# optional hook for what one machine wants done with it, untracked so that
+	# stays out of the repository.
 	@[ ! -x ./post-install.sh ] || ./post-install.sh "$(DEB_FILE)"
 
 # --- dev workflow --------------------------------------------------------
