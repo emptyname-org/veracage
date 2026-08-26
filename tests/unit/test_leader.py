@@ -702,3 +702,38 @@ def test_a_symlink_in_the_log_directory_is_refused(tmp_path, monkeypatch, capsys
     leader._debug(_state(debug=True), "launch 'Kate'")
     assert not target.exists()
     assert "launch 'Kate'" in capsys.readouterr().err   # fell back to stderr
+
+
+def test_kdeglobals_carries_the_hosts_own_look_when_one_is_published(tmp_path, monkeypatch):
+    """Following the Host means the Host's scheme, style and icons, not Breeze:
+    the published groups go in verbatim and the Breeze scheme file is not read
+    at all."""
+    breeze = tmp_path / "BreezeLight.colors"
+    breeze.write_text("[Colors:Window]\nBackgroundNormal=252,252,252\n")
+    monkeypatch.setitem(leader.COLOR_SCHEMES, "light", breeze)
+    host = ("Papirus-Dark", "kvantum",
+            "[Colors:Window]\nBackgroundNormal=46,52,64\n\n[WM]\nactiveBackground=59,66,82\n")
+
+    body = leader._kdeglobals_body("light", "Noto Sans", 12.0, True, host)
+
+    assert "Theme=Papirus-Dark" in body
+    assert "widgetStyle=kvantum" in body
+    assert "BackgroundNormal=46,52,64" in body
+    assert "[WM]" in body
+    assert "252,252,252" not in body               # Breeze was not consulted
+    assert "SingleClick=true" in body
+    assert body.count("[General]") == 1 and body.count("[KDE]") == 1
+    assert "font=Noto Sans,12," in body
+
+
+def test_an_unpublished_or_empty_host_look_falls_back_to_breeze(tmp_path, monkeypatch):
+    """Veracage sets the look when it is not following the Host, and an empty
+    apptheme file (which is how switching back is published) reads the same as
+    an absent one."""
+    monkeypatch.setattr(leader, "APPTHEME_PUB", tmp_path / "apptheme")
+    assert leader._read_apptheme() is None          # absent
+    (tmp_path / "apptheme").write_text("")
+    assert leader._read_apptheme() is None          # empty: an override is in force
+    (tmp_path / "apptheme").write_text("Papirus\nBreeze\n[Colors:Window]\nBackgroundNormal=1,2,3\n")
+    assert leader._read_apptheme() == (
+        "Papirus", "Breeze", "[Colors:Window]\nBackgroundNormal=1,2,3\n")

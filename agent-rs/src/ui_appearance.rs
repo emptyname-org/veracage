@@ -112,9 +112,12 @@ impl eframe::App for Appearance {
                         .truncate()
                         .selected_text(match self.cfg.theme.as_str() {
                             "dark" => "Dark",
-                            _ => "Light",
+                            "light" => "Light",
+                            _ => "Follow the Host",
                         })
                         .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.cfg.theme, "system".into(),
+                                                "Follow the Host");
                             ui.selectable_value(&mut self.cfg.theme, "light".into(), "Light");
                             ui.selectable_value(&mut self.cfg.theme, "dark".into(), "Dark");
                         });

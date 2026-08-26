@@ -459,3 +459,27 @@ launch and exit. Point `log_dir` at a path that is not a directory: `veracage`
 says so on stderr and logs to `/run/veracage/rt/compositor.log` instead. Plant
 a symlink at `<log_dir>/compositor.log`: it is refused (O_NOFOLLOW), not
 followed.
+
+### Test 33: Apps follow the Host's theme, whatever it is
+
+Settings > Appearance > Theme: Follow the Host. On the Host, apply a colour
+scheme that is not Breeze (System Settings > Colours), a non-Breeze widget style
+and a system-wide icon theme, then launch an app inside Veracage.
+
+Expect: the app comes up in the Host's colours, with that widget style and those
+icons, and the Veracage window follows the same light or dark. Check the seed
+if it does not:
+
+```bash
+grep -A3 '\[Colors:Window\]' /run/veracage/pub/apptheme   # the Host's own groups
+head -2 /run/veracage/pub/apptheme                        # icon theme, widget style
+cat /run/veracage/pub/theme                               # resolved: light or dark
+```
+
+Then switch the Host to an icon theme installed only under `~/.local/share/icons`
+and open a volume again. Expect: Breeze icons, not missing ones, and a line on
+stderr saying the theme is not installed system-wide. The sandbox has no host
+home, so it could not load that theme.
+
+Then set Theme: Light. Expect: Breeze light apps regardless of the Host, and
+`/run/veracage/pub/apptheme` empty.

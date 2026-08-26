@@ -19,6 +19,22 @@ pub fn apply_config(ctx: &egui::Context, cfg: &crate::config::Config) {
     set_text_sizes(ctx, crate::fonts::base_size(&cfg.ui_font, &cfg.ui_font_size));
 }
 
+/// The theme to actually paint: `theme` itself, unless it is "system", which
+/// means follow the Host and is resolved to light or dark by the human side
+/// (config.py publishes the RESOLVED value to `pub/theme`). Read once. An
+/// unreadable file leaves it light, the same as an undetectable Host.
+fn resolved(theme: &str) -> &str {
+    if theme != "system" {
+        return theme;
+    }
+    static PUBLISHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PUBLISHED.get_or_init(|| {
+        std::fs::read_to_string("/run/veracage/pub/theme")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    })
+}
+
 /// Theme colors, widget rounding, and spacing (no fonts). Cheap to call per frame.
 pub fn apply_theme(ctx: &egui::Context, theme: &str) {
     // A slow click is still a click. egui drops a press-release pair that lasted
@@ -28,7 +44,7 @@ pub fn apply_theme(ctx: &egui::Context, theme: &str) {
     // button, 2 seconds apart, with `clicked=false`. These dialogs have no
     // context menus, so the timeout only has downside.
     ctx.options_mut(|o| o.input_options.max_click_duration = f64::INFINITY);
-    let dark = theme == "dark";
+    let dark = resolved(theme) == "dark";
     let mut v = if dark {
         egui::Visuals::dark()
     } else {

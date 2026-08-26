@@ -99,6 +99,10 @@ APPFONT_PUB = Path("/run/veracage/pub/appfont")
 # config.host_single_click. Seeded too, because KDE's own default is single click
 # and an unseeded sandbox would ignore a host set to double click.
 SINGLECLICK_PUB = Path("/run/veracage/pub/singleclick")
+# The host desktop's own look, when Veracage is set to follow it: icon theme,
+# widget style, then its colour scheme groups. Empty when Veracage sets the look
+# itself, and then the Breeze scheme files below are used instead.
+APPTHEME_PUB = Path("/run/veracage/pub/apptheme")
 COLOR_SCHEMES = {
     "dark": Path("/usr/share/color-schemes/BreezeDark.colors"),
     "light": Path("/usr/share/color-schemes/BreezeLight.colors"),
@@ -673,17 +677,30 @@ def _qt_font(family: str, points: float) -> str:
     return f"{family},{points:g},-1,5,50,0,0,0,0,0"
 
 
-def _kdeglobals_body(theme: str, family: str, points: float,
-                     single_click: bool) -> str:
-    """The kdeglobals seeded into the sandbox: the Veracage font, theme and click
-    behaviour, so apps match the compositor and the host instead of falling back
-    to their built-in look.
+def _read_apptheme() -> tuple[str, str, str] | None:
+    """The published host look as (icon theme, widget style, colour groups), or
+    None when Veracage sets the look itself and the Breeze scheme files apply."""
+    try:
+        icons, style, colors = APPTHEME_PUB.read_text().split("\n", 2)
+    except (OSError, ValueError):
+        return None
+    return (icons.strip(), style.strip(), colors) if colors.strip() else None
 
-    The colours are the desktop's own scheme file verbatim (its [Colors:*] and
-    [ColorEffects:*] groups are exactly what kdeglobals reads), minus its
-    [General] group, which is just the scheme's translated names and would
-    collide with the font settings written here. Without a scheme file (a
-    non-KDE host) only the fonts are set."""
+
+def _kdeglobals_body(theme: str, family: str, points: float, single_click: bool,
+                     host: tuple[str, str, str] | None = None) -> str:
+    """The kdeglobals seeded into the sandbox: the Veracage font and click
+    behaviour, plus a look, so apps match the compositor and the host instead of
+    falling back to their built-in one.
+
+    The look is the HOST's when it published one (its colour groups verbatim out
+    of its own kdeglobals, which is where KDE writes whatever scheme is applied,
+    plus its widget style and icon theme). Otherwise it is Breeze light or dark
+    to match the Veracage window, read from the desktop's own scheme file (its
+    [Colors:*] and [ColorEffects:*] groups are exactly what kdeglobals reads),
+    minus its [General] group, which is just the scheme's translated names and
+    would collide with the font settings written here. With neither, only the
+    fonts are set and apps keep their own colours."""
     small = max(6.0, round(points * 0.85))
     lines = [
         "[General]",
@@ -694,7 +711,7 @@ def _kdeglobals_body(theme: str, family: str, points: float,
         f"fixed={_qt_font('Monospace', points)}",
         "",
         "[Icons]",
-        f"Theme={ICON_THEMES.get(theme, 'breeze')}",
+        f"Theme={(host[0] if host else '') or ICON_THEMES.get(theme, 'breeze')}",
         "",
     ]
     # [KDE] carries both the widget style (a scheme without Breeze widgets looks
@@ -704,8 +721,10 @@ def _kdeglobals_body(theme: str, family: str, points: float,
     kde_group = [
         "[KDE]",
         f"SingleClick={'true' if single_click else 'false'}",
-        "widgetStyle=Breeze",
+        f"widgetStyle={(host[1] if host else '') or 'Breeze'}",
     ]
+    if host is not None:
+        return "\n".join(lines + kde_group + ["", host[2]]) + "\n"
     scheme = COLOR_SCHEMES.get(theme)
     wrote_kde = False
     if scheme is not None:
@@ -741,8 +760,8 @@ def _write_kdeglobals_file() -> Path | None:
         except OSError:
             single_click = False
         path = Path(os.environ["XDG_RUNTIME_DIR"]) / "kdeglobals"
-        path.write_text(
-            _kdeglobals_body(theme, family.strip(), float(points), single_click))
+        path.write_text(_kdeglobals_body(theme, family.strip(), float(points),
+                                         single_click, _read_apptheme()))
         return path
     except (OSError, KeyError, ValueError) as e:
         print(f"veracage: could not seed the app theme: {e}", file=sys.stderr)

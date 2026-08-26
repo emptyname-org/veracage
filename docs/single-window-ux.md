@@ -104,11 +104,18 @@ configuration with the configured modifier mapping applied). The discovery scan
 picks each up within 250ms, so a Settings change applies to the running session
 instead of waiting for a restart.
 
-It also carries `appfont` (family + point size). The leader builds the sandbox's
-`$XDG_CONFIG_HOME/kdeglobals` from it and `theme`: the Veracage font in Qt's own
-unit, plus the desktop's own Breeze colour scheme file verbatim, so a dark
-Veracage launches dark apps. An app reads it at startup, so a change applies to
-the next app launched, not to a running one.
+It also carries `appfont` (family + point size) and `apptheme`. The leader builds
+the sandbox's `$XDG_CONFIG_HOME/kdeglobals` from those and `theme`: the Veracage
+font in Qt's own unit, plus a look. `apptheme` is the Host's own, published when
+the theme setting is `system`: its icon theme, its widget style, and the
+`[Colors:*]`, `[ColorEffects:*]` and `[WM]` groups copied verbatim out of the
+human's `kdeglobals`, which is where KDE writes whatever scheme is applied. That
+reproduces a scheme whose `.colors` file the sandbox could never read, under the
+human's home. It is published empty for `light` and `dark`, and the leader then
+reads the desktop's own Breeze scheme file as before, so a dark Veracage
+launches dark apps. `theme` itself is published RESOLVED, light or dark, so the
+compositor and the agent keep reading one of two words. An app reads the seed at
+startup, so a change applies to the next app launched, not to a running one.
 
 The same channel carries `mimeapps.list`, the default-app associations the
 leader seeds into each sandbox at `$XDG_CONFIG_HOME/mimeapps.list` (the

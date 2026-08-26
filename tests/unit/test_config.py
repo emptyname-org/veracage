@@ -488,13 +488,15 @@ def test_shortcuts_round_trip_and_a_bad_bind_falls_back(tmp_xdg_config, capsys):
     assert "invalid shortcut" in capsys.readouterr().err
 
 
-def test_an_unknown_theme_falls_back_to_light(tmp_xdg_config):
+def test_an_unknown_theme_falls_back_to_the_default(tmp_xdg_config):
     """theme is published to the compositor and seeded into every sandbox's
-    kdeglobals; an arbitrary string there is not something to pass on."""
+    kdeglobals, so an arbitrary string there is not something to pass on. It
+    falls back to the default, which is to follow the Host."""
     (tmp_xdg_config / "veracage").mkdir(parents=True, exist_ok=True)
     (tmp_xdg_config / "veracage" / "config.toml").write_text(
         '[default]\ntheme = "neon"\n')
-    assert config.load().theme == "light"
+    assert config.load().theme == "system"
+    assert config.Config(apps={}).theme == "system"
 
 
 def test_a_string_is_not_a_boolean(tmp_xdg_config):
@@ -556,3 +558,99 @@ def test_log_dir_roundtrip_and_validation(tmp_xdg_config, capsys):
     assert config._coerce_log_dir(7) is None
     err = capsys.readouterr().err
     assert err.count("invalid log_dir") == 2
+
+
+_HOST_KDEGLOBALS = """[General]
+ColorScheme=Nordic
+Name=Nordic
+
+[Icons]
+Theme=Papirus-Dark
+
+[KDE]
+SingleClick=true
+widgetStyle=kvantum
+
+[Colors:Window]
+BackgroundNormal=46,52,64
+ForegroundNormal=216,222,233
+
+[ColorEffects:Disabled]
+Color=56,56,56
+
+[WM]
+activeBackground=59,66,82
+"""
+
+
+def _write_host_kdeglobals(tmp_path, monkeypatch, body=_HOST_KDEGLOBALS):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "kdeglobals").write_text(body)
+
+
+def test_the_host_look_is_read_from_the_hosts_own_kdeglobals(tmp_path, monkeypatch):
+    """Whatever scheme the Host applies, KDE writes it into that file, so the
+    sandbox can reproduce a scheme whose .colors file it could never read."""
+    _write_host_kdeglobals(tmp_path, monkeypatch)
+    monkeypatch.setenv("XDG_DATA_DIRS", str(tmp_path / "share"))
+    (tmp_path / "share" / "icons" / "Papirus-Dark").mkdir(parents=True)
+
+    host = config.host_app_theme()
+    assert host is not None
+    assert host.widget_style == "kvantum"      # passed through, Qt falls back if absent
+    assert host.icon_theme == "Papirus-Dark"
+    assert host.dark is True                   # from BackgroundNormal, not from a name
+    # The scheme groups, verbatim. Not [General]: that holds the scheme's name
+    # and would collide with the fonts the leader writes.
+    assert "[Colors:Window]" in host.colors
+    assert "BackgroundNormal=46,52,64" in host.colors
+    assert "[ColorEffects:Disabled]" in host.colors
+    assert "[WM]" in host.colors
+    assert "ColorScheme=Nordic" not in host.colors
+
+
+def test_an_icon_theme_the_sandbox_cannot_see_is_dropped(tmp_path, monkeypatch, capsys):
+    """A theme under the human's own ~/.local/share/icons is invisible inside the
+    sandbox (no host home), and missing icons are worse than Breeze icons."""
+    _write_host_kdeglobals(tmp_path, monkeypatch)
+    monkeypatch.setenv("XDG_DATA_DIRS", str(tmp_path / "share"))   # no icons there
+    host = config.host_app_theme()
+    assert host is not None and host.icon_theme == ""
+    assert "not installed system-wide" in capsys.readouterr().err
+
+
+def test_no_host_kdeglobals_means_no_host_look(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert config.host_app_theme() is None
+
+
+def test_resolved_theme_follows_the_host_only_when_asked(tmp_path, monkeypatch):
+    _write_host_kdeglobals(tmp_path, monkeypatch)
+    monkeypatch.setenv("XDG_DATA_DIRS", str(tmp_path / "share"))
+    (tmp_path / "share" / "icons" / "Papirus-Dark").mkdir(parents=True)
+
+    theme, host = config.resolved_theme(config.Config(apps={}, theme="system"))
+    assert theme == "dark" and host is not None       # the Host's scheme is dark
+    for explicit in ("light", "dark"):
+        theme, host = config.resolved_theme(config.Config(apps={}, theme=explicit))
+        assert theme == explicit and host is None     # an override seeds Breeze
+
+
+def test_publish_writes_the_resolved_theme_and_the_host_look(tmp_path, monkeypatch):
+    _write_host_kdeglobals(tmp_path, monkeypatch)
+    monkeypatch.setenv("XDG_DATA_DIRS", str(tmp_path / "share"))
+    (tmp_path / "share" / "icons" / "Papirus-Dark").mkdir(parents=True)
+    pub = tmp_path / "pub"
+    pub.mkdir()
+    monkeypatch.setenv("VERACAGE_PUB_DIR", str(pub))
+
+    config.publish_apps(config.Config(apps={}, theme="system"))
+    assert (pub / "theme").read_text() == "dark\n"    # consumers still read light|dark
+    icons, style, colors = (pub / "apptheme").read_text().split("\n", 2)
+    assert (icons, style) == ("Papirus-Dark", "kvantum")
+    assert "BackgroundNormal=46,52,64" in colors
+
+    # Switching back to an override must not leave the Host's scheme behind.
+    config.publish_apps(config.Config(apps={}, theme="light"))
+    assert (pub / "theme").read_text() == "light\n"
+    assert (pub / "apptheme").read_text() == ""

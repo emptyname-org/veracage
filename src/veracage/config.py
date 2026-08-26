@@ -201,6 +201,94 @@ def host_single_click() -> bool:
     return False
 
 
+# The kdeglobals groups that carry a colour scheme. KDE writes the WHOLE applied
+# scheme into the human's own kdeglobals, so copying these groups reproduces the
+# host's colours exactly, whatever scheme it is and wherever that scheme's file
+# lives (including one the sandbox could never read, under the human's home).
+_SCHEME_GROUPS = ("[Colors:", "[ColorEffects:", "[WM]")
+
+
+@dataclass(frozen=True)
+class HostTheme:
+    """The host desktop's app look, as the sandbox can reproduce it."""
+    colors: str        # the scheme groups, verbatim from the host's kdeglobals
+    widget_style: str  # [KDE] widgetStyle, "" when unset
+    icon_theme: str    # [Icons] Theme, "" when unset or not installed system-wide
+    dark: bool         # from the window background, so the Veracage UI can match
+
+
+def _host_kdeglobals() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "kdeglobals"
+
+
+def _is_dark(background: str) -> bool:
+    """True when an `r,g,b` background is dark enough to call the theme dark.
+    Rec. 709 luma, halfway. A malformed value reads as light."""
+    try:
+        r, g, b = (float(v) for v in background.split(",")[:3])
+    except ValueError:
+        return False
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b < 128.0
+
+
+def _icon_theme_is_system_wide(name: str) -> bool:
+    """Whether an icon theme is installed where the SANDBOX can see it. The
+    sandbox has no host home, so a theme under ~/.local/share/icons would leave
+    apps with missing icons, which is worse than the wrong icons."""
+    dirs = os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share"
+    return any((Path(d) / "icons" / name).is_dir() for d in dirs.split(":") if d)
+
+
+def host_app_theme() -> HostTheme | None:
+    """The host desktop's colour scheme, widget style and icon theme, or None
+    when there is nothing to read (a non-KDE host, or no kdeglobals yet).
+
+    The widget style is passed through unchecked: naming a style Qt cannot load
+    makes Qt fall back to its own default, which is the same outcome as not
+    naming one, and finding style plugins reliably means guessing at library
+    paths."""
+    try:
+        text = _host_kdeglobals().read_text(errors="replace")
+    except OSError:
+        return None
+    colors: list[str] = []
+    widget_style = icon_theme = background = ""
+    group = ""
+    for line in text.splitlines():
+        if line.startswith("["):
+            group = line.strip()
+            if group.startswith(_SCHEME_GROUPS):
+                colors += ["", group]
+            continue
+        if group.startswith(_SCHEME_GROUPS):
+            colors.append(line)
+            if group == "[Colors:Window]" and line.startswith("BackgroundNormal="):
+                background = line.split("=", 1)[1]
+        elif group == "[KDE]" and line.startswith("widgetStyle="):
+            widget_style = line.split("=", 1)[1].strip()
+        elif group == "[Icons]" and line.startswith("Theme="):
+            icon_theme = line.split("=", 1)[1].strip()
+    if not colors and not widget_style and not icon_theme:
+        return None
+    if icon_theme and not _icon_theme_is_system_wide(icon_theme):
+        print(f"veracage: icon theme {icon_theme!r} is not installed system-wide, "
+              "the sandbox keeps Breeze", file=sys.stderr)
+        icon_theme = ""
+    return HostTheme("\n".join(colors).strip() + "\n" if colors else "",
+                     widget_style, icon_theme, _is_dark(background))
+
+
+def resolved_theme(cfg: Config) -> tuple[str, HostTheme | None]:
+    """The light/dark the Veracage window uses, and the host look to seed into
+    the sandbox with it. `theme = "system"` follows the host and seeds its
+    scheme, "light"/"dark" are explicit overrides and seed Breeze."""
+    if cfg.theme != "system":
+        return cfg.theme, None
+    host = host_app_theme()
+    return ("dark" if host is not None and host.dark else "light"), host
+
+
 def modifier_options(host_options: str, choice: str) -> str:
     """The XKB option list to publish: the host's options with the configured
     modifier mapping applied (mirrors agent-rs keyboard.rs `options_for`)."""
@@ -378,7 +466,7 @@ class Config:
     apps: dict[str, App]
     last_used_app: str | None = None
     suspend_action: str = "dismount"      # "dismount" | "ignore"
-    theme: str = "light"                  # compositor/agent egui theme: light|dark|system
+    theme: str = "system"                 # light | dark | system (follow the Host)
     ui_font: str = "system"               # UI font key (see _VALID_FONTS); system = host
     ui_font_size: str = "system"          # "system" (host size) | a point size
     window_size: str = "default"          # window size at compositor start
@@ -479,10 +567,10 @@ def load() -> Config:
     clip_clear_timeout = _coerce_clip_timeout(
         default.get("clip_clear_timeout", DEFAULT_CLIP_CLEAR_TIMEOUT))
     auto_dismount = _coerce_auto_dismount(default.get("auto_dismount", 0))
-    theme = default.get("theme", "light")
+    theme = default.get("theme", "system")
     if theme not in ("light", "dark", "system"):
-        print(f"veracage: invalid theme {theme!r}, using 'light'", file=sys.stderr)
-        theme = "light"
+        print(f"veracage: invalid theme {theme!r}, following the Host", file=sys.stderr)
+        theme = "system"
     ui_font = default.get("ui_font", "system")
     if ui_font not in _VALID_FONTS:
         print(f"veracage: invalid ui_font {ui_font!r}, using 'system'", file=sys.stderr)
@@ -773,7 +861,15 @@ def publish_apps(cfg: Config) -> None:
     # (temp + replace). The window size is NOT here: it applies when the window
     # is created, forwarded as VERACAGE_WINDOW_SIZE by cli.py.
     _publish_atomic(pub, "config.apps", apps)
-    _publish_atomic(pub, "theme", cfg.theme + "\n")
+    # The RESOLVED theme, so every consumer keeps reading light|dark, and beside
+    # it the host look the leader seeds (icon theme, widget style, colours).
+    # Always published, empty when Veracage sets the look rather than the host,
+    # so switching back does not leave a stale scheme behind.
+    theme, host = resolved_theme(cfg)
+    _publish_atomic(pub, "theme", theme + "\n")
+    _publish_atomic(pub, "apptheme",
+                    "" if host is None else
+                    f"{host.icon_theme}\n{host.widget_style}\n{host.colors}")
     # The app-side font (family + points): the leader builds the sandbox's
     # kdeglobals from this, pub/theme and pub/singleclick.
     family, points = app_font(cfg)

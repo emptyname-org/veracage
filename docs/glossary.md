@@ -90,8 +90,9 @@ apps). Settings that touch both live under Settings > System Integration.
   configured app list (`config.apps`) and menu icons for the Apps menu, the
   compositor's live look (`theme`, `font`, `shortcuts`,
   `clipclear`, `keyboard`), and the two seeds the leader copies into each
-  sandbox: `mimeapps.list` (default-app associations) and `appfont`, which with
-  `theme` becomes the sandbox's `kdeglobals`. Same trust level as config.toml.
+  sandbox: `mimeapps.list` (default-app associations), `appfont` and `apptheme`,
+  which with `theme` become the sandbox's `kdeglobals`. Same trust level as
+  config.toml.
 
 ## Privilege & lifecycle
 
