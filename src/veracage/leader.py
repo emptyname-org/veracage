@@ -79,6 +79,42 @@ def _debug(state, msg: str) -> None:
     except OSError:
         print(line, file=sys.stderr, flush=True)
 
+
+def _app_output(state) -> int:
+    """Where a launched app's stdout and stderr go. Cached: the same destination
+    serves every app in the session.
+
+    Never the leader's own stdio. Qt/KF apps print the paths of the files they
+    open, and this process's stderr is the stream pkexec hands journald, so
+    inheriting it writes volume file names into the SYSTEM journal: persistent,
+    readable by any host uid in `adm`, and still there after the volume is closed.
+    That is the accidental-leak channel the uid barrier exists to close.
+
+    Discarded by default. Under debug logging it goes to an append-only
+    `apps.log` in the session's own runtime scratch (`VERACAGE_VAULT_RUNTIME`,
+    which the helper makes 0700 and veracage-owned, and cleanup.py removes with
+    the session), so the output an app's launch problem needs is kept without
+    letting those paths outlive the volume or cross to the human's uid. Not
+    `log_dir` either: that is a host directory the human can read, and handing a
+    sandboxed app a writable fd into it is a hole the log is not worth. It grows
+    unbounded, in RAM, for as long as the session runs: it is a debugging switch.
+    """
+    if state.app_out is not None:
+        return state.app_out
+    state.app_out = subprocess.DEVNULL
+    if state.debug:
+        # O_NOFOLLOW: the scratch is veracage-owned, so a sandboxed app could
+        # plant a symlink there and aim this write elsewhere. Losing the log
+        # beats failing the launch, so an open error only downgrades to DEVNULL.
+        path = Path(os.environ.get("XDG_RUNTIME_DIR", "/nonexistent")) / "apps.log"
+        try:
+            state.app_out = os.open(
+                path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        except OSError as e:
+            _debug(state, f"app output not logged ({e})")
+    return state.app_out
+
+
 # The shared-workspace root (must match WORKSPACE in helper-rs/src/main.rs): the
 # leader's private-NS tmpfs holding every open volume at <WORKSPACE>/<label>. The
 # sandbox binds this whole tree at /vaults, so one app sees all volumes.
@@ -139,6 +175,7 @@ class _LeaderState:
     volumes: list = field(default_factory=list)  # per-volume labels (per-vol close)
     exchange: str | None = None      # idmapped host<->vault shared dir -> /exchange
     debug: bool = False              # verbose timing logs (config debug / --debug)
+    app_out: int | None = None       # cached app stdio destination (see _app_output)
 
 
 # ------------------------------------------------------------- protocol ----
@@ -255,19 +292,10 @@ def _launch_app(state: _LeaderState, spec) -> dict:
                              seeds, state.exchange)
         _debug(state, f"launch {label!r}: exec={command} seeds={len(seeds)} "
                       f"argv={len(argv)} words")
-        # Detach the app's stdio. Inheriting the leader's stdin/out/err hands a
-        # chatty viewer the session's terminal/journal: Qt/KF apps print the paths
-        # of files they open on stderr, which would persist unencrypted in the
-        # user journal, readable by any same-uid process after the vault closes
-        # (an accidental-leak channel in the threat model), and hands the app an
-        # fd to the human's pty. Nothing vault-side needs the app's stdio.
-        # The app's stdio is normally discarded: a chatty viewer prints the paths
-        # of files it opens, which would persist unencrypted in the journal after
-        # the volume closes (an accidental-leak channel in the threat model).
-        # Debug logging deliberately lifts that, because an app's own warnings are
-        # exactly what a launch problem looks like - it is opt-in, and the trade
-        # is documented in docs/debugging.md.
-        app_out = None if state.debug else subprocess.DEVNULL
+        # Detached, never inherited: nothing vault-side needs the app's stdio, and
+        # the leader's own would carry the paths the app prints into the journal
+        # and to the human's pty. See _app_output for where it goes instead.
+        app_out = _app_output(state)
         # An app takes a second or two to put its first window up, with nothing on
         # screen meanwhile: ask the compositor for a progress note. Written BEFORE
         # the spawn, because the compositor ends the note when a window appears
@@ -296,8 +324,8 @@ def _launch_app(state: _LeaderState, spec) -> dict:
     # Track the launch time (monotonic) alongside the label. The reaper uses it to
     # tell an immediate failure (a GUI that needs X11 in this Wayland-only sandbox,
     # a crash, a missing in-sandbox dependency) from a normal quit, and report it.
-    # The app's stdio is DEVNULL'd, so without this a launch that dies at once
-    # leaves no trace. Done in the reaper (not here) so the serve loop never
+    # The app's stdio never reaches the human, so without this a launch that dies
+    # at once leaves no trace. Done in the reaper (not here) so the serve loop never
     # blocks: the launch returns at once.
     state.children[proc.pid] = (label, time.monotonic())
     _debug(state, f"launch {label!r}: pid={proc.pid} spawned in "

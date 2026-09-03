@@ -164,6 +164,75 @@ def test_launch_app_launches_and_tracks(monkeypatch):
     assert captured["stderr"] == leader.subprocess.DEVNULL
 
 
+def _capture_launch(monkeypatch, st, spec=None):
+    """Launch one app through the real `_launch_app` and return Popen's kwargs."""
+    monkeypatch.setattr(leader, "bwrap_command",
+                        lambda mp, a, ws, places=None, exchange=None: ["true"])
+    captured: dict = {}
+
+    class FakeProc:
+        pid = 4321
+
+    def fake_popen(argv, **kw):
+        captured.update(kw)
+        return FakeProc()
+    monkeypatch.setattr(leader.subprocess, "Popen", fake_popen)
+    leader._launch_app(st, spec or {"name": "Kate", "exec": "kate"})
+    return captured
+
+
+def test_debug_app_output_goes_to_the_session_scratch(tmp_path, monkeypatch):
+    """Under debug the app's output must NOT be inherited: the leader's stderr is
+    the stream pkexec hands journald, so an app printing the paths of the files it
+    opens would write volume file names into the system journal, where they
+    outlive the closed volume. It goes to the session scratch instead."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    st = _state(wl_socket=Path("/run/x/wayland-1"), debug=True)
+    captured = _capture_launch(monkeypatch, st)
+
+    assert captured["stdout"] is not None          # never inherited
+    assert captured["stdout"] == captured["stderr"]
+    assert captured["stdin"] == leader.subprocess.DEVNULL
+
+    log = tmp_path / "apps.log"
+    assert log.exists()
+    # 0600 and inside the veracage-owned scratch: the human's uid cannot read the
+    # volume paths this file collects.
+    assert log.stat().st_mode & 0o777 == 0o600
+    os.write(captured["stdout"], b"from the app\n")
+    assert log.read_bytes() == b"from the app\n"
+    os.close(st.app_out)
+
+
+def test_debug_app_output_is_opened_once(tmp_path, monkeypatch):
+    """One shared append-only fd, not a file per launch."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    st = _state(wl_socket=Path("/run/x/wayland-1"), debug=True)
+    first = _capture_launch(monkeypatch, st)["stdout"]
+    second = _capture_launch(monkeypatch, st)["stdout"]
+    assert first == second
+    os.close(st.app_out)
+
+
+def test_debug_app_output_falls_back_to_devnull(tmp_path, monkeypatch):
+    """An unwritable scratch loses the debug log, never the launch, and never
+    downgrades to inheriting the leader's stdio."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "absent"))
+    st = _state(wl_socket=Path("/run/x/wayland-1"), debug=True)
+    assert _capture_launch(monkeypatch, st)["stdout"] == leader.subprocess.DEVNULL
+
+
+def test_debug_app_output_refuses_a_symlinked_log(tmp_path, monkeypatch):
+    """O_NOFOLLOW: a symlink planted in the scratch by a sandboxed app must not
+    redirect the log into a file of its choosing."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    target = tmp_path / "elsewhere"
+    (tmp_path / "apps.log").symlink_to(target)
+    st = _state(wl_socket=Path("/run/x/wayland-1"), debug=True)
+    assert _capture_launch(monkeypatch, st)["stdout"] == leader.subprocess.DEVNULL
+    assert not target.exists()
+
+
 def test_consume_launch_request_launches_and_removes(tmp_path, monkeypatch):
     """The helper's add-volume path drops launch.req (root-written) into the
     vault runtime dir; the leader launches the spec once and removes the file."""

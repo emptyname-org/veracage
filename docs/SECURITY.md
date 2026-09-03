@@ -103,11 +103,14 @@ contract.
   long as the app is open. It leaves no record: it dies with the process, and
   nothing on the host stores it. Apps started from the Apps menu carry no file
   path at all. Inherent to handing a path to a program that takes a path.
-- **`debug = true` sends app output to the journal.** The session leader passes
-  each app's stdio through, and toolkits print file paths in their warnings, so
-  the debug setting turns app-side paths into a persistent host record. It is
-  off by default and is a deliberate trade for diagnosing launches
-  (`docs/debugging.md`).
+- **`debug = true` keeps app output.** Toolkits print file paths in their
+  warnings, so with a volume open that output names its contents. The leader
+  writes it to `apps.log` in the session's runtime scratch (0700, veracage-owned,
+  on tmpfs, removed with the session), never to its own stderr: that stderr is
+  the stream `pkexec` hands journald, and inheriting it put volume file names in
+  the SYSTEM journal, where they survived the close and were readable by anyone
+  in `adm`. Fixed after v0.7.0; a journal written by an earlier build still holds
+  them (`docs/debugging.md`). Off by default either way.
 - **No network** from the sandbox, even opt-in (v1 non-goal).
 - **Clipboard is text-only** in v1.
 - **Apps and the compositor render on the host GPU** (`/dev/dri` is passed

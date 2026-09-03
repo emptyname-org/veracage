@@ -22,7 +22,7 @@ env allowlist) and the session leader as `--debug`.
 | Component | Where | Read it with |
 | --- | --- | --- |
 | Session leader (app launches, volumes) | the SYSTEM journal | `journalctl _UID=$(id -u veracage) -f` |
-| Sandboxed apps' own output | same, only while `debug = true` | as above |
+| Sandboxed apps' own output | `session-<uid>.run/apps.log`, only while `debug = true` | `sudo tail -f /run/veracage/session-$(id -u).run/apps.log` |
 | Broker (`veracage-agent`: mount flow) | the user journal | `journalctl --user -f` |
 | Compositor (rendering) | `/run/veracage/rt/compositor.log` | `tail -f /run/veracage/rt/compositor.log` |
 
@@ -51,8 +51,10 @@ log_dir = "/home/you/logs"    # absolute; must exist and be writable by uid vera
 
 With a log directory configured, the session leader writes its own lines to
 `<log_dir>/leader.log` instead of that journal, so both logs sit side by side.
-The sandboxed apps' output stays in the journal deliberately: putting it in the
-file would mean handing a sandboxed app a writable fd into a host directory.
+The sandboxed apps' output does NOT follow it there: writing it to `log_dir`
+would hand a sandboxed app a writable fd into a host directory, and the paths it
+prints would then sit in a file the human's uid can read. It goes to `apps.log`
+in the session's own runtime scratch instead - see the trade below.
 
 The directory is NOT created for you, and Veracage does not widen its
 permissions: the compositor runs as the `veracage` uid, so the directory has to
@@ -65,9 +67,9 @@ uid cannot write is the one case that loses lines silently, because the
 compositor has no stdio to complain on.
 
 A log outside the runtime dir is readable by whoever can reach that directory.
-The lines are render counters and cursor decisions, not volume contents, but the
-sandboxed apps' own output (which does name paths inside the volume) goes to the
-journal whenever `debug = true` - see the trade below.
+The lines are render counters and cursor decisions, not volume contents. The one
+debug stream that does name paths inside the volume is the sandboxed apps' own
+output, which is why it never goes here - see the trade below.
 
 ## What each line means
 
@@ -98,10 +100,29 @@ commands.
 
 ## The trade
 
-`debug = true` lets the sandboxed apps' own stdout and stderr into the journal.
-Apps print the paths of files they open, so with a volume mounted those paths
-land in the user journal and stay there after the volume is closed. That is an
-accidental-leak channel the threat model cares about, which is why it is off by
-default and why this is a debugging switch, not a setting. Turn it off when you
-are done, and `journalctl --user --vacuum-time=1d` if you were working in a
-volume whose file names you would rather not keep.
+`debug = true` keeps the sandboxed apps' own stdout and stderr instead of
+discarding them. Apps print the paths of the files they open, so with a volume
+open that output names its contents. It is written to `apps.log` in the session's
+runtime scratch (`/run/veracage/session-<uid>.run`, which the helper creates 0700
+and veracage-owned), so it is on tmpfs, unreadable by the human's uid, and
+removed with the session by the ExecStopPost cleanup: the file names do not
+outlive the closed volume.
+
+The file has no size limit and lives in RAM, so an app stuck printing on stderr
+grows it for as long as the session runs. That is one more reason this is a
+debugging switch and not a setting.
+
+Before this was fixed (after v0.7.0) the output was inherited from the leader's
+stderr instead. The leader runs as the `veracage` uid under `pkexec`, so those
+lines went to the SYSTEM journal, persistent and readable by anyone in `adm`, and
+they stayed there after the volume was closed. If you ran `debug = true` on a
+build from before the fix, the paths are still in that journal and only a root
+vacuum removes them:
+
+```
+sudo journalctl --rotate --vacuum-time=1s
+```
+
+That drops all system logs, not just those lines. `journalctl --user
+--vacuum-time=1d`, which earlier versions of this page suggested, never touched
+them: they were never in the user journal.
