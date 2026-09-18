@@ -882,7 +882,10 @@ fn holder_names(holders: &[String]) -> String {
 
 /// Process names that are Veracage's own sandbox plumbing rather than an app the
 /// human would recognise, so a "still in use" message names Dolphin, not bwrap.
-const SANDBOX_WRAPPERS: &[&str] = &["bwrap", "dbus-run-session", "dbus-daemon", "sh", "bash"];
+/// `veracage-reaper` is the subreaper the leader puts between the bus and the
+/// app (`sandbox.REAPER_NAME`).
+const SANDBOX_WRAPPERS: &[&str] =
+    &["bwrap", "dbus-run-session", "dbus-daemon", "veracage-reaper", "sh", "bash"];
 
 /// True if `comm` is sandbox plumbing. `/proc/<pid>/comm` is capped at 15
 /// characters, so "dbus-run-session" arrives as "dbus-run-sessio" and an equality
@@ -2312,6 +2315,7 @@ mod tests {
         assert!(is_sandbox_wrapper("bwrap"));
         assert!(is_sandbox_wrapper("dbus-run-sessio"));
         assert!(is_sandbox_wrapper("dbus-daemon"));
+        assert!(is_sandbox_wrapper("veracage-reaper"));
         assert!(!is_sandbox_wrapper("dolphin"));
         assert!(!is_sandbox_wrapper("dbus"));   // a prefix, but not truncated at 15
     }

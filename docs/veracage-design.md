@@ -98,7 +98,7 @@ bwrap --unshare-pid --unshare-uts --unshare-ipc --unshare-cgroup --unshare-net \
       --bind <exchange> /exchange                    (nosuid,nodev,noexec; optional) \
       --bind /run/veracage/rt/wl-vc /run/user/<uid>/wayland-0 \
       --setenv HOME /vaults   (XDG_* on an ephemeral /xdg tmpfs) \
-      -- <app> ...
+      -- dbus-run-session -- python3 -I -c <reaper> <app>
 ```
 
 - No network, no host home, no D-Bus, no portals. Only the one Wayland
@@ -107,6 +107,14 @@ bwrap --unshare-pid --unshare-uts --unshare-ipc --unshare-cgroup --unshare-net \
   in host `~/.cache` (this is what closes the accidental-leak goal).
 - Only the compositor's `wl-vc` socket is bound in. The control / app-launch /
   clipboard channels are not reachable from the sandbox.
+- The sandbox lasts as long as the app's processes, not its first one. bwrap
+  ends it, and SIGKILLs whatever is left, when its first process exits, which
+  `dbus-run-session` does with the app's first process. The reaper
+  (`sandbox.REAPER`) is a `PR_SET_CHILD_SUBREAPER` that execs the app and waits
+  for every orphan below it. Kate 25.04 forks into the background and its first
+  process exits 0 at once, and anything an app starts that outlives it (a Kate
+  opened from Dolphin, once Dolphin closes) was SIGKILLed with the sandbox. A
+  process the app leaves running therefore keeps its volume busy.
 - GPU always passed through: `/dev/dri` plus the `/sys` device metadata Mesa
   needs to pick its hardware driver (without them apps fall back to llvmpipe
   software rendering). The `veracage` user is added to the `render` group at

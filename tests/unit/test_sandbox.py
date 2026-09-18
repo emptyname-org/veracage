@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -61,10 +62,11 @@ def test_starts_with_bwrap(argv):
 
 
 def test_app_command_appears_after_double_dash(argv):
-    # The app is what bwrap ultimately runs: last, after the `--` separator and
-    # the private-bus wrapper (see test_app_runs_under_a_private_dbus_session).
+    # The app is what bwrap ultimately runs: last, after the `--` separator, the
+    # private-bus wrapper (see test_app_runs_under_a_private_dbus_session) and the
+    # reaper (see test_reaper_waits_for_what_the_app_leaves_running).
     sep = argv.index("--")
-    assert argv[sep + 1:] == [*sandbox.dbus_wrapper(), "kate"]
+    assert argv[sep + 1:] == [*sandbox.dbus_wrapper(), *sandbox.REAPER, "kate"]
 
 
 def test_vault_is_bound_at_slash_vault(argv):
@@ -151,10 +153,11 @@ def test_no_share_user_no_share_net_no_network(argv):
 def test_app_launches_bare(argv):
     # Apps launch with no arguments (the launch-dir args feature was removed);
     # the sandbox chdir (/vaults) is what places them in the workspace. The only
-    # thing allowed between bwrap's `--` and the app is the private-bus wrapper.
+    # things allowed between bwrap's `--` and the app are the private-bus wrapper
+    # and the reaper.
     assert argv[-1] == "kate"
     sep = argv.index("--")
-    assert argv[sep + 1:] == [*sandbox.dbus_wrapper(), "kate"]
+    assert argv[sep + 1:] == [*sandbox.dbus_wrapper(), *sandbox.REAPER, "kate"]
 
 
 def test_app_runs_under_a_private_dbus_session():
@@ -184,9 +187,43 @@ def test_bwrap_runs_exec_as_single_argv():
     sep = argv.index("--")
     # The exec is the LAST element and still exactly one element, so it can only
     # name a program (this one fails to exec). `dbus-run-session` is in front of
-    # it on hosts that have it, and execs its command directly - no shell there
-    # either - so the containment argument is unchanged.
-    assert argv[sep + 1:] == [*sandbox.dbus_wrapper(), "kate --evil; rm -rf ~"]
+    # it on hosts that have it, then the reaper, and both exec their command
+    # directly - no shell there either - so the containment argument is unchanged.
+    assert argv[sep + 1:] == [*sandbox.dbus_wrapper(), *sandbox.REAPER,
+                               "kate --evil; rm -rf ~"]
+
+
+def test_reaper_waits_for_what_the_app_leaves_running(tmp_path):
+    """Kate 25.04 forks into the background and its first process exits 0 at
+    once. bwrap ends the sandbox, SIGKILLing everything in it, when its first
+    process exits, so the reaper has to outlive the whole tree: here a child
+    that is still writing its file after its parent has returned."""
+    marker = tmp_path / "marker"
+    app = f'(sleep 0.3; echo done > "{marker}") & exit 0'
+    subprocess.run([*sandbox.REAPER, "sh", "-c", app], check=True, timeout=10)
+    assert marker.read_text() == "done\n"
+
+
+@pytest.mark.parametrize("app, status", [
+    (["sh", "-c", "exit 3"], 3),
+    (["sh", "-c", "kill -TERM $$"], 128 + 15),
+    (["/nonexistent/app"], 127),
+])
+def test_reaper_exits_with_the_first_process_status(app, status):
+    """The leader reports an app that exits at once as a failed launch, which
+    needs the app's own status and timing, not the reaper's."""
+    run = subprocess.run([*sandbox.REAPER, *app], capture_output=True, timeout=10)
+    assert run.returncode == status
+
+
+def test_reaper_is_named_as_the_helper_expects():
+    """The helper names a busy volume's holders from /proc/<pid>/comm and drops
+    its own plumbing by name (helper-rs SANDBOX_WRAPPERS), so the reaper must
+    carry that name rather than python3's."""
+    run = subprocess.run([*sandbox.REAPER, "sh", "-c", "cat /proc/$PPID/comm"],
+                         capture_output=True, text=True, timeout=10)
+    assert run.stdout.strip() == sandbox.REAPER_NAME
+    assert len(sandbox.REAPER_NAME.encode()) <= 15
 
 
 def test_chdir_to_vault(argv):

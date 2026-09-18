@@ -163,10 +163,57 @@ def bwrap_command(workspace: str, app: App, wayland_socket: Path,
     # Solid backend) before carrying on degraded. `dbus-run-session` starts a bus
     # for this app alone and tears it down when it exits. The bus socket lives in
     # the sandbox's own /tmp and its IPC namespace, so this exposes nothing of the
-    # host session: it is a bus per app, not the host's bus.
-    argv += ["--", *dbus_wrapper(), app.exec]
+    # host session: it is a bus per app, not the host's bus. REAPER sits inside it,
+    # so the bus lasts as long as the app's processes do.
+    argv += ["--", *dbus_wrapper(), *REAPER, app.exec]
     return argv
 
+
+# The reaper's process name (`/proc/<pid>/comm`, 15 bytes at most). The helper
+# lists it as sandbox plumbing, so "Close <app> to continue." names the app and
+# not a bare python3 that the human cannot recognise.
+REAPER_NAME = "veracage-reaper"
+
+# Runs the app and waits for every process it leaves behind, not just the first.
+# bwrap ends the sandbox, and SIGKILLs whatever is still in it, when its first
+# process exits: dbus-run-session, which exits with the app's first process. Kate
+# 25.04 forks itself into the background at start (daemon(3) unless given
+# --block), so that first process exits 0 at once and took Kate down with it. The
+# same exit kills anything an app started that outlives it (measured with a
+# background child of the first process), a Kate opened from Dolphin once Dolphin
+# closes among them. As PR_SET_CHILD_SUBREAPER, this process becomes the parent
+# of every orphan below it and exits, with the first process's status, once the
+# last one has. Bus-activated services are children of the bus, not of the app,
+# so they do not hold the sandbox open.
+_REAPER_CODE = f"""\
+import ctypes, os, sys
+libc = ctypes.CDLL(None)
+libc.prctl(36, 1)  # PR_SET_CHILD_SUBREAPER
+libc.prctl(15, {REAPER_NAME.encode()!r})  # PR_SET_NAME
+app = os.fork()
+if app == 0:
+    try:
+        os.execvp(sys.argv[1], sys.argv[1:])
+    except OSError as e:
+        print(sys.argv[1] + ":", e, file=sys.stderr)
+    os._exit(127)
+status = 0
+while True:
+    try:
+        pid, wstatus = os.wait()
+    except ChildProcessError:
+        break
+    if pid == app:
+        status = os.waitstatus_to_exitcode(wstatus)
+sys.exit(status if status >= 0 else 128 - status)
+"""
+
+# `-I`: the working directory and HOME are the workspace, so neither may add code
+# from a volume to the interpreter: without it `import ctypes` would find a
+# `ctypes.py` in /vaults first, and a user site-packages or a PYTHON* variable
+# could do the same. python3 is the host's, read-only under /usr, and Veracage
+# itself depends on it.
+REAPER = ["python3", "-I", "-c", _REAPER_CODE]
 
 def dbus_wrapper() -> list[str]:
     """`dbus-run-session --` when it is installed, else nothing. The sandbox sees
