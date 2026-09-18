@@ -652,9 +652,6 @@ pub fn publish_shortcuts(cfg: &crate::config::Config) {
     }
 }
 
-/// Write the host-clipboard auto-clear policy to `PUB_DIR/clipclear`
-/// (`<0|1 enabled>\n<timeout secs>`) so the compositor's clipboard worker picks
-/// it up on its next scan. Best-effort.
 /// One timing line to stderr (the broker's journal entry) when config `debug` is
 /// on. Read it with `journalctl --user -f`; see docs/debugging.md.
 pub fn debug_log(msg: &str) {
@@ -688,6 +685,9 @@ pub fn publish_status(text: &str) {
     }
 }
 
+/// Write the host-clipboard auto-clear policy to `PUB_DIR/clipclear`
+/// (`<0|1 enabled>\n<timeout secs>`) so the compositor's clipboard worker picks
+/// it up on its next scan. Best-effort.
 pub fn publish_clipclear(cfg: &crate::config::Config) {
     let dir = pub_dir();
     if !dir.is_dir() {
