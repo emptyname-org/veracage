@@ -41,19 +41,43 @@ pub fn detected_defaults() -> Vec<Suggestion> {
     }
     // A GUI text editor and a terminal are useful against a volume but aren't a
     // mime default (there is no mimetype for "terminal", and text/plain may
-    // resolve to something odd), so fill them from a small installed-app probe.
+    // resolve to something odd), so fill them from a small installed-app probe,
+    // after the terminal the desktop itself opens.
     if !out.iter().any(|s| s.category == "text editor") {
         if let Some(s) = first_installed(EDITORS, "text editor") {
             out.push(s);
         }
     }
-    if let Some(term) = first_installed(TERMINALS, "terminal").map(resolve_terminal) {
+    let term = kde_terminal()
+        .or_else(|| first_installed(TERMINALS, "terminal").map(resolve_terminal));
+    if let Some(term) = term {
         let base = crate::config::exec_basename(&term.exec);
         if !out.iter().any(|e| crate::config::exec_basename(&e.exec) == base) {
             out.push(term);
         }
     }
     out
+}
+
+/// The terminal KDE itself opens, on a KDE desktop: what System Settings >
+/// Default Applications wrote to kdeglobals, a desktop id in `TerminalService`
+/// or a command in `TerminalApplication`, and Konsole when neither is set. It
+/// comes before `x-terminal-emulator`, which is Debian's ranking by package
+/// priority and not the desktop's choice: with terminator installed it names
+/// terminator (priority 50) over Konsole (40). None off KDE, or when that
+/// terminal is not installed.
+fn kde_terminal() -> Option<Suggestion> {
+    let desktops = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    if !desktops.split(':').any(|d| d == "KDE") {
+        return None;
+    }
+    let setting = |key| crate::fonts::kde_config(&["--group", "General", "--key", key]);
+    let exec = setting("TerminalService")
+        .and_then(|id| parse_desktop(&id))
+        .map(|(_, exec)| exec)
+        .or_else(|| setting("TerminalApplication").map(|cmd| exec_binary(&cmd)))
+        .unwrap_or_else(|| "konsole".to_string());
+    crate::apps::is_installed(&exec).then(|| terminal(&exec))
 }
 
 /// Debian's `x-terminal-emulator` is an update-alternatives symlink. Resolve it
@@ -69,15 +93,21 @@ fn resolve_terminal(s: Suggestion) -> Suggestion {
     else {
         return s;
     };
-    let Some(base) = target.file_name().and_then(|n| n.to_str()) else {
-        return s;
-    };
+    match target.file_name().and_then(|n| n.to_str()) {
+        Some(base) => terminal(base),
+        None => s,
+    }
+}
+
+/// The terminal suggestion for binary `exec`, named as TERMINALS names it, else
+/// after the binary.
+fn terminal(exec: &str) -> Suggestion {
     let name = TERMINALS
         .iter()
-        .find(|(_, e)| *e == base)
+        .find(|(_, e)| *e == exec)
         .map(|(n, _)| (*n).to_string())
-        .unwrap_or_else(|| crate::config::capitalize_first(base));
-    Suggestion { name, exec: base.to_string(), category: s.category }
+        .unwrap_or_else(|| crate::config::capitalize_first(exec));
+    Suggestion { name, exec: exec.to_string(), category: "terminal" }
 }
 
 /// Common GUI text editors, best-known first (fallback when `text/plain` didn't
@@ -90,8 +120,10 @@ const EDITORS: &[(&str, &str)] = &[
     ("KWrite", "kwrite"),
 ];
 
-/// Terminal emulators. `x-terminal-emulator` is Debian's update-alternatives
-/// default (a symlink to the user's chosen terminal), so it comes first.
+/// Terminal emulators, when the desktop names none (see `kde_terminal`).
+/// `x-terminal-emulator` is Debian's update-alternatives default (a symlink to
+/// the terminal set with `update-alternatives`, or else the highest-priority
+/// one installed), so it comes first.
 const TERMINALS: &[(&str, &str)] = &[
     ("Terminal", "x-terminal-emulator"),
     ("Konsole", "konsole"),
@@ -510,6 +542,13 @@ mod tests {
         assert_eq!(exec_binary("/usr/bin/kate -b %F"), "kate");
         assert_eq!(exec_binary("nautilus --new-window %U"), "nautilus");
         assert_eq!(exec_binary("%U"), "");
+    }
+
+    #[test]
+    fn terminal_named_from_the_list_else_after_its_binary() {
+        assert_eq!(terminal("konsole").name, "Konsole");
+        assert_eq!(terminal("terminator").name, "Terminator");
+        assert_eq!(terminal("terminator").category, "terminal");
     }
 
     #[test]

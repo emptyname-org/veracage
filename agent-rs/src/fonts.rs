@@ -92,6 +92,12 @@ pub(crate) fn run(bin: &str, args: &[&str]) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
+/// A KDE setting through `kreadconfig` (Plasma 6, then 5): `args` name the key,
+/// and kdeglobals is read unless they give a `--file`. None when unset or off KDE.
+pub(crate) fn kde_config(args: &[&str]) -> Option<String> {
+    ["kreadconfig6", "kreadconfig5"].into_iter().find_map(|tool| run(tool, args))
+}
+
 /// The host desktop's UI font family and point size, if detectable. KDE first
 /// (`kreadconfig`), then GNOME (`gsettings`), then fontconfig's `sans-serif`
 /// (family only). Used for the "system" font/size defaults.

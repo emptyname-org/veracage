@@ -56,13 +56,8 @@ pub struct HostKeyboard {
 /// too). Other desktops fall through to empty, and the compositor then uses
 /// libxkbcommon's default.
 pub fn host_keyboard() -> HostKeyboard {
-    let read = |key: &str| -> Option<String> {
-        for tool in ["kreadconfig6", "kreadconfig5"] {
-            if let Some(v) = crate::fonts::run(tool, &["--file", "kxkbrc", "--group", "Layout", "--key", key]) {
-                return Some(v);
-            }
-        }
-        None
+    let read = |key: &str| {
+        crate::fonts::kde_config(&["--file", "kxkbrc", "--group", "Layout", "--key", key])
     };
     if read("Use").as_deref() != Some("true") {
         return HostKeyboard::default();
