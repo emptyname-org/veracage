@@ -223,17 +223,21 @@ struct State {
 
 fn worker(conn: Connection, rx: Receiver<Cmd>, wake_r: OwnedFd) {
     let Ok((globals, mut queue)) = registry_queue_init::<State>(&conn) else {
+        debug(format_args!("no Host registry, Copy out and Paste in are off"));
         return;
     };
     let qh = queue.handle();
     let Ok(seat) = globals.bind::<WlSeat, _, _>(&qh, 1..=1, ()) else {
+        debug(format_args!("no Host seat, Copy out and Paste in are off"));
         return;
     };
     let Ok(manager) = globals.bind::<ZwlrDataControlManagerV1, _, _>(&qh, 1..=2, ()) else {
-        return; // host has no wlr-data-control
+        debug(format_args!("Host has no wlr-data-control, Copy out and Paste in are off"));
+        return;
     };
     let device = manager.get_data_device(&seat, &qh, ());
     let has_primary = device.version() >= 2; // primary selection is v2+
+    debug(format_args!("wlr-data-control v{} on the Host", device.version()));
     let (clear_enabled, clear_secs) = DEFAULT_CLEAR_POLICY;
     let mut state = State {
         qh: qh.clone(),
@@ -258,9 +262,11 @@ fn worker(conn: Connection, rx: Receiver<Cmd>, wake_r: OwnedFd) {
 
     loop {
         if conn.flush().is_err() {
+            debug(format_args!("Host connection lost, worker stopped"));
             return;
         }
         if queue.dispatch_pending(&mut state).is_err() {
+            debug(format_args!("Host protocol error, worker stopped"));
             return;
         }
         // Handle any queued commands.
@@ -281,6 +287,7 @@ fn worker(conn: Connection, rx: Receiver<Cmd>, wake_r: OwnedFd) {
             clear_pushed(&mut state, &conn, &mut queue);
         }
         if conn.flush().is_err() {
+            debug(format_args!("Host connection lost, worker stopped"));
             return;
         }
         // Block until the wayland fd or the wake pipe is readable.
@@ -340,6 +347,11 @@ fn handle_cmd(state: &mut State, conn: &Connection, queue: &mut wayland_client::
             // Record the pushed value and arm the auto-clear countdown (only if
             // enabled). `pushed` also gates clear-on-exit, which fires regardless
             // of the enable flag once anything has been pushed.
+            debug(format_args!(
+                "copy out: {} bytes, auto-clear {}",
+                arc.len(),
+                if state.clear_enabled { format!("in {}s", state.clear_secs) } else { "off".into() }
+            ));
             state.pushed = Some(arc);
             state.owns_clip = true;
             state.deadline = state
@@ -351,6 +363,7 @@ fn handle_cmd(state: &mut State, conn: &Connection, queue: &mut wayland_client::
             let _ = reply.send(text);
         }
         Cmd::Policy { enabled, secs } => {
+            debug(format_args!("auto-clear policy: enabled={enabled} after {secs}s"));
             state.clear_enabled = enabled;
             state.clear_secs = secs;
             if !enabled {
@@ -446,6 +459,11 @@ fn clear_pushed(state: &mut State, conn: &Connection, queue: &mut wayland_client
         pushed.as_slice(),
         current_primary.as_deref().map(str::as_bytes),
     );
+    debug(format_args!(
+        "clear: clipboard {}, primary {}",
+        if clear_clip { "cleared" } else { "left alone (replaced on the Host)" },
+        if clear_primary { "cleared" } else { "left alone" }
+    ));
 
     if clear_clip {
         state.device.set_selection(None);
@@ -585,6 +603,7 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for State {
                 // must not touch it (it now holds newer host content). A cancel
                 // for a source we already replaced ourselves is ignored.
                 if state.source.as_ref() == Some(source) {
+                    debug(format_args!("copy out replaced on the Host"));
                     state.source = None;
                     state.owns_clip = false;
                 }
@@ -595,6 +614,14 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for State {
 }
 
 // --------------------------------------------------------------- helpers -----
+
+/// A debug-log line (config `debug`) about the Host clipboard: sizes and
+/// decisions, never the text. Its clear is otherwise invisible from outside.
+fn debug(msg: std::fmt::Arguments) {
+    if crate::debug_enabled() {
+        crate::vcdebug(&format!("hostclip: {msg}"));
+    }
+}
 
 /// A close-on-exec pipe as (read, write) owned fds.
 fn pipe() -> Option<(OwnedFd, OwnedFd)> {

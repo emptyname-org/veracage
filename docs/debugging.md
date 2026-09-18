@@ -98,6 +98,22 @@ is held: anything but `none` on a line where nothing is being typed is a latched
 modifier, which the sandboxed app sees as a wheel that zooms or letters that run
 commands.
 
+Compositor, the Host clipboard, one line per event, sizes and decisions only:
+
+```
+hostclip: wlr-data-control v2 on the Host
+hostclip: auto-clear policy: enabled=true after 60s
+hostclip: copy out: 21 bytes, auto-clear in 60s
+hostclip: copy out replaced on the Host
+hostclip: clear: clipboard left alone (replaced on the Host), primary left alone
+```
+
+The clear only empties the Host clipboard while it still holds the Copy out, so
+`replaced on the Host` means another Host client set the clipboard after it, and
+the clear kept that newer content. A line ending `are off` or `worker stopped`,
+or no `wlr-data-control` line at all, means the worker is not running: Copy out
+and Paste in do nothing, and there is nothing to clear.
+
 ## The trade
 
 `debug = true` keeps the sandboxed apps' own stdout and stderr instead of
